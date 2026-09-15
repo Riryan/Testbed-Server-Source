@@ -1,0 +1,39 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "GatewayServer.RegressionTests/1.0.0": {
+        "dependencies": {
+          "GatewayServer": "1.0.0"
+        },
+        "runtime": {
+          "GatewayServer.RegressionTests.dll": {}
+        }
+      },
+      "GatewayServer/1.0.0": {
+        "runtime": {
+          "GatewayServer.dll": {
+            "assemblyVersion": "1.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "GatewayServer.RegressionTests/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "GatewayServer/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

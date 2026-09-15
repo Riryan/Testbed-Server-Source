@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>GatewayServer</AssemblyName>
+    <RootNamespace>Game.BackendServer</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compile the same primitives-only wire contracts and portable name/failure policy
+         from the standalone Game.Shared source snapshot. No Unity Assets dependency. -->
+    <Compile Include="..\Game.Shared\Source\Backend\BackendServiceContracts.cs" Link="Shared\BackendServiceContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Backend\BackendGuildContracts.cs" Link="Shared\BackendGuildContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Content\GameplayContentDefinitions.cs" Link="Shared\GameplayContentDefinitions.cs" />
+    <Compile Include="..\Game.Shared\Source\Content\RecoveryContentDefinitions.cs" Link="Shared\RecoveryContentDefinitions.cs" />
+    <Compile Include="..\Game.Shared\Source\Progression\ProgressionContracts.cs" Link="Shared\ProgressionContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Resources\CharacterResourceTypes.cs" Link="Shared\CharacterResourceTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\Actors\GameplayActorTypes.cs" Link="Shared\GameplayActorTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\StatusEffects\StatusEffectTypes.cs" Link="Shared\StatusEffectTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\Abilities\AbilityTypes.cs" Link="Shared\AbilityTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\Effects\GameplayEffectTypes.cs" Link="Shared\GameplayEffectTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\Interactions\InteractionTypes.cs" Link="Shared\InteractionTypes.cs" />
+    <Compile Include="..\Game.Shared\Source\Authentication\AccountCredentialPolicy.cs" Link="Shared\AccountCredentialPolicy.cs" />
+    <Compile Include="..\Game.Shared\Source\Characters\CharacterNamePolicy.cs" Link="Shared\CharacterNamePolicy.cs" />
+    <Compile Include="..\Game.Shared\Source\Characters\CharacterAppearanceContracts.cs" Link="Shared\CharacterAppearanceContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Characters\CharacterPresentationPreferences.cs" Link="Shared\CharacterPresentationPreferences.cs" />
+    <Compile Include="..\Game.Shared\Source\Protocol\CharacterCreateFailure.cs" Link="Shared\CharacterCreateFailure.cs" />
+    <Compile Include="..\Game.Shared\Source\Protocol\CharacterDeleteFailure.cs" Link="Shared\CharacterDeleteFailure.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+    <None Include="ThirdParty\SQLite\sqlite3.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>sqlite3.dll</TargetPath>
+    </None>
+    <None Include="ThirdParty\SQLite\LICENSE.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>ThirdParty\SQLite-net-LICENSE.txt</TargetPath>
+    </None>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>GameServer</AssemblyName>
+    <RootNamespace>Game.GameServer</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DotRecast.Detour" Version="2026.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Game.Shared\Game.Shared.csproj" />
+    <ProjectReference Include="..\Game.Server.Domain\Game.Server.Domain.csproj" />
+    <ProjectReference Include="..\Game.Server.Application\Game.Server.Application.csproj" />
+    <ProjectReference Include="..\LiteNetLib.Server\LiteNetLib.Server.csproj" />
+  </ItemGroup>
+</Project>

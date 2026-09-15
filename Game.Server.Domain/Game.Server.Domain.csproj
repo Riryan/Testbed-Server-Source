@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>Game.Server.Domain</AssemblyName>
+    <RootNamespace>Game.Server.Domain</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Game.Shared\Game.Shared.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Standalone source snapshot. No Unity Assets dependency. -->
+    <Compile Include="Source\**\*.cs" />
+  </ItemGroup>
+</Project>

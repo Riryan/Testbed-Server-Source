@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "btTtDel4+HQZB1G+47pNB7zoMJEk3xqC1EPjV+m6Y6Q=",
+  "Source": "GatewayServer",
+  "BasePath": "_content/GatewayServer",
+  "Mode": "Default",
+  "ManifestType": "Publish",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}

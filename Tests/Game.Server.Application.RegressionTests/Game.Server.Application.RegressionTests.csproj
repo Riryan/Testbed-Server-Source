@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\Game.Server.Application\Game.Server.Application.csproj" />
+    <ProjectReference Include="..\..\Game.Server.Domain\Game.Server.Domain.csproj" />
+    <ProjectReference Include="..\..\Game.Shared\Game.Shared.csproj" />
+  </ItemGroup>
+</Project>
