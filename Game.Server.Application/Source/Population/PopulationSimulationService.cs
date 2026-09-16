@@ -38,6 +38,13 @@ namespace Game.Server.Application.Population
         Exterior = 5,
     }
 
+    public enum SharedAiMovementMode : byte
+    {
+        Route = 0,
+        FreeRoam = 1,
+        Stationary = 2,
+    }
+
     public sealed class PopulationActorRuntime
     {
         internal CharacterMotorState MotorState;
@@ -66,6 +73,10 @@ namespace Game.Server.Application.Population
         internal long HibernationCellKey;
         internal WorldPosition HibernationPosition;
         internal long PreviousNodeId;
+        internal WorldPosition HomePosition;
+        internal WorldPosition RoamTarget;
+        internal bool HasRoamTarget;
+        internal double NextRoamDecisionAt;
 
         public AuthoritativeActorRuntime Actor { get; internal set; }
         public PlayerRuntime CombatRuntime { get; internal set; }
@@ -80,6 +91,12 @@ namespace Game.Server.Application.Population
         public float CombatSkill { get; internal set; }
         public long SpawnAnchorId { get; internal set; }
         public string DeathLootTableId { get; internal set; } = string.Empty;
+        public ServerSpawnKind SpawnKind { get; internal set; } = ServerSpawnKind.Population;
+        public SharedAiMovementMode MovementBehavior { get; internal set; } = SharedAiMovementMode.Route;
+        public float RoamRadius { get; internal set; }
+        public float LeashRadius { get; internal set; }
+        public float CapsuleRadius { get; internal set; } = 0.35f;
+        public float CapsuleHeight { get; internal set; } = 1.8f;
         public long CurrentPortalId => LastPortalId;
         public long CurrentRouteNodeId => CurrentNodeId;
         public long NextRouteNodeId => NextNodeId;
@@ -186,6 +203,10 @@ namespace Game.Server.Application.Population
 
         public float EngagedDistance { get; set; } = 28f;
         public float ActiveDistance { get; set; } = 80f;
+        // Standalone GameServer may wire its existing CombatPresentationRange here.
+        // <= 0 keeps legacy behavior by falling back to ActiveDistance.
+        // This gate is intentionally FreeRoam-only; routed Population/NPC LOD is unchanged.
+        public float FreeRoamActiveDistance { get; set; }
         public float CoarseDistance { get; set; } = 250f;
         public float VisibilitySuppressionDistance { get; set; } = 35f;
         public int MaximumPortalRespawnsPerTick { get; set; } = 8;
@@ -203,6 +224,10 @@ namespace Game.Server.Application.Population
         public double ActivationHeartbeatSeconds { get; set; } = 1.00d;
         public double MaximumLogicalCatchUpSeconds { get; set; } = 21600d;
         public int MaximumLogicalCatchUpHops { get; set; } = 512;
+        public float DefaultFreeRoamRadius { get; set; } = 20f;
+        public float DefaultFreeRoamLeashRadius { get; set; } = 35f;
+        public double FreeRoamMinimumPauseSeconds { get; set; } = 0.50d;
+        public double FreeRoamMaximumPauseSeconds { get; set; } = 2.00d;
         public int Count => _population.Count;
         public int HibernatingCount => _hibernatingCount;
         public int SpatiallyActiveCount => Math.Max(0, _population.Count - _hibernatingCount);
@@ -417,9 +442,18 @@ namespace Game.Server.Application.Population
             }
             if (pop.AiState == PopulationAiState.Fleeing || pop.AiState == PopulationAiState.Fighting)
             {
-                pop.AiState = PopulationAiState.Recovering;
                 pop.RouteReason = PopulationRouteReason.Recovery;
-                ReattachToNearestRoute(pop);
+                if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                {
+                    pop.AiState = PopulationAiState.Recovering;
+                    ReattachToNearestRoute(pop);
+                }
+                else
+                {
+                    pop.AiState = PopulationAiState.Idle;
+                    pop.HasRoamTarget = false;
+                    pop.NextRoamDecisionAt = now;
+                }
             }
 
             if (pop.WaitUntil > now)
@@ -431,6 +465,33 @@ namespace Game.Server.Application.Population
             if (pop.PortalPhase != PopulationPortalSequencePhase.None)
             {
                 TickPortalExitSequence(pop, Math.Min(fixedDelta, 0.25f), now);
+                return;
+            }
+
+            if (pop.MovementBehavior == SharedAiMovementMode.FreeRoam)
+            {
+                // FreeRoam has a tighter presentation-aware movement gate than routed actors.
+                // The standalone GameServer wires its existing CombatPresentationRange here
+                // (36m by default). No new distance source is introduced. If not wired, fall
+                // back to the existing ActiveDistance for isolated service/Unity tests.
+                float freeRoamDistance = FreeRoamActiveDistance > 0f
+                    ? Math.Min(FreeRoamActiveDistance, ActiveDistance)
+                    : ActiveDistance;
+                float nearestPlayerSq = GetNearestPlayerDistanceSquared(pop.Actor);
+                if (nearestPlayerSq <= freeRoamDistance * freeRoamDistance)
+                {
+                    TickFreeRoam(pop, Math.Min(fixedDelta, 0.25f), now);
+                }
+                else
+                {
+                    TickStationary(pop);
+                }
+                return;
+            }
+
+            if (pop.MovementBehavior == SharedAiMovementMode.Stationary)
+            {
+                TickStationary(pop);
                 return;
             }
 
@@ -710,14 +771,22 @@ namespace Game.Server.Application.Population
                 for (int i = 0; i < anchors.Length; ++i)
                 {
                     ServerSpawnAnchor anchor = anchors[i];
-                    if (anchor == null || !anchor.enabled || anchor.kind != ServerSpawnKind.Population)
+                    if (anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
                         continue;
                     if (!TryResolveSpawn(graph, anchor, out ServerPose spawnPose))
                         continue;
 
+                    SharedAiMovementMode movementBehavior = ResolveMovementBehavior(graph, anchor);
                     PopulationNpcType npcType = InferNpcType(anchor.archetypeId);
-                    PopulationBehaviorProfileData profile = DefaultProfile(npcType);
-                    string displayName = string.IsNullOrWhiteSpace(anchor.label) ? $"Population {anchor.stableId}" : anchor.label;
+                    PopulationBehaviorProfileData profile = DefaultProfile(npcType, anchor.kind);
+                    string displayName = string.IsNullOrWhiteSpace(anchor.label)
+                        ? $"{anchor.kind} {anchor.stableId}"
+                        : anchor.label;
+
+                    // Population/NPC/Monster are intentionally the same lightweight authoritative
+                    // actor family. SpawnKind + MovementBehavior select their AI; keeping the
+                    // canonical Population actor kind preserves the existing presentation,
+                    // interaction, combat-promotion, loot, AOI and replication paths.
                     AuthoritativeActorRuntime actor = _actors.Create(
                         AuthoritativeActorKind.Population,
                         anchor.archetypeId,
@@ -730,10 +799,12 @@ namespace Game.Server.Application.Population
                         100,
                         profile.weightClass);
 
+                    float capsuleRadius = Math.Max(0.2f, anchor.capsuleRadius);
+                    float capsuleHeight = Math.Max(anchor.capsuleHeight, capsuleRadius * 2f);
                     var motorSettings = new CharacterMotorSettings
                     {
-                        Radius = Math.Max(0.2f, anchor.capsuleRadius),
-                        Height = Math.Max(anchor.capsuleHeight, anchor.capsuleRadius * 2f),
+                        Radius = capsuleRadius,
+                        Height = capsuleHeight,
                         WalkSpeed = profile.walkSpeed,
                         SprintSpeed = profile.runSpeed,
                     };
@@ -741,8 +812,12 @@ namespace Game.Server.Application.Population
                     {
                         Actor = actor,
                         NpcType = npcType,
+                        SpawnKind = anchor.kind,
+                        MovementBehavior = movementBehavior,
                         SimulationLod = PopulationSimulationLod.CoarseRoute,
-                        AiState = PopulationAiState.FollowingRoute,
+                        AiState = movementBehavior == SharedAiMovementMode.Route
+                            ? PopulationAiState.FollowingRoute
+                            : PopulationAiState.Idle,
                         RouteReason = PopulationRouteReason.Wander,
                         WalkSpeed = profile.walkSpeed * DeterministicVariation(anchor.stableId, 0.88f, 1.12f),
                         RunSpeed = profile.runSpeed,
@@ -756,8 +831,19 @@ namespace Game.Server.Application.Population
                         Random = new Random(unchecked((int)(anchor.stableId ^ (anchor.stableId >> 32) ^ 0x51F15EED))),
                         LastProgressAt = 0d,
                         LastProgressPosition = spawnPose.ToWorldPosition(),
+                        HomePosition = spawnPose.ToWorldPosition(),
+                        RoamRadius = Math.Max(2f, DefaultFreeRoamRadius),
+                        LeashRadius = Math.Max(Math.Max(2f, DefaultFreeRoamRadius) + 1f, DefaultFreeRoamLeashRadius),
+                        CapsuleRadius = capsuleRadius,
+                        CapsuleHeight = capsuleHeight,
                     };
-                    pop.CurrentNodeId = anchor.routeNodeId > 0 ? anchor.routeNodeId : FindNearestNode(graph, spawnPose.ToWorldPosition());
+
+                    pop.CurrentNodeId = movementBehavior == SharedAiMovementMode.Route
+                        ? (anchor.routeNodeId > 0
+                            ? anchor.routeNodeId
+                            : FindNearestNode(graph, spawnPose.ToWorldPosition()))
+                        : 0;
+
                     _population.Add(actor.Handle.actorId, pop);
                     _populationSchedule.Add(pop);
 
@@ -769,7 +855,8 @@ namespace Game.Server.Application.Population
                         pop.LastPortalId = initialPortal.stableId;
                         pop.AiState = PopulationAiState.PortalDormant;
                         pop.SimulationLod = PopulationSimulationLod.Dormant;
-                        pop.CurrentNodeId = initialPortal.routeNodeId > 0 ? initialPortal.routeNodeId : pop.CurrentNodeId;
+                        if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                            pop.CurrentNodeId = initialPortal.routeNodeId > 0 ? initialPortal.routeNodeId : pop.CurrentNodeId;
                         pop.Actor.Position = initialPortal.interiorSpawn.ToWorldPosition();
                         pop.Actor.LastSafePosition = pop.Actor.Position;
                         pop.MotorState = new CharacterMotorState(pop.Actor.Position);
@@ -778,7 +865,8 @@ namespace Game.Server.Application.Population
                     }
                     else
                     {
-                        OrganicStartupDistribution(graph, pop, false);
+                        if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                            OrganicStartupDistribution(graph, pop, false);
                         EnterAoiHibernate(pop, 0d);
                     }
 
@@ -787,11 +875,31 @@ namespace Game.Server.Application.Population
             }
         }
 
+        private static bool IsSharedAiSpawnKind(ServerSpawnKind kind) =>
+            kind == ServerSpawnKind.Population ||
+            kind == ServerSpawnKind.Npc ||
+            kind == ServerSpawnKind.Monster;
+
+        private static SharedAiMovementMode ResolveMovementBehavior(MapGraph graph, ServerSpawnAnchor anchor)
+        {
+            if (anchor != null && anchor.routeNodeId > 0 && graph.Nodes.ContainsKey(anchor.routeNodeId))
+                return SharedAiMovementMode.Route;
+
+            if (anchor != null && anchor.kind == ServerSpawnKind.Monster)
+                return SharedAiMovementMode.FreeRoam;
+
+            if (anchor != null && FindNearestNode(graph, anchor.pose.ToWorldPosition()) > 0)
+                return SharedAiMovementMode.Route;
+
+            return SharedAiMovementMode.Stationary;
+        }
+
         private static PopulationNpcType InferNpcType(string archetypeId)
         {
             string value = (archetypeId ?? string.Empty).ToLowerInvariant();
             if (value.Contains("police")) return PopulationNpcType.Police;
             if (value.Contains("hunter")) return PopulationNpcType.Hunter;
+            if (value.Contains("ghoul")) return PopulationNpcType.Ghoul;
             if (value.Contains("gang")) return PopulationNpcType.GangMember;
             if (value.Contains("criminal")) return PopulationNpcType.Criminal;
             if (value.Contains("worker")) return PopulationNpcType.Worker;
@@ -802,9 +910,19 @@ namespace Game.Server.Application.Population
             return PopulationNpcType.Civilian;
         }
 
-        private static PopulationBehaviorProfileData DefaultProfile(PopulationNpcType type)
+        private static PopulationBehaviorProfileData DefaultProfile(PopulationNpcType type, ServerSpawnKind spawnKind)
         {
             var result = new PopulationBehaviorProfileData { npcType = type, profileId = type.ToString() };
+            if (spawnKind == ServerSpawnKind.Monster)
+            {
+                result.profileId = "Monster.FreeRoam";
+                result.faction = ActorFaction.Monster;
+                result.aggression = 0.75f;
+                result.courage = 0.85f;
+                result.combatSkill = 0.50f;
+                return result;
+            }
+
             switch (type)
             {
                 case PopulationNpcType.Police:
@@ -885,6 +1003,160 @@ namespace Game.Server.Application.Population
             // Logical actors retain life/route state but update less often. Advancing route progress
             // is cheap and keeps their conceptual travel continuous without collision queries.
             TickCoarse(pop, Math.Min(dt, 2f), now);
+        }
+
+        private void TickStationary(PopulationActorRuntime pop)
+        {
+            if (pop?.Actor == null)
+                return;
+
+            bool changed =
+                Math.Abs(pop.Actor.VelocityX) > 0.0001f ||
+                Math.Abs(pop.Actor.VelocityY) > 0.0001f ||
+                Math.Abs(pop.Actor.VelocityZ) > 0.0001f ||
+                pop.AiState != PopulationAiState.Idle;
+
+            pop.Actor.VelocityX = 0f;
+            pop.Actor.VelocityY = 0f;
+            pop.Actor.VelocityZ = 0f;
+            pop.AiState = PopulationAiState.Idle;
+
+            if (changed)
+            {
+                _actors.PublishChanged(pop.Actor);
+                Changed?.Invoke(pop);
+            }
+        }
+
+        private void TickFreeRoam(PopulationActorRuntime pop, float dt, double now)
+        {
+            if (pop?.Actor == null || !TryGetGraph(pop.Actor, out MapGraph graph))
+                return;
+
+            if (pop.WaitUntil > now)
+            {
+                TickStationary(pop);
+                return;
+            }
+
+            float leash = Math.Max(pop.RoamRadius + 1f, pop.LeashRadius);
+            if (DistanceXZ(pop.Actor.Position, pop.HomePosition) > leash)
+            {
+                pop.RoamTarget = pop.HomePosition;
+                pop.HasRoamTarget = true;
+                pop.AiState = PopulationAiState.Recovering;
+            }
+            else if (!pop.HasRoamTarget)
+            {
+                if (now + 0.000001d < pop.NextRoamDecisionAt)
+                {
+                    TickStationary(pop);
+                    return;
+                }
+
+                if (!TrySelectFreeRoamTarget(graph, pop, out WorldPosition roamTarget))
+                {
+                    pop.NextRoamDecisionAt = now + 1d;
+                    TickStationary(pop);
+                    return;
+                }
+
+                pop.RoamTarget = roamTarget;
+                pop.HasRoamTarget = true;
+                pop.AiState = PopulationAiState.FollowingRoute;
+                pop.RouteReason = PopulationRouteReason.Wander;
+            }
+
+            float dx = pop.RoamTarget.X - pop.Actor.Position.X;
+            float dz = pop.RoamTarget.Z - pop.Actor.Position.Z;
+            float distSq = dx * dx + dz * dz;
+            if (distSq <= 0.50f * 0.50f)
+            {
+                pop.HasRoamTarget = false;
+                double minPause = Math.Max(0d, FreeRoamMinimumPauseSeconds);
+                double maxPause = Math.Max(minPause, FreeRoamMaximumPauseSeconds);
+                pop.WaitUntil = now + minPause + (maxPause - minPause) * pop.Random.NextDouble();
+                pop.NextRoamDecisionAt = pop.WaitUntil;
+                TickStationary(pop);
+                return;
+            }
+
+            float inv = 1f / MathF.Sqrt(Math.Max(0.0001f, distSq));
+            pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
+
+            if (graph.Collision != null)
+            {
+                var intent = new CharacterMovementIntent(dx * inv, dz * inv, false, false);
+                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision);
+                ApplyMotor(pop);
+            }
+            else
+            {
+                WorldPosition previous = pop.Actor.Position;
+                float step = Math.Min(MathF.Sqrt(distSq), Math.Max(0.1f, pop.WalkSpeed) * dt);
+                pop.Actor.Position = new WorldPosition(
+                    previous.X + dx * inv * step,
+                    previous.Y,
+                    previous.Z + dz * inv * step);
+                pop.Actor.LastSafePosition = pop.Actor.Position;
+                pop.Actor.MovementMode = ActorMovementMode.Grounded;
+                pop.Actor.VelocityX = pop.Actor.Position.X - previous.X;
+                pop.Actor.VelocityY = pop.Actor.Position.Y - previous.Y;
+                pop.Actor.VelocityZ = pop.Actor.Position.Z - previous.Z;
+                _actors.PublishChanged(pop.Actor);
+                Changed?.Invoke(pop);
+            }
+
+            DetectStuck(graph, pop, now);
+        }
+
+        private bool TrySelectFreeRoamTarget(
+            MapGraph graph,
+            PopulationActorRuntime pop,
+            out WorldPosition target)
+        {
+            target = pop?.HomePosition ?? default;
+            if (pop?.Actor == null)
+                return false;
+
+            float radius = Math.Max(2f, pop.RoamRadius);
+            for (int attempt = 0; attempt < 8; ++attempt)
+            {
+                double angle = pop.Random.NextDouble() * Math.PI * 2d;
+                float distance = 2f + (float)pop.Random.NextDouble() * Math.Max(0.1f, radius - 2f);
+                var candidate = new WorldPosition(
+                    pop.HomePosition.X + (float)Math.Sin(angle) * distance,
+                    pop.HomePosition.Y,
+                    pop.HomePosition.Z + (float)Math.Cos(angle) * distance);
+
+                if (graph.Collision == null)
+                {
+                    target = candidate;
+                    return true;
+                }
+
+                if (!graph.Collision.TryFindGround(
+                        candidate,
+                        Math.Max(0.2f, pop.CapsuleRadius),
+                        1f,
+                        2f,
+                        55f,
+                        out ServerGroundHit ground))
+                {
+                    continue;
+                }
+
+                var capsule = new ServerCapsule(
+                    Math.Max(0.2f, pop.CapsuleRadius),
+                    Math.Max(pop.CapsuleHeight, pop.CapsuleRadius * 2f));
+                if (!graph.Collision.IsCapsuleClear(ground.Position, capsule))
+                    continue;
+
+                target = ground.Position;
+                return true;
+            }
+
+            return false;
         }
 
         private void TickCoarse(PopulationActorRuntime pop, float dt, double now)
@@ -998,17 +1270,42 @@ namespace Game.Server.Application.Population
             }
             if (now - pop.LastProgressAt < 3d) return;
 
-            // First recovery is route reattachment rather than teleportation. Disposable Population
-            // can later be demoted/portal-recycled if repeated recovery fails.
-            pop.AiState = PopulationAiState.Recovering;
             pop.RouteReason = PopulationRouteReason.Recovery;
-            ReattachToNearestRoute(pop);
+            if (pop.MovementBehavior == SharedAiMovementMode.Route)
+            {
+                // First recovery is route reattachment rather than teleportation.
+                pop.AiState = PopulationAiState.Recovering;
+                ReattachToNearestRoute(pop);
+            }
+            else if (pop.MovementBehavior == SharedAiMovementMode.FreeRoam)
+            {
+                // Free-roam recovery is cheap: discard the blocked destination and choose
+                // another direction on the next shared scheduler work item.
+                pop.AiState = PopulationAiState.Idle;
+                pop.HasRoamTarget = false;
+                pop.NextRoamDecisionAt = now + 0.25d;
+            }
+            else
+            {
+                pop.AiState = PopulationAiState.Idle;
+            }
+
             pop.LastProgressAt = now;
             pop.LastProgressPosition = pop.Actor.Position;
         }
 
         private void ReattachToNearestRoute(PopulationActorRuntime pop)
         {
+            if (pop == null || pop.MovementBehavior != SharedAiMovementMode.Route)
+            {
+                if (pop != null)
+                {
+                    pop.AiState = PopulationAiState.Idle;
+                    pop.HasRoamTarget = false;
+                }
+                return;
+            }
+
             if (!TryGetGraph(pop.Actor, out MapGraph graph)) return;
             long node = FindNearestNode(graph, pop.Actor.Position);
             if (node <= 0) return;
@@ -1278,9 +1575,19 @@ namespace Game.Server.Application.Population
                 };
                 if (pop.PortalPhase == PopulationPortalSequencePhase.None)
                 {
-                    pop.AiState = PopulationAiState.FollowingRoute;
                     pop.RouteReason = PopulationRouteReason.Wander;
-                    EnsureNextNode(graph, pop);
+                    if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                    {
+                        pop.AiState = PopulationAiState.FollowingRoute;
+                        EnsureNextNode(graph, pop);
+                    }
+                    else
+                    {
+                        pop.AiState = PopulationAiState.Idle;
+                        pop.HasRoamTarget = false;
+                        pop.HomePosition = pop.Actor.Position;
+                        pop.NextRoamDecisionAt = now;
+                    }
                 }
             }
         }
@@ -1625,6 +1932,22 @@ namespace Game.Server.Application.Population
             elapsed = Math.Min(elapsed, Math.Max(1d, MaximumLogicalCatchUpSeconds));
             if (elapsed <= 0.0001d)
                 return;
+
+            // Route actors can cheaply advance deterministically while hibernated. Free-roam
+            // actors have no authored path to integrate off-screen, so wake at their last safe
+            // position and choose a fresh direction without spending dormant CPU.
+            if (pop.MovementBehavior != SharedAiMovementMode.Route)
+            {
+                pop.HasRoamTarget = false;
+                pop.WaitUntil = 0d;
+                pop.NextRoamDecisionAt = now;
+                pop.AiState = PopulationAiState.Idle;
+                pop.Actor.VelocityX = 0f;
+                pop.Actor.VelocityY = 0f;
+                pop.Actor.VelocityZ = 0f;
+                pop.MotorState = new CharacterMotorState(pop.Actor.Position);
+                return;
+            }
 
             double cursor = now - elapsed;
             int hops = 0;

@@ -20,3 +20,4 @@ C:\MMO\Project Testbed\Server\Source\Tests\Game.Server.Application.RegressionTes
 C:\MMO\Project Testbed\Server\Source\Tests\Game.Server.Application.RegressionTests\obj\Release\net8.0\Game.Server.Application.RegressionTests.pdb
 C:\MMO\Project Testbed\Server\Source\Tests\Game.Server.Application.RegressionTests\obj\Release\net8.0\Game.Server.Application.RegressionTests.genruntimeconfig.cache
 C:\MMO\Project Testbed\Server\Source\Tests\Game.Server.Application.RegressionTests\obj\Release\net8.0\ref\Game.Server.Application.RegressionTests.dll
+C:\MMO\Project Testbed\Server\Source\Tests\Game.Server.Application.RegressionTests\obj\Release\net8.0\Game.Server.Application.RegressionTests.sourcelink.json

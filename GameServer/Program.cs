@@ -43,6 +43,11 @@ internal static class Program
                 options.RequireMapData,
                 options.StaffAuthorizationFile,
                 options.StaffAuditFile);
+
+            // Reuse the existing GameServer presentation distance as the FreeRoam-only
+            // movement cutoff. Routed Population/NPC ActiveDistance remains unchanged.
+            runtime.Population.FreeRoamActiveDistance = options.CombatPresentationRange;
+
             using var directoryLease = new BackendGameServerDirectoryLease(
                 runtime.Backend,
                 options,

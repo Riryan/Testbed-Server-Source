@@ -94,6 +94,9 @@ internal static class Program
         RunSync("Population portal spawn remains dormant until a player activates it", PopulationPortalActivationUsesExistingPortal);
         RunSync("Population portal can release multiple active Pops from one authored spawn", PopulationPortalAllowsMultipleActive);
         RunSync("Population portal staggers release cadence without per-Pop timers", PopulationPortalStaggersReleaseCadence);
+        RunSync("Monster free roam uses shared actor runtime without route nodes", MonsterFreeRoamUsesSharedRuntime);
+        RunSync("Monster free roam idles beyond configured free-roam distance", MonsterFreeRoamIdlesAtFarRange);
+        RunSync("NPC route movement uses shared actor runtime", NpcRouteMovementUsesSharedRuntime);
         Console.WriteLine("All Game.Server.Application regression tests passed.");
     }
 
@@ -376,6 +379,170 @@ internal static class Program
                 active++;
         }
         return active;
+    }
+
+    private static void MonsterFreeRoamUsesSharedRuntime()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.populationNodes = Array.Empty<ServerPopulationRouteNode>();
+        map.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        map.spawnAnchors[0].kind = ServerSpawnKind.Monster;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Monster;
+        map.spawnAnchors[0].archetypeId = "monster.test";
+        map.spawnAnchors[0].routeNodeId = 0;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+            DefaultFreeRoamRadius = 20f,
+            DefaultFreeRoamLeashRadius = 35f,
+        };
+
+        PopulationActorRuntime monster = SinglePopulation(population);
+        Require(monster.Actor.Handle.kind == AuthoritativeActorKind.Population,
+            "Monster AI should reuse the canonical lightweight Population actor family");
+        Require(monster.SpawnKind == ServerSpawnKind.Monster,
+            "Monster spawn kind must remain available to AI");
+        Require(monster.MovementBehavior == SharedAiMovementMode.FreeRoam,
+            "route-less Monster should select FreeRoam");
+        Require(monster.IsHibernating,
+            "Monster should start in the shared AOI hibernation path");
+
+        WorldPosition before = monster.Actor.Position;
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(5, "population_test", string.Empty, before),
+        };
+
+        population.PrepareBudgetedTick(nearbyPlayer, 2d);
+        Require(!monster.IsHibernating, "nearby player should wake the Monster");
+
+        for (int step = 0; step < 12; ++step)
+        {
+            double now = 2.25d + step * 0.25d;
+            population.PrepareBudgetedTick(nearbyPlayer, now);
+            int guard = 0;
+            while (population.HasDueWork(now) && guard++ < 8)
+                population.TickNextBudgeted(0.25f, now);
+        }
+
+        float dx = monster.Actor.Position.X - before.X;
+        float dz = monster.Actor.Position.Z - before.Z;
+        Require(dx * dx + dz * dz > 0.01f,
+            "free-roam Monster should move without Population route nodes");
+    }
+
+    private static void MonsterFreeRoamIdlesAtFarRange()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.populationNodes = Array.Empty<ServerPopulationRouteNode>();
+        map.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        map.spawnAnchors[0].kind = ServerSpawnKind.Monster;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Monster;
+        map.spawnAnchors[0].archetypeId = "monster.test";
+        map.spawnAnchors[0].routeNodeId = 0;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            EngagedDistance = 28f,
+            ActiveDistance = 80f,
+            FreeRoamActiveDistance = 36f,
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+        };
+
+        PopulationActorRuntime monster = SinglePopulation(population);
+        WorldPosition spawn = monster.Actor.Position;
+
+        // Wake inside the existing activation threshold first.
+        var nearPlayer = new[]
+        {
+            new PopulationPlayerView(7, "population_test", string.Empty, spawn),
+        };
+        population.PrepareBudgetedTick(nearPlayer, 1d);
+        Require(!monster.IsHibernating, "near player should wake the Monster");
+
+        // Move the observer beyond the 36m FreeRoam gate but keep it inside the 80m Active LOD.
+        var farPlayer = new[]
+        {
+            new PopulationPlayerView(
+                7,
+                "population_test",
+                string.Empty,
+                new WorldPosition(spawn.X + 40f, spawn.Y, spawn.Z)),
+        };
+
+        population.PrepareBudgetedTick(farPlayer, 2d);
+        int guard = 0;
+        while (population.HasDueWork(2d) && guard++ < 8)
+            population.TickNextBudgeted(0.25f, 2d);
+
+        Require(!monster.IsHibernating,
+            "Monster at 40m should remain awake");
+        Require(monster.SimulationLod == PopulationSimulationLod.Active,
+            "Monster at 40m should still be in the existing Active LOD tier");
+
+        WorldPosition beforeIdle = monster.Actor.Position;
+
+        for (int step = 0; step < 4; ++step)
+        {
+            double now = 3d + step;
+            population.PrepareBudgetedTick(farPlayer, now);
+            guard = 0;
+            while (population.HasDueWork(now) && guard++ < 8)
+                population.TickNextBudgeted(0.25f, now);
+        }
+
+        float dx = monster.Actor.Position.X - beforeIdle.X;
+        float dz = monster.Actor.Position.Z - beforeIdle.Z;
+        Require(dx * dx + dz * dz <= 0.0001f,
+            "Monster beyond FreeRoamActiveDistance should idle instead of free-roaming");
+        Require(Math.Abs(monster.Actor.VelocityX) <= 0.0001f &&
+                Math.Abs(monster.Actor.VelocityY) <= 0.0001f &&
+                Math.Abs(monster.Actor.VelocityZ) <= 0.0001f,
+            "far-idle Monster should publish zero movement velocity");
+    }
+
+    private static void NpcRouteMovementUsesSharedRuntime()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.spawnAnchors[0].kind = ServerSpawnKind.Npc;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Npc;
+        map.spawnAnchors[0].archetypeId = "worker.test";
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+        };
+
+        PopulationActorRuntime npc = SinglePopulation(population);
+        Require(npc.Actor.Handle.kind == AuthoritativeActorKind.Population,
+            "NPC AI should reuse the canonical lightweight Population actor family");
+        Require(npc.SpawnKind == ServerSpawnKind.Npc,
+            "NPC spawn kind must remain available to AI");
+        Require(npc.MovementBehavior == SharedAiMovementMode.Route,
+            "NPC with an authored route should use Route movement");
+
+        WorldPosition before = npc.Actor.Position;
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(6, "population_test", string.Empty, before),
+        };
+        population.PrepareBudgetedTick(nearbyPlayer, 20d);
+
+        Require(!npc.IsHibernating, "nearby player should wake the NPC");
+        float dx = npc.Actor.Position.X - before.X;
+        float dz = npc.Actor.Position.Z - before.Z;
+        Require(dx * dx + dz * dz > 0.25f,
+            "NPC should reuse existing route catch-up movement");
     }
 
     private static PopulationActorRuntime SinglePopulation(PopulationSimulationService population)

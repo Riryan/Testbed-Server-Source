@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Game.Server.Application.RegressionTests")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f6b2af542b5e3464c2c1be2827ea98e579b2cafc")]
 [assembly: System.Reflection.AssemblyProductAttribute("Game.Server.Application.RegressionTests")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Game.Server.Application.RegressionTests")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
