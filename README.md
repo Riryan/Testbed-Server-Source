@@ -143,6 +143,14 @@ Examples that should remain outside source control:
 - `bin/` and `obj/` output;
 - logs, dumps, profiler captures, and temporary runtime files unless intentionally added as test evidence.
 
+## License and contributions
+
+This project is released under the **MIT License**. See [`LICENSE`](LICENSE).
+
+Forks, experiments, fixes, performance work, tooling, and other extensions are welcome. If you build on this project, preserve the MIT license notice for the portions covered by this repository.
+
+Third-party components and bundled dependencies remain subject to their own license terms where applicable.
+
 ## Status
 
 This repository is an active development/testbed snapshot rather than a packaged public release. Architecture, protocol contracts, performance work, gameplay systems, and administration tooling are still evolving.
