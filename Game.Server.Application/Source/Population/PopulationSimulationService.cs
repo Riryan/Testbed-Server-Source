@@ -406,7 +406,7 @@ namespace Game.Server.Application.Population
             double now,
             IReadOnlyList<PopulationPlayerView> players)
         {
-            UpdateSimulationLod(pop);
+            float nearestPlayerSq = UpdateSimulationLod(pop);
 
             // Canonical Population death is terminal for normal simulation until an explicit
             // future decay/respawn policy changes it. Do not let dormant/logical route ticking
@@ -429,7 +429,7 @@ namespace Game.Server.Application.Population
                 return;
             }
 
-            if (ShouldHibernateForPlayerDistance(pop))
+            if (ShouldHibernateForPlayerDistance(pop, nearestPlayerSq))
             {
                 EnterAoiHibernate(pop, now);
                 return;
@@ -477,7 +477,6 @@ namespace Game.Server.Application.Population
                 float freeRoamDistance = FreeRoamActiveDistance > 0f
                     ? Math.Min(FreeRoamActiveDistance, ActiveDistance)
                     : ActiveDistance;
-                float nearestPlayerSq = GetNearestPlayerDistanceSquared(pop.Actor);
                 if (nearestPlayerSq <= freeRoamDistance * freeRoamDistance)
                 {
                     TickFreeRoam(pop, Math.Min(fixedDelta, 0.25f), now);
@@ -839,7 +838,7 @@ namespace Game.Server.Application.Population
                     };
 
                     pop.CurrentNodeId = movementBehavior == SharedAiMovementMode.Route
-                        ? (anchor.routeNodeId > 0
+                        ? (anchor.routeNodeId > 0 && graph.Nodes.ContainsKey(anchor.routeNodeId)
                             ? anchor.routeNodeId
                             : FindNearestNode(graph, spawnPose.ToWorldPosition()))
                         : 0;
@@ -976,12 +975,12 @@ namespace Game.Server.Application.Population
             }
         }
 
-        private void UpdateSimulationLod(PopulationActorRuntime pop)
+        private float UpdateSimulationLod(PopulationActorRuntime pop)
         {
             if (pop.AiState == PopulationAiState.PortalDormant || !pop.Actor.Alive)
             {
                 pop.SimulationLod = PopulationSimulationLod.Dormant;
-                return;
+                return float.PositiveInfinity;
             }
 
             float nearestSq = GetNearestPlayerDistanceSquared(pop.Actor);
@@ -996,6 +995,8 @@ namespace Game.Server.Application.Population
                 pop.SimulationLod = PopulationSimulationLod.CoarseRoute;
             else
                 pop.SimulationLod = PopulationSimulationLod.Logical;
+
+            return nearestSq;
         }
 
         private void TickLogical(PopulationActorRuntime pop, float dt, double now)
@@ -1736,7 +1737,7 @@ namespace Game.Server.Application.Population
             return lane * half;
         }
 
-        private bool ShouldHibernateForPlayerDistance(PopulationActorRuntime pop)
+        private bool ShouldHibernateForPlayerDistance(PopulationActorRuntime pop, float nearestPlayerSq)
         {
             if (pop == null || pop.Actor == null || pop.AwaitingPlayerActivation ||
                 pop.AiState == PopulationAiState.PortalDormant ||
@@ -1747,7 +1748,7 @@ namespace Game.Server.Application.Population
             }
 
             float hibernate = Math.Max(PlayerActivationDistance + 1f, PlayerHibernateDistance);
-            return GetNearestPlayerDistanceSquared(pop.Actor) > hibernate * hibernate;
+            return nearestPlayerSq > hibernate * hibernate;
         }
 
         private void EnterAoiHibernate(PopulationActorRuntime pop, double now)

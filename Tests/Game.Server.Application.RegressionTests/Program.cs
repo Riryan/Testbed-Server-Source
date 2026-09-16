@@ -97,6 +97,10 @@ internal static class Program
         RunSync("Monster free roam uses shared actor runtime without route nodes", MonsterFreeRoamUsesSharedRuntime);
         RunSync("Monster free roam idles beyond configured free-roam distance", MonsterFreeRoamIdlesAtFarRange);
         RunSync("NPC route movement uses shared actor runtime", NpcRouteMovementUsesSharedRuntime);
+        RunSync("NPC without route graph resolves Stationary", NpcWithoutRouteGraphIsStationary);
+        RunSync("NPC without explicit route uses nearest-route fallback", NpcWithoutExplicitRouteUsesNearestRouteFallback);
+        RunSync("NPC invalid explicit route normalizes to nearest valid route", NpcInvalidExplicitRouteNormalizesToNearestRoute);
+        RunSync("Monster invalid explicit route resolves FreeRoam", MonsterInvalidExplicitRouteResolvesFreeRoam);
         Console.WriteLine("All Game.Server.Application regression tests passed.");
     }
 
@@ -543,6 +547,88 @@ internal static class Program
         float dz = npc.Actor.Position.Z - before.Z;
         Require(dx * dx + dz * dz > 0.25f,
             "NPC should reuse existing route catch-up movement");
+    }
+
+    private static void NpcWithoutRouteGraphIsStationary()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.populationNodes = Array.Empty<ServerPopulationRouteNode>();
+        map.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        map.spawnAnchors[0].kind = ServerSpawnKind.Npc;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Npc;
+        map.spawnAnchors[0].archetypeId = "worker.stationary";
+        map.spawnAnchors[0].routeNodeId = 0;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null);
+
+        PopulationActorRuntime npc = SinglePopulation(population);
+        Require(npc.MovementBehavior == SharedAiMovementMode.Stationary,
+            "NPC with no explicit route and no route graph should resolve Stationary");
+        Require(npc.CurrentRouteNodeId == 0,
+            "Stationary NPC should not retain a route node");
+    }
+
+    private static void NpcWithoutExplicitRouteUsesNearestRouteFallback()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.populationNodes = new[] { map.populationNodes[0] };
+        map.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        map.spawnAnchors[0].kind = ServerSpawnKind.Npc;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Npc;
+        map.spawnAnchors[0].archetypeId = "worker.nearest";
+        map.spawnAnchors[0].routeNodeId = 0;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null);
+
+        PopulationActorRuntime npc = SinglePopulation(population);
+        Require(npc.MovementBehavior == SharedAiMovementMode.Route,
+            "NPC with no explicit route should preserve the existing nearest-route fallback");
+        Require(npc.CurrentRouteNodeId == 1001,
+            "nearest-route fallback should bind the test NPC to the nearest valid route node");
+    }
+
+    private static void NpcInvalidExplicitRouteNormalizesToNearestRoute()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.populationNodes = new[] { map.populationNodes[0] };
+        map.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        map.spawnAnchors[0].kind = ServerSpawnKind.Npc;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Npc;
+        map.spawnAnchors[0].archetypeId = "worker.invalid-route";
+        map.spawnAnchors[0].routeNodeId = 999999;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null);
+
+        PopulationActorRuntime npc = SinglePopulation(population);
+        Require(npc.MovementBehavior == SharedAiMovementMode.Route,
+            "NPC with an invalid explicit route should preserve legacy nearest-route resolution");
+        Require(npc.CurrentRouteNodeId == 1001,
+            "invalid explicit route should normalize immediately to the nearest valid route node");
+    }
+
+    private static void MonsterInvalidExplicitRouteResolvesFreeRoam()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.spawnAnchors[0].kind = ServerSpawnKind.Monster;
+        map.spawnAnchors[0].actorKind = AuthoritativeActorKind.Monster;
+        map.spawnAnchors[0].archetypeId = "monster.invalid-route";
+        map.spawnAnchors[0].routeNodeId = 999999;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null);
+
+        PopulationActorRuntime monster = SinglePopulation(population);
+        Require(monster.MovementBehavior == SharedAiMovementMode.FreeRoam,
+            "Monster with an invalid explicit route should preserve FreeRoam fallback");
+        Require(monster.CurrentRouteNodeId == 0,
+            "FreeRoam Monster should not retain the invalid route node");
     }
 
     private static PopulationActorRuntime SinglePopulation(PopulationSimulationService population)
