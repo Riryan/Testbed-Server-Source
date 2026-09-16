@@ -1,0 +1,449 @@
+<Window x:Class="MMODashboard.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MMO Dashboard" Height="760" Width="1220" MinHeight="520" MinWidth="900"
+        ResizeMode="CanResizeWithGrip" SizeToContent="Manual"
+        WindowStartupLocation="CenterScreen" Background="#0B1019" Foreground="#E8EDF6">
+    <Window.Resources>
+        <SolidColorBrush x:Key="Panel" Color="#121927"/>
+        <SolidColorBrush x:Key="Panel2" Color="#171F30"/>
+        <SolidColorBrush x:Key="Border" Color="#253149"/>
+        <SolidColorBrush x:Key="Muted" Color="#95A3B8"/>
+        <SolidColorBrush x:Key="Accent" Color="#386FEF"/>
+        <SolidColorBrush x:Key="Green" Color="#3ED598"/>
+        <SolidColorBrush x:Key="Red" Color="#FF6B6B"/>
+        <Style TargetType="Button">
+            <Setter Property="Foreground" Value="#EEF3FB"/>
+            <Setter Property="Background" Value="#202A3D"/>
+            <Setter Property="BorderBrush" Value="#34425C"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="14,8"/>
+            <Setter Property="Margin" Value="5,0,0,0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#0E1420"/>
+            <Setter Property="Foreground" Value="#E8EDF6"/>
+            <Setter Property="BorderBrush" Value="#2A3650"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="9,7"/>
+            <Setter Property="CaretBrush" Value="White"/>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#0E1420"/>
+            <Setter Property="Foreground" Value="#E8EDF6"/>
+            <Setter Property="BorderBrush" Value="#2A3650"/>
+            <Setter Property="Padding" Value="7,5"/>
+        </Style>
+        <Style TargetType="ListBox">
+            <Setter Property="Background" Value="#0E1420"/>
+            <Setter Property="Foreground" Value="#E8EDF6"/>
+            <Setter Property="BorderBrush" Value="#2A3650"/>
+        </Style>
+        <Style TargetType="DataGrid">
+            <Setter Property="Background" Value="#0A101A"/>
+            <Setter Property="Foreground" Value="#E8EDF6"/>
+            <Setter Property="BorderBrush" Value="#253149"/>
+            <Setter Property="RowBackground" Value="#0E1521"/>
+            <Setter Property="AlternatingRowBackground" Value="#111A28"/>
+            <Setter Property="HorizontalGridLinesBrush" Value="#202C40"/>
+            <Setter Property="VerticalGridLinesBrush" Value="#202C40"/>
+            <Setter Property="HeadersVisibility" Value="Column"/>
+            <Setter Property="AutoGenerateColumns" Value="False"/>
+        </Style>
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#182235"/>
+            <Setter Property="Foreground" Value="#DCE5F3"/>
+            <Setter Property="BorderBrush" Value="#2A3650"/>
+            <Setter Property="Padding" Value="8,6"/>
+        </Style>
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="#253149"/>
+        </Style>
+        <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="#DDE5F3"/>
+            <Setter Property="Background" Value="#121927"/>
+            <Setter Property="BorderBrush" Value="#34425C"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="14,7"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="TabBorder"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}"
+                                Margin="0,0,2,0">
+                            <ContentPresenter ContentSource="Header"
+                                              HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#21324B"/>
+                                <Setter Property="Foreground" Value="#F3F7FF"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#8FC5FF"/>
+                                <Setter TargetName="TabBorder" Property="BorderBrush" Value="#B9DBFF"/>
+                                <Setter Property="Foreground" Value="#08111F"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,5"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="22">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,18">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="MMO Dashboard" FontSize="31" FontWeight="SemiBold"/>
+                <TextBlock Text="Server operations, configuration, and gameplay content authoring" Foreground="{StaticResource Muted}" Margin="0,5,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <Button x:Name="BuildAllButton" Content="BUILD ALL" Click="BuildAll_Click"/>
+                <Button x:Name="BuildStartButton" Content="BUILD &amp; START" Click="BuildStart_Click" Background="{StaticResource Accent}" BorderBrush="#6B91F0" FontWeight="SemiBold" Padding="22,11"/>
+            </StackPanel>
+        </Grid>
+
+        <Border Grid.Row="1" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="12" Padding="15" Margin="0,0,0,14">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock Text="SERVER ROOT" Foreground="{StaticResource Muted}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <TextBlock x:Name="ServerRootText" Grid.Column="1" Margin="14,0" FontFamily="Consolas" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                <Button Grid.Column="2" Content="Open Folder" Click="OpenRoot_Click" Margin="0"/>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="2" Margin="0,0,0,14">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="14"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="12" Padding="18">
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="Gateway" FontSize="20" FontWeight="SemiBold"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                            <Ellipse x:Name="GatewayDot" Width="10" Height="10" Fill="{StaticResource Red}" Margin="0,3,8,0"/>
+                            <TextBlock x:Name="GatewayStatus" Text="Stopped" Foreground="{StaticResource Muted}"/>
+                        </StackPanel>
+                        <TextBlock x:Name="GatewayScriptText" Foreground="{StaticResource Muted}" Margin="0,8,0,0" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="BuildGatewayButton" Content="Build" Click="BuildGateway_Click"/>
+                        <Button Content="Run" Click="RunGateway_Click"/>
+                        <Button Content="Stop" Click="StopGateway_Click" Background="#4A252B" BorderBrush="#6A333C"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="12" Padding="18">
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="GameServer" FontSize="20" FontWeight="SemiBold"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                            <Ellipse x:Name="GameDot" Width="10" Height="10" Fill="{StaticResource Red}" Margin="0,3,8,0"/>
+                            <TextBlock x:Name="GameStatus" Text="Stopped" Foreground="{StaticResource Muted}"/>
+                        </StackPanel>
+                        <TextBlock x:Name="GameScriptText" Foreground="{StaticResource Muted}" Margin="0,8,0,0" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="BuildGameButton" Content="Build" Click="BuildGame_Click"/>
+                        <Button Content="Run" Click="RunGame_Click"/>
+                        <Button Content="Stop" Click="StopGame_Click" Background="#4A252B" BorderBrush="#6A333C"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <TabControl Grid.Row="3" x:Name="MainTabs">
+            <TabItem Header="Operations">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="12" Padding="12">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                            <Grid Margin="4,2,4,9">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="Console" FontSize="16" FontWeight="SemiBold"/>
+                                    <TextBlock x:Name="ActivityText" Text="Ready" Foreground="{StaticResource Muted}" Margin="14,2,0,0"/>
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="Clear" Click="Clear_Click" Padding="11,5" FontSize="12" Margin="0"/>
+                            </Grid>
+                            <RichTextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" Background="#090D14" Foreground="#D5DEED"
+                                         BorderBrush="#202A3B" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                         FontFamily="Consolas" FontSize="12" Padding="8"/>
+                        </Grid>
+                    </Border>
+
+                    <Expander x:Name="SetupExpander" Grid.Row="1" Header="Setup / Configuration" Margin="0,12,0,0" Foreground="#DDE5F3" Background="{StaticResource Panel}">
+                        <Border BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14" Background="{StaticResource Panel}">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="175"/><ColumnDefinition Width="*"/><ColumnDefinition Width="96"/></Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <TextBlock Grid.Row="0" Text="Build Gateway" VerticalAlignment="Center"/>
+                                <TextBox x:Name="BuildGatewayPathBox" Grid.Row="0" Grid.Column="1" Margin="6" TextChanged="ConfigurationPath_TextChanged"/>
+                                <Button Grid.Row="0" Grid.Column="2" Content="Browse" Click="BrowseBuildGateway_Click" Padding="8,7"/>
+
+                                <TextBlock Grid.Row="1" Text="Build GameServer" VerticalAlignment="Center"/>
+                                <TextBox x:Name="BuildGameServerPathBox" Grid.Row="1" Grid.Column="1" Margin="6" TextChanged="ConfigurationPath_TextChanged"/>
+                                <Button Grid.Row="1" Grid.Column="2" Content="Browse" Click="BrowseBuildGameServer_Click" Padding="8,7"/>
+
+                                <TextBlock Grid.Row="2" Text="Run Gateway" VerticalAlignment="Center"/>
+                                <TextBox x:Name="RunGatewayPathBox" Grid.Row="2" Grid.Column="1" Margin="6" TextChanged="ConfigurationPath_TextChanged"/>
+                                <Button Grid.Row="2" Grid.Column="2" Content="Browse" Click="BrowseRunGateway_Click" Padding="8,7"/>
+
+                                <TextBlock Grid.Row="3" Text="Run GameServer" VerticalAlignment="Center"/>
+                                <TextBox x:Name="RunGameServerPathBox" Grid.Row="3" Grid.Column="1" Margin="6" TextChanged="ConfigurationPath_TextChanged"/>
+                                <Button Grid.Row="3" Grid.Column="2" Content="Browse" Click="BrowseRunGameServer_Click" Padding="8,7"/>
+
+                                <TextBlock Grid.Row="4" Text="Runtime Config" VerticalAlignment="Center"/>
+                                <TextBox x:Name="ServerConfigPathBox" Grid.Row="4" Grid.Column="1" Margin="6" IsReadOnly="True"/>
+                                <Button Grid.Row="4" Grid.Column="2" Content="Install/Repair" Click="InstallRuntimeConfig_Click" Padding="6,7"/>
+
+                                <StackPanel Grid.Row="5" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,7,0,0">
+                                    <Button Content="Auto Detect" Click="AutoDetectButton_Click"/>
+                                    <Button Content="Save Configuration" Click="SaveConfigurationButton_Click" Background="#244A3B" BorderBrush="#32654F"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                    </Expander>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Server Config">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <Border Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="Canonical server settings" FontSize="17" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="AdminWorkspaceText" Text="Local filesystem" Foreground="{StaticResource Muted}" Margin="0,4,0,0"/>
+                            </StackPanel>
+                            <Button Grid.Column="1" Content="Reload All" Click="ReloadAdminDocuments_Click" Margin="0" VerticalAlignment="Center"/>
+                        </Grid>
+                    </Border>
+
+                    <TabControl Grid.Row="1">
+                        <TabItem Header="Runtime / Process">
+                            <Grid Margin="8">
+                                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="ServerConfig.bat" FontSize="16" FontWeight="SemiBold"/>
+                                        <TextBlock x:Name="RuntimeConfigDocumentText" Foreground="{StaticResource Muted}" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                        <Button Content="Open File" Click="OpenRuntimeConfig_Click"/>
+                                        <Button Content="Save Changes" Click="SaveRuntimeConfig_Click" Background="#244A3B" BorderBrush="#32654F"/>
+                                    </StackPanel>
+                                </Grid>
+                                <DataGrid x:Name="RuntimeConfigGrid" Grid.Row="1" CanUserAddRows="False" AlternationCount="2">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="Setting" Binding="{Binding Key}" IsReadOnly="True" Width="2*"/>
+                                        <DataGridTextColumn Header="Value" Binding="{Binding Value, UpdateSourceTrigger=PropertyChanged}" Width="4*"/>
+                                        <DataGridTextColumn Header="Type" Binding="{Binding Kind}" IsReadOnly="True" Width="1.5*"/>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </TabItem>
+
+                        <TabItem Header="Gateway">
+                            <Grid Margin="8">
+                                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="Gateway appsettings" FontSize="16" FontWeight="SemiBold"/>
+                                        <TextBlock x:Name="GatewaySettingsDocumentText" Foreground="{StaticResource Muted}" TextTrimming="CharacterEllipsis"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                        <Button Content="Open File" Click="OpenGatewaySettings_Click"/>
+                                        <Button Content="Save Changes" Click="SaveGatewaySettings_Click" Background="#244A3B" BorderBrush="#32654F"/>
+                                    </StackPanel>
+                                </Grid>
+                                <DataGrid x:Name="GatewaySettingsGrid" Grid.Row="1" CanUserAddRows="False" AlternationCount="2">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="Setting" Binding="{Binding Key}" IsReadOnly="True" Width="2*"/>
+                                        <DataGridTextColumn Header="Value" Binding="{Binding Value, UpdateSourceTrigger=PropertyChanged}" Width="4*"/>
+                                        <DataGridTextColumn Header="Type" Binding="{Binding Kind}" IsReadOnly="True" Width="1.5*"/>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </TabItem>
+                    </TabControl>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Item Builder">
+                <Grid Margin="10">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="340"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+
+                    <Border Grid.Column="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="10">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                            <TextBlock Text="Server Items" FontSize="17" FontWeight="SemiBold"/>
+                            <TextBox x:Name="ItemSearchBox" Grid.Row="1" Margin="0,8,0,8" TextChanged="ItemSearchBox_TextChanged" ToolTip="Filter by item ID or display name"/>
+                            <DataGrid x:Name="ExistingItemsGrid" Grid.Row="2" IsReadOnly="True" SelectionMode="Single" SelectionChanged="ExistingItemsGrid_SelectionChanged" AlternationCount="2">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="ID" Binding="{Binding DefinitionId}" Width="2*"/>
+                                    <DataGridTextColumn Header="Name" Binding="{Binding DisplayName}" Width="2*"/>
+                                    <DataGridTextColumn Header="Stack" Binding="{Binding MaxStack}" Width="65"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+
+                    <Border Grid.Column="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="Item Definition" FontSize="18" FontWeight="SemiBold"/>
+                                    <TextBlock x:Name="GameplayContentDocumentText" Foreground="{StaticResource Muted}" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <Button Content="Reload Content" Click="ReloadGameplayContent_Click"/>
+                                    <Button Content="New Item" Click="NewItem_Click"/>
+                                    <Button Content="Duplicate" Click="DuplicateItem_Click"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <StackPanel Margin="0,0,8,8">
+                                    <TextBlock Text="IDENTITY" Style="{StaticResource FieldLabel}"/>
+                                    <Grid Margin="0,0,0,12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="2*"/><ColumnDefinition Width="2*"/><ColumnDefinition Width="1*"/></Grid.ColumnDefinitions>
+                                        <StackPanel Margin="0,0,8,0">
+                                            <TextBlock Text="Definition ID" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="ItemDefinitionIdBox"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="1" Margin="0,0,8,0">
+                                            <TextBlock Text="Display Name" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="ItemDisplayNameBox"/>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Presentation ID" Style="{StaticResource FieldLabel}"/>
+                                            <TextBox x:Name="ItemPresentationIdBox" Text="0"/>
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <TextBlock Text="INVENTORY / EQUIPMENT" Style="{StaticResource FieldLabel}"/>
+                                    <Grid Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                        <StackPanel Margin="0,0,8,0"><TextBlock Text="Max Stack" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemMaxStackBox" Text="1"/></StackPanel>
+                                        <StackPanel Grid.Column="1" Margin="0,0,8,0"><TextBlock Text="Weight" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemWeightBox" Text="0"/></StackPanel>
+                                        <StackPanel Grid.Column="2"><TextBlock Text="Max Durability" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemMaxDurabilityBox" Text="0"/></StackPanel>
+                                    </Grid>
+                                    <Grid Margin="0,0,0,12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="2*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                        <StackPanel Margin="0,0,8,0"><TextBlock Text="Tags (comma separated)" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemTagsBox"/></StackPanel>
+                                        <StackPanel Grid.Column="1"><TextBlock Text="Ammo Family" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemAmmoFamilyBox"/></StackPanel>
+                                    </Grid>
+                                    <TextBlock Text="Allowed Equipment Slots (Ctrl+Click for multiple)" Style="{StaticResource FieldLabel}"/>
+                                    <ListBox x:Name="AllowedSlotsList" Height="92" SelectionMode="Extended" Margin="0,0,0,12"/>
+
+                                    <TextBlock Text="COMBAT" Style="{StaticResource FieldLabel}"/>
+                                    <Grid Margin="0,0,0,12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                        <StackPanel Margin="0,0,8,0"><TextBlock Text="Damage Min" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemDamageMinBox" Text="0"/></StackPanel>
+                                        <StackPanel Grid.Column="1" Margin="0,0,8,0"><TextBlock Text="Damage Max" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemDamageMaxBox" Text="0"/></StackPanel>
+                                        <StackPanel Grid.Column="2" Margin="0,0,8,0"><TextBlock Text="Attack Range" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemAttackRangeBox" Text="0"/></StackPanel>
+                                        <StackPanel Grid.Column="3"><TextBlock Text="Attack Interval (0 or 1.25-10s)" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemAttackIntervalBox" Text="0"/></StackPanel>
+                                    </Grid>
+
+                                    <Grid Margin="0,0,0,5">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <TextBlock Text="STAT MODIFIERS" Style="{StaticResource FieldLabel}" VerticalAlignment="Center"/>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                            <Button Content="Add" Click="AddModifier_Click" Padding="9,4"/>
+                                            <Button Content="Remove" Click="RemoveModifier_Click" Padding="9,4"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <DataGrid x:Name="StatModifiersGrid" Height="125" CanUserAddRows="False" AlternationCount="2" Margin="0,0,0,12">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="Stat ID" Binding="{Binding StatId, UpdateSourceTrigger=PropertyChanged}" Width="2*"/>
+                                            <DataGridTextColumn Header="Additive" Binding="{Binding Additive, UpdateSourceTrigger=PropertyChanged}" Width="*"/>
+                                            <DataGridTextColumn Header="Multiplier" Binding="{Binding Multiplier, UpdateSourceTrigger=PropertyChanged}" Width="*"/>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+
+                                    <Grid Margin="0,0,0,5">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <TextBlock Text="USE / CONSUMABLE" Style="{StaticResource FieldLabel}" VerticalAlignment="Center"/>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                            <Button Content="Add Effect" Click="AddEffect_Click" Padding="9,4"/>
+                                            <Button Content="Remove" Click="RemoveEffect_Click" Padding="9,4"/>
+                                        </StackPanel>
+                                    </Grid>
+                                    <Grid Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                        <StackPanel Margin="0,0,8,0"><TextBlock Text="Consume Quantity" Style="{StaticResource FieldLabel}"/><TextBox x:Name="ItemConsumeQuantityBox" Text="0"/></StackPanel>
+                                        <TextBlock Grid.Column="1" Text="Use effects are validated against the resources and status effects already defined by GameplayContent.json." Foreground="{StaticResource Muted}" TextWrapping="Wrap" VerticalAlignment="Bottom" Margin="0,0,0,6"/>
+                                    </Grid>
+                                    <DataGrid x:Name="UseEffectsGrid" Height="145" CanUserAddRows="False" AlternationCount="2">
+                                        <DataGrid.Columns>
+                                            <DataGridComboBoxColumn x:Name="EffectKindColumn" Header="Kind" Width="1.4*"/>
+                                            <DataGridComboBoxColumn x:Name="EffectResourceColumn" Header="Resource" Width="1.5*"/>
+                                            <DataGridTextColumn Header="Amount" Binding="{Binding Amount, UpdateSourceTrigger=PropertyChanged}" Width="*"/>
+                                            <DataGridComboBoxColumn x:Name="EffectStatusColumn" Header="Status Effect" Width="1.6*"/>
+                                            <DataGridTextColumn Header="Stacks" Binding="{Binding Stacks, UpdateSourceTrigger=PropertyChanged}" Width="*"/>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </StackPanel>
+                            </ScrollViewer>
+
+                            <Grid Grid.Row="2" Margin="0,10,0,0">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock x:Name="ItemBuilderStatus" Text="Load GameplayContent.json to begin." Foreground="{StaticResource Muted}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                                <Button Grid.Column="1" x:Name="SaveItemButton" Content="SAVE ITEM + BUMP REVISION" Click="SaveItem_Click" Background="{StaticResource Accent}" BorderBrush="#6B91F0" FontWeight="SemiBold" Padding="18,10"/>
+                            </Grid>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <Grid Grid.Row="4" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <TextBlock x:Name="EnvironmentStatus" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button Content="START ALL" Click="StartAll_Click"/>
+                <Button Content="STOP ALL" Click="StopAll_Click" Background="#4A252B" BorderBrush="#6A333C"/>
+                <Button Content="Open Build Folder" Click="OpenTools_Click"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>
