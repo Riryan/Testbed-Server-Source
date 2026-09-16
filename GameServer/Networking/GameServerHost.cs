@@ -218,10 +218,22 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         private readonly GameServerHost _owner;
         private readonly List<PopulationPlayerView> _players = new List<PopulationPlayerView>(128);
         private long _preparedTick = long.MinValue;
+        private double _nextActivationCheckAt;
 
         public PopulationSimulationSystem(GameServerHost owner) => _owner = owner;
         public string Name => "PopulationAuthority";
-        public bool HasPendingWork => _owner._runtime.Population.HasDueWork(_owner._scheduler.ServerTime);
+        public bool HasPendingWork
+        {
+            get
+            {
+                double now = _owner._scheduler.ServerTime;
+                if (_owner._runtime.Population.HasDueWork(now))
+                    return true;
+                return _owner._runtime.Population.HibernatingCount > 0 &&
+                       _owner._readySessionsByCharacterId.Count > 0 &&
+                       now + 0.000001d >= _nextActivationCheckAt;
+            }
+        }
 
         public void ExecuteOneWorkUnit(in CoreTickContext context)
         {
@@ -243,7 +255,8 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                         new WorldPosition(entity.X, entity.Y, entity.Z)));
                 }
 
-                _owner._runtime.Population.PrepareBudgetedTick(_players);
+                _owner._runtime.Population.PrepareBudgetedTick(_players, context.Now);
+                _nextActivationCheckAt = context.Now + Math.Max(0.25d, _owner._runtime.Population.ActivationHeartbeatSeconds);
             }
 
             _owner._runtime.Population.TickNextBudgeted(context.FixedDelta, context.Now);
@@ -380,6 +393,12 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         _directoryLease = directoryLease ?? throw new ArgumentNullException(nameof(directoryLease));
 
         _runtime.Population.DeadDecaySeconds = _options.PopulationDeadDecaySeconds;
+        // Population wakes slightly ahead of replication AOI so doorway exits and route
+        // presentation are already coherent when the player reaches observer range.
+        _runtime.Population.PlayerActivationDistance = Math.Max(
+            _options.AoiRange + _options.AoiExitPadding + 24f,
+            _options.AoiRange * 1.5f);
+        _runtime.Population.PlayerHibernateDistance = _runtime.Population.PlayerActivationDistance + Math.Max(24f, _options.AoiExitPadding * 2f);
         _runtime.WorldItems.ConfigureTransientPolicy(
             _options.DroppedItemLifetimeSeconds,
             _options.MaxTransientDroppedItems,

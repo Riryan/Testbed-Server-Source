@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Game.Server.Application.Actors;
+using Game.Server.Application.Population;
+using Game.Server.Application.World;
 using Game.Server.Application.Content;
 using Game.Server.Application.Items;
 using Game.Server.Application.Persistence;
@@ -11,6 +14,8 @@ using Game.Server.Domain.Equipment;
 using Game.Server.Domain.Inventory;
 using Game.Server.Domain.Players;
 using Game.Server.Domain.Stats;
+using Game.Shared.Actors;
+using Game.Shared.Population;
 using Game.Shared.Backend;
 using Game.Shared.Content;
 using Game.Shared.Identity;
@@ -85,6 +90,10 @@ internal static class Program
         await Run("HttpClient-style timeout after commit reconciles as success", TimeoutAfterCommitReconcilesAsSuccess);
         await Run("stale response reloads authoritative state", StaleResponseReloadsAuthoritativeState);
         RunSync("transient world item ids are isolated from durable ids", TransientWorldIdsUseReservedRange);
+        RunSync("Population hibernates out of AOI and catches route progress up on wake", PopulationHibernationCatchesUpOnWake);
+        RunSync("Population portal spawn remains dormant until a player activates it", PopulationPortalActivationUsesExistingPortal);
+        RunSync("Population portal can release multiple active Pops from one authored spawn", PopulationPortalAllowsMultipleActive);
+        RunSync("Population portal staggers release cadence without per-Pop timers", PopulationPortalStaggersReleaseCadence);
         Console.WriteLine("All Game.Server.Application regression tests passed.");
     }
 
@@ -141,6 +150,364 @@ internal static class Program
                 "transient id must be inside the reserved high range");
             Require(seen.Add(value), "transient ids must be unique");
         }
+    }
+
+    private static void PopulationHibernationCatchesUpOnWake()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+        };
+
+        PopulationActorRuntime pop = SinglePopulation(population);
+        Require(pop.IsHibernating, "baked Population should start hibernated when no players are present");
+        Require(population.HibernatingCount == 1, "hibernation index should contain the dormant Pop");
+
+        WorldPosition before = pop.Actor.Position;
+        var spatial = new List<AuthoritativeActorRuntime>();
+        actors.QueryRadius("population_test", string.Empty, before, 8f, spatial);
+        Require(spatial.Count == 0, "hibernating Population must be absent from authoritative spatial queries");
+
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(1, "population_test", string.Empty, before),
+        };
+        population.PrepareBudgetedTick(nearbyPlayer, 20d);
+
+        Require(!pop.IsHibernating, "nearby player should reactivate the Pop");
+        Require(population.HibernatingCount == 0, "reactivated Pop must leave the hibernation index");
+        float dx = pop.Actor.Position.X - before.X;
+        float dz = pop.Actor.Position.Z - before.Z;
+        Require(dx * dx + dz * dz > 0.25f,
+            "reactivated Pop should catch up route travel instead of returning at the old frozen point");
+
+        actors.QueryRadius("population_test", string.Empty, pop.Actor.Position, 8f, spatial);
+        Require(spatial.Exists(x => x.Handle.actorId == pop.Actor.Handle.actorId),
+            "reactivated Population must re-enter authoritative spatial queries");
+    }
+
+    private static void PopulationPortalActivationUsesExistingPortal()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: true);
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+        };
+
+        PopulationActorRuntime pop = SinglePopulation(population);
+        Require(pop.IsHibernating, "portal-backed Population should be parked until a player is nearby");
+        Require(pop.AiState == PopulationAiState.PortalDormant, "portal-backed Population should begin off-world");
+        Require(pop.CurrentPortalId == 5001, "spawn must retain its authored portal identity");
+
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(2, "population_test", string.Empty, new WorldPosition(0f, 0f, 0f)),
+        };
+        population.PrepareBudgetedTick(nearbyPlayer, 1d);
+        Require(population.HasDueWork(1d), "player activation should schedule the portal spawn immediately");
+        Require(population.TickNextBudgeted(0.1f, 1d), "portal activation should execute one Population work unit");
+
+        Require(!pop.IsHibernating, "portal-spawned Population should become spatially active");
+        Require(pop.AiState == PopulationAiState.FollowingRoute, "portal-spawned Population should enter its route state");
+        Require(pop.PortalSequencePhase == PopulationPortalSequencePhase.Interior,
+            "portal-spawned Population should begin the authored interior-to-exterior sequence");
+        Require(!actors.IsSpatiallySuspended(pop.Actor), "portal-spawned Population should resume authoritative spatial presence");
+    }
+
+
+    private static void PopulationPortalAllowsMultipleActive()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: true);
+        map.populationPortals[0].maximumActiveNearby = 17;
+        map.populationPortals[0].minimumSpawnInterval = 0f;
+        map.populationPortals[0].maximumSpawnInterval = 0f;
+        map.populationPortals[0].spawnBurstLimit = 17;
+
+        ServerSpawnAnchor template = map.spawnAnchors[0];
+        var anchors = new ServerSpawnAnchor[17];
+        for (int i = 0; i < anchors.Length; ++i)
+        {
+            anchors[i] = new ServerSpawnAnchor
+            {
+                stableId = template.stableId + i,
+                label = $"Population Test Spawn #{i + 1}",
+                kind = template.kind,
+                actorKind = template.actorKind,
+                archetypeId = template.archetypeId,
+                deathLootTableId = template.deathLootTableId,
+                pose = template.pose,
+                priority = template.priority,
+                enabled = template.enabled,
+                capsuleRadius = template.capsuleRadius,
+                capsuleHeight = template.capsuleHeight,
+                maximumGroundSnap = template.maximumGroundSnap,
+                tags = template.tags,
+                routeNodeId = template.routeNodeId,
+                portalId = template.portalId,
+            };
+        }
+        map.spawnAnchors = anchors;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+            MaximumPortalRespawnsPerTick = 8,
+        };
+
+        Require(population.Count == 17, "test map should create all 17 authored Population identities");
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(3, "population_test", string.Empty, new WorldPosition(0f, 0f, 0f)),
+        };
+        // The production core scheduler only calls PrepareBudgetedTick when HasDueWork is true.
+        // Portal-backed identities are hibernated and therefore have no per-actor due item until
+        // player activation is probed. The shared activation heartbeat must make the system
+        // schedulable without ticking each dormant Pop.
+        Require(population.HasDueWork(1d),
+            "hibernated Population must expose shared activation-heartbeat work to the scheduler");
+        population.PrepareBudgetedTick(nearbyPlayer, 1d);
+
+        // Portal admission is handled directly by the shared AOI activation pass. The first
+        // activation probe may release up to MaximumPortalRespawnsPerTick without waiting for
+        // one Population actor to finish its route or consume a separate scheduler cycle.
+        int activeAfterActivationPass = 0;
+        foreach (PopulationActorRuntime pop in population.All)
+        {
+            if (!pop.IsHibernating && pop.AiState == PopulationAiState.FollowingRoute)
+                activeAfterActivationPass++;
+        }
+        Require(activeAfterActivationPass > 1,
+            "one portal with capacity >1 must release multiple Population identities in the AOI activation pass");
+        Require(activeAfterActivationPass <= population.MaximumPortalRespawnsPerTick,
+            "portal activation pass must remain bounded by MaximumPortalRespawnsPerTick");
+
+        int processed = 0;
+        while (processed < 17 && population.HasDueWork(1d))
+        {
+            Require(population.TickNextBudgeted(0.1f, 1d), "due portal Population work should be executable");
+            processed++;
+        }
+
+        int active = 0;
+        foreach (PopulationActorRuntime pop in population.All)
+        {
+            if (!pop.IsHibernating && pop.AiState == PopulationAiState.FollowingRoute)
+                active++;
+        }
+        Require(active > 1, "one portal with capacity >1 must not serialize Population to a single live actor");
+    }
+
+    private static void PopulationPortalStaggersReleaseCadence()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: true);
+        ServerPopulationPortal portal = map.populationPortals[0];
+        portal.maximumActiveNearby = 17;
+        portal.minimumSpawnInterval = 1f;
+        portal.maximumSpawnInterval = 1f;
+        portal.spawnBurstLimit = 1;
+
+        ServerSpawnAnchor template = map.spawnAnchors[0];
+        var anchors = new ServerSpawnAnchor[4];
+        for (int i = 0; i < anchors.Length; ++i)
+        {
+            anchors[i] = new ServerSpawnAnchor
+            {
+                stableId = template.stableId + i,
+                label = $"Staggered Population Test Spawn #{i + 1}",
+                kind = template.kind,
+                actorKind = template.actorKind,
+                archetypeId = template.archetypeId,
+                deathLootTableId = template.deathLootTableId,
+                pose = template.pose,
+                priority = template.priority,
+                enabled = template.enabled,
+                capsuleRadius = template.capsuleRadius,
+                capsuleHeight = template.capsuleHeight,
+                maximumGroundSnap = template.maximumGroundSnap,
+                tags = template.tags,
+                routeNodeId = template.routeNodeId,
+                portalId = template.portalId,
+            };
+        }
+        map.spawnAnchors = anchors;
+
+        var catalog = new ServerMapCatalog(new[] { map });
+        var actors = new AuthoritativeActorRegistry();
+        var population = new PopulationSimulationService(catalog, actors, null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+            MaximumPortalRespawnsPerTick = 8,
+        };
+        var nearbyPlayer = new[]
+        {
+            new PopulationPlayerView(4, "population_test", string.Empty, new WorldPosition(0f, 0f, 0f)),
+        };
+
+        population.PrepareBudgetedTick(nearbyPlayer, 1d);
+        Require(CountActivePopulation(population) == 1,
+            "burst limit 1 should release exactly one Pop in the first activation pass");
+
+        population.PrepareBudgetedTick(nearbyPlayer, 1.5d);
+        Require(CountActivePopulation(population) == 1,
+            "portal should not release another Pop before the shared portal interval expires");
+
+        population.PrepareBudgetedTick(nearbyPlayer, 2.01d);
+        Require(CountActivePopulation(population) == 2,
+            "portal should release the next Pop after the shared interval without waiting for the first route to finish");
+    }
+
+    private static int CountActivePopulation(PopulationSimulationService population)
+    {
+        int active = 0;
+        foreach (PopulationActorRuntime pop in population.All)
+        {
+            if (!pop.IsHibernating && pop.AiState == PopulationAiState.FollowingRoute)
+                active++;
+        }
+        return active;
+    }
+
+    private static PopulationActorRuntime SinglePopulation(PopulationSimulationService population)
+    {
+        PopulationActorRuntime found = null;
+        int count = 0;
+        foreach (PopulationActorRuntime pop in population.All)
+        {
+            found = pop;
+            count++;
+        }
+        Require(count == 1 && found != null, "test map should create exactly one Population actor");
+        return found;
+    }
+
+    private static ServerMapSnapshot CreatePopulationMap(bool includePortal)
+    {
+        var first = new ServerPopulationRouteNode
+        {
+            stableId = 1001,
+            label = "A",
+            pose = new ServerPose(0f, 0f, 0f),
+            pathWidth = 2.5f,
+            routeWeight = 1f,
+            allowedNpcTypes = PopulationNpcTypeMask.All,
+        };
+        var second = new ServerPopulationRouteNode
+        {
+            stableId = 1002,
+            label = "B",
+            pose = new ServerPose(1000f, 0f, 0f),
+            pathWidth = 2.5f,
+            routeWeight = 1f,
+            allowedNpcTypes = PopulationNpcTypeMask.All,
+        };
+
+        ServerPopulationPortal[] portals = includePortal
+            ? new[]
+            {
+                new ServerPopulationPortal
+                {
+                    stableId = 5001,
+                    label = "Test Door",
+                    mode = PopulationPortalMode.SpawnAndDespawn,
+                    portalType = PopulationPortalType.GenericBuilding,
+                    allowedNpcTypes = PopulationNpcTypeMask.All,
+                    routeNodeId = first.stableId,
+                    interiorSpawn = new ServerPose(0f, 0f, -2f),
+                    approach = new ServerPose(0f, 0f, -1.2f),
+                    interaction = new ServerPose(0f, 0f, -0.8f),
+                    threshold = new ServerPose(0f, 0f, -0.3f),
+                    exterior = first.pose,
+                    minimumRespawnDelay = 0f,
+                    maximumRespawnDelay = 0f,
+                    blockedRetryDelay = 0.25f,
+                    minimumSpawnInterval = 0.75f,
+                    maximumSpawnInterval = 1.75f,
+                    spawnBurstLimit = 1,
+                    maximumActiveNearby = 12,
+                    activeNearbyRadius = 18f,
+                    exitClearanceRadius = 0.35f,
+                    suppressWhenVisibleToPlayers = false,
+                },
+            }
+            : Array.Empty<ServerPopulationPortal>();
+
+        return new ServerMapSnapshot
+        {
+            formatVersion = ServerMapFormat.Version,
+            mapId = "population_test",
+            instanceId = string.Empty,
+            collisionTriangles = FlatPopulationTestGround(),
+            populationNodes = new[] { first, second },
+            populationEdges = new[]
+            {
+                new ServerPopulationRouteEdge
+                {
+                    fromNodeId = first.stableId,
+                    toNodeId = second.stableId,
+                    oneWay = false,
+                    width = 2.5f,
+                    weight = 1f,
+                    validatedClear = true,
+                },
+            },
+            populationPortals = portals,
+            spawnAnchors = new[]
+            {
+                new ServerSpawnAnchor
+                {
+                    stableId = 7001,
+                    label = "Population Test Spawn",
+                    kind = ServerSpawnKind.Population,
+                    actorKind = AuthoritativeActorKind.Population,
+                    archetypeId = "civilian.test",
+                    pose = first.pose,
+                    enabled = true,
+                    capsuleRadius = 0.35f,
+                    capsuleHeight = 1.8f,
+                    maximumGroundSnap = 0.65f,
+                    routeNodeId = first.stableId,
+                    portalId = includePortal ? 5001 : 0,
+                },
+            },
+        };
+    }
+
+    private static ServerCollisionTriangle[] FlatPopulationTestGround()
+    {
+        const float extent = 2000f;
+        ServerSurfaceFlags flags = ServerSurfaceFlags.Walkable | ServerSurfaceFlags.Ground | ServerSurfaceFlags.Sidewalk;
+        return new[]
+        {
+            new ServerCollisionTriangle
+            {
+                surfaceId = 1,
+                ax = -extent, ay = 0f, az = -extent,
+                bx = -extent, by = 0f, bz = extent,
+                cx = extent, cy = 0f, cz = extent,
+                normalX = 0f, normalY = 1f, normalZ = 0f,
+                flags = flags,
+            },
+            new ServerCollisionTriangle
+            {
+                surfaceId = 1,
+                ax = -extent, ay = 0f, az = -extent,
+                bx = extent, by = 0f, bz = extent,
+                cx = extent, cy = 0f, cz = -extent,
+                normalX = 0f, normalY = 1f, normalZ = 0f,
+                flags = flags,
+            },
+        };
     }
 
     private static (PlayerItemService Service, PlayerRuntime Runtime, FakeRepository Repository) CreateHarness(CommitBehavior behavior)

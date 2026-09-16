@@ -1,0 +1,160 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0": {
+      "Game.Server.Domain/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "dependencies": {
+          "Game.Shared": "1.0.0"
+        },
+        "compile": {
+          "bin/placeholder/Game.Server.Domain.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Game.Server.Domain.dll": {}
+        }
+      },
+      "Game.Shared/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "compile": {
+          "bin/placeholder/Game.Shared.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Game.Shared.dll": {}
+        }
+      }
+    },
+    "net8.0/win-x64": {
+      "Game.Server.Domain/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "dependencies": {
+          "Game.Shared": "1.0.0"
+        },
+        "compile": {
+          "bin/placeholder/Game.Server.Domain.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Game.Server.Domain.dll": {}
+        }
+      },
+      "Game.Shared/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "compile": {
+          "bin/placeholder/Game.Shared.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Game.Shared.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Game.Server.Domain/1.0.0": {
+      "type": "project",
+      "path": "../Game.Server.Domain/Game.Server.Domain.csproj",
+      "msbuildProject": "../Game.Server.Domain/Game.Server.Domain.csproj"
+    },
+    "Game.Shared/1.0.0": {
+      "type": "project",
+      "path": "../Game.Shared/Game.Shared.csproj",
+      "msbuildProject": "../Game.Shared/Game.Shared.csproj"
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "Game.Server.Domain >= 1.0.0",
+      "Game.Shared >= 1.0.0"
+    ]
+  },
+  "packageFolders": {
+    "C:\\Users\\antho\\.nuget\\packages\\": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Server.Application\\Game.Server.Application.csproj",
+      "projectName": "Game.Server.Application",
+      "projectPath": "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Server.Application\\Game.Server.Application.csproj",
+      "packagesPath": "C:\\Users\\antho\\.nuget\\packages\\",
+      "outputPath": "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Server.Application\\obj\\",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "C:\\Users\\antho\\AppData\\Roaming\\NuGet\\NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "projectReferences": {
+            "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Server.Domain\\Game.Server.Domain.csproj": {
+              "projectPath": "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Server.Domain\\Game.Server.Domain.csproj"
+            },
+            "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Shared\\Game.Shared.csproj": {
+              "projectPath": "C:\\MMO\\Project Testbed\\Server\\Source\\Game.Shared\\Game.Shared.csproj"
+            }
+          }
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      }
+    },
+    "frameworks": {
+      "net8.0": {
+        "targetAlias": "net8.0",
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "downloadDependencies": [
+          {
+            "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
+            "version": "[8.0.30, 8.0.30]"
+          },
+          {
+            "name": "Microsoft.NETCore.App.Runtime.win-x64",
+            "version": "[8.0.30, 8.0.30]"
+          },
+          {
+            "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
+            "version": "[8.0.30, 8.0.30]"
+          }
+        ],
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.424/PortableRuntimeIdentifierGraph.json"
+      }
+    },
+    "runtimes": {
+      "win-x64": {
+        "#import": []
+      }
+    }
+  }
+}

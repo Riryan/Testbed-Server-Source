@@ -175,7 +175,8 @@ internal sealed partial class GameServerHost
         PopulationActorRuntime population = state?.Entity?.Population;
         return population?.Actor != null &&
                population.Actor.Handle.kind == AuthoritativeActorKind.Population &&
-               population.AiState != PopulationAiState.PortalDormant;
+               population.AiState != PopulationAiState.PortalDormant &&
+               !population.IsHibernating;
     }
 
     private void ReconcilePopulationObserver(ClientSession observer)

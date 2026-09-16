@@ -181,7 +181,8 @@ namespace Game.Server.Application.Combat
             pop.Actor.Handle.kind == AuthoritativeActorKind.Population &&
             pop.Actor.Alive &&
             pop.Actor.HealthCurrent > 0 &&
-            pop.AiState != PopulationAiState.PortalDormant;
+            pop.AiState != PopulationAiState.PortalDormant &&
+            !pop.IsHibernating;
 
         public bool TryGet(
             string mapId,

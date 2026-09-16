@@ -133,6 +133,7 @@ namespace Game.Server.Application.Actors
         private readonly Dictionary<SpatialCellKey, List<AuthoritativeActorRuntime>> _spatial =
             new Dictionary<SpatialCellKey, List<AuthoritativeActorRuntime>>();
         private readonly Dictionary<long, SpatialCellKey> _actorCells = new Dictionary<long, SpatialCellKey>();
+        private readonly HashSet<long> _spatiallySuspended = new HashSet<long>();
         private readonly Stack<List<AuthoritativeActorRuntime>> _spatialListPool = new Stack<List<AuthoritativeActorRuntime>>();
         private long _nextActorId = 1000000;
         private ushort _nextGeneration = 1;
@@ -182,16 +183,49 @@ namespace Game.Server.Application.Actors
         {
             if (actor == null || !_actors.TryGetValue(actor.Handle.actorId, out AuthoritativeActorRuntime current) || !ReferenceEquals(current, actor))
                 return;
-            MoveSpatialIfNeeded(actor);
+            if (!_spatiallySuspended.Contains(actor.Handle.actorId))
+                MoveSpatialIfNeeded(actor);
             actor.Touch();
             Changed?.Invoke(actor);
         }
+
+        /// <summary>
+        /// Removes an actor from spatial queries without destroying its authoritative identity.
+        /// Population uses this while an off-AOI actor is logically hibernating.
+        /// </summary>
+        public bool SuspendSpatial(AuthoritativeActorRuntime actor)
+        {
+            if (actor == null || !_actors.TryGetValue(actor.Handle.actorId, out AuthoritativeActorRuntime current) || !ReferenceEquals(current, actor))
+                return false;
+            if (!_spatiallySuspended.Add(actor.Handle.actorId))
+                return true;
+            RemoveFromSpatial(actor);
+            return true;
+        }
+
+        /// <summary>Restores a previously suspended actor to authoritative spatial queries.</summary>
+        public bool ResumeSpatial(AuthoritativeActorRuntime actor)
+        {
+            if (actor == null || !_actors.TryGetValue(actor.Handle.actorId, out AuthoritativeActorRuntime current) || !ReferenceEquals(current, actor))
+                return false;
+            if (!_spatiallySuspended.Remove(actor.Handle.actorId))
+            {
+                MoveSpatialIfNeeded(actor);
+                return true;
+            }
+            AddToSpatial(actor);
+            return true;
+        }
+
+        public bool IsSpatiallySuspended(AuthoritativeActorRuntime actor) =>
+            actor != null && _spatiallySuspended.Contains(actor.Handle.actorId);
 
         public bool Remove(AuthoritativeActorHandle handle)
         {
             if (!TryGet(handle, out AuthoritativeActorRuntime actor))
                 return false;
             RemoveFromSpatial(actor);
+            _spatiallySuspended.Remove(handle.actorId);
             _actors.Remove(handle.actorId);
             Removed?.Invoke(handle);
             return true;
