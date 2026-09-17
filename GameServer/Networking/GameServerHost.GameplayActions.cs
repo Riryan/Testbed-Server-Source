@@ -345,6 +345,20 @@ internal sealed partial class GameServerHost
             return;
         }
 
+        // Party/Guild already have canonical standalone owners. Reuse them from the
+        // existing player-interaction request instead of inventing a social wire route.
+        if (request.ActionId == InteractionActionId.PartyInvite)
+        {
+            InteractionResult partyInvite = ExecutePartyInviteInteraction(source, target, request.sequence);
+            SendResponse(session, requestId, ToGameplayWire(partyInvite));
+            return;
+        }
+        if (request.ActionId == InteractionActionId.GuildInvite)
+        {
+            RunGuildInviteInteractionAsync(session, requestId, source, target, request.sequence).Forget();
+            return;
+        }
+
         InteractionResult result = _runtime.Interactions.ExecutePlayerAction(
             source,
             target,

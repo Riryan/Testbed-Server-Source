@@ -136,6 +136,24 @@ internal sealed partial class GameServerHost
         }
     }
 
+    private byte ApplyVisibilityPresentationFlags(IPlayerEntityPresentationSource entity, byte flags)
+    {
+        if (entity == null || entity.ObjectId == 0u)
+            return flags;
+
+        if (_readySessionsByObjectId.TryGetValue(entity.ObjectId, out ClientSession target) &&
+            target != null &&
+            (_runtime.GameMasters.IsHiddenObserver(target.AuthenticatedAccountId) ||
+             _runtime.GameMasters.IsPlayerHidden(target.AuthenticatedAccountId)))
+        {
+            // Hidden is already an allocated PlayerEntity snapshot bit. Reusing it gives
+            // authorized observers/self visible feedback without adding a message or bytes.
+            flags |= (byte)PlayerEntityFlags.Hidden;
+        }
+
+        return flags;
+    }
+
     private void SendSpawn(ClientSession recipient, ServerPlayerEntity entity)
     {
         _writer.Reset();
@@ -156,7 +174,8 @@ internal sealed partial class GameServerHost
         _writer.PutPackedInt(2);
 
         _writer.PutPackedInt(SnapshotElementId);
-        WriteSnapshot(_writer, entity, entity.SnapshotSpeed, entity.SnapshotFlags, entity.SnapshotMoveState);
+        byte spawnFlags = ApplyVisibilityPresentationFlags(entity, entity.SnapshotFlags);
+        WriteSnapshot(_writer, entity, entity.SnapshotSpeed, spawnFlags, entity.SnapshotMoveState);
 
         _writer.PutPackedInt(AppearanceElementId);
         WriteAppearance(_writer, entity);
@@ -178,6 +197,8 @@ internal sealed partial class GameServerHost
     {
         if (!IsCurrent(recipient) || !recipient.Ready || recipient.Entity == null || entity == null)
             return;
+
+        flags = ApplyVisibilityPresentationFlags(entity, flags);
 
         if (!_snapshotBatches.TryGetValue(recipient, out ObserverSnapshotBatch batch))
         {

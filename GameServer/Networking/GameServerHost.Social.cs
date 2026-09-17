@@ -8,6 +8,7 @@ using Game.GameServer.Runtime;
 using Game.Server.Application.Social;
 using Game.Server.Domain.Players;
 using Game.Shared.Chat;
+using Game.Shared.Interactions;
 using LiteNetLib;
 using Player.Networking;
 
@@ -27,6 +28,9 @@ internal sealed partial class GameServerHost
     {
         if (string.IsNullOrWhiteSpace(text) || text[0] != '/')
             return false;
+
+        if (TryHandleModerationCommand(session, actor, text))
+            return true;
 
         if (StartsWithCommand(text, "/party", out string partyArgs))
         {
@@ -420,6 +424,83 @@ internal sealed partial class GameServerHost
                 ClientSession recipient = FindIndexedReadySessionByCharacterId(guild.Members[i].CharacterId);
                 if (recipient != null)
                     SendClientMessage(recipient, PlayerChatMessageTypes.Deliver, delivery, DeliveryMethod.ReliableOrdered);
+            }
+        });
+    }
+
+    private InteractionResult ExecutePartyInviteInteraction(
+        PlayerRuntime source,
+        PlayerRuntime target,
+        uint sequence)
+    {
+        var handle = InteractionTargetHandle.Player(target?.CharacterId.Value ?? 0);
+        if (source == null || target == null)
+            return new InteractionResult(sequence, InteractionActionId.PartyInvite, InteractionResultCode.InvalidTarget, handle, "target is unavailable");
+
+        PartyOperationResult operation = PartySocial.Invite(source, target);
+        if (operation.Success)
+        {
+            ClientSession targetSession = FindIndexedReadySessionByCharacterId(target.CharacterId.Value);
+            if (targetSession != null)
+            {
+                string actorName = source.Character?.Name ?? "Player";
+                SendSystemChat(targetSession, $"{actorName} invited you to a party. Type /party accept or /party decline.");
+            }
+        }
+        return new InteractionResult(
+            sequence,
+            InteractionActionId.PartyInvite,
+            operation.Success ? InteractionResultCode.Success : InteractionResultCode.Rejected,
+            handle,
+            operation.Message);
+    }
+
+    private async Task RunGuildInviteInteractionAsync(
+        ClientSession sourceSession,
+        uint requestId,
+        PlayerRuntime source,
+        PlayerRuntime target,
+        uint sequence)
+    {
+        var handle = InteractionTargetHandle.Player(target?.CharacterId.Value ?? 0);
+        GuildOperationResult operation;
+        try
+        {
+            operation = await GuildSocial.InviteAsync(source, target, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Guild interaction invite failed for character {source?.CharacterId.Value ?? 0}: {ex.Message}");
+            QueueMainThreadCompletion(() =>
+            {
+                if (!IsCurrent(sourceSession)) return;
+                SendResponse(sourceSession, requestId, ToGameplayWire(new InteractionResult(
+                    sequence, InteractionActionId.GuildInvite, InteractionResultCode.Rejected, handle,
+                    "guild service is temporarily unavailable")));
+            });
+            return;
+        }
+
+        QueueMainThreadCompletion(() =>
+        {
+            if (!IsCurrent(sourceSession))
+                return;
+
+            SendResponse(sourceSession, requestId, ToGameplayWire(new InteractionResult(
+                sequence,
+                InteractionActionId.GuildInvite,
+                operation.Success ? InteractionResultCode.Success : InteractionResultCode.Rejected,
+                handle,
+                operation.Message)));
+
+            if (!operation.Success || target == null)
+                return;
+            ClientSession targetSession = FindIndexedReadySessionByCharacterId(target.CharacterId.Value);
+            if (targetSession != null && IsCurrent(targetSession))
+            {
+                string actorName = source?.Character?.Name ?? "Player";
+                string guildName = operation.Guild?.Name ?? "the guild";
+                SendSystemChat(targetSession, $"{actorName} invited you to guild '{guildName}'. Type /guild accept or /guild decline.");
             }
         });
     }

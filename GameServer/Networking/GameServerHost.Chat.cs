@@ -107,6 +107,9 @@ internal sealed partial class GameServerHost
             ClientSession recipient = _localChatRecipientScratch[i];
             if (!TryGetGameplayRuntime(recipient, out _))
                 continue;
+            // Visibility suppresses the actor replication edge, not the player's ability
+            // to communicate. Hidden/gameplay-hidden/staff-hidden players remain valid chat
+            // participants and use the existing proximity recipient query.
             SendClientMessage(recipient, PlayerChatMessageTypes.Deliver, delivery, DeliveryMethod.ReliableOrdered);
         }
     }
@@ -200,6 +203,15 @@ internal sealed partial class GameServerHost
         return true;
     }
 
-    private void RemovePlayerChatState(int peerId) => _chatRateStates.Remove(peerId);
-    private void ClearPlayerChatState() => _chatRateStates.Clear();
+    private void RemovePlayerChatState(int peerId)
+    {
+        _chatRateStates.Remove(peerId);
+        RemoveModerationCommandState(peerId);
+    }
+
+    private void ClearPlayerChatState()
+    {
+        _chatRateStates.Clear();
+        ClearModerationCommandState();
+    }
 }

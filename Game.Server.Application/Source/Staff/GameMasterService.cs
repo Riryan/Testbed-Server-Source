@@ -11,6 +11,10 @@ namespace Game.Server.Application.Staff
         public StaffCapability Capabilities { get; internal set; }
         public StaffVisibilityMode VisibilityMode { get; internal set; }
         public long SpectateCharacterId { get; internal set; }
+        // Gameplay-hidden bridge. This is intentionally not exposed as a player command.
+        // The eventual Hide gameplay action/status may drive this existing visibility hook
+        // without introducing another AOI or replication system.
+        public bool PlayerHiddenFromPlayers { get; internal set; }
         public long Revision { get; internal set; }
         public bool IsAuthorized => AccountId > 0 && Capabilities != StaffCapability.None;
 
@@ -140,19 +144,110 @@ namespace Game.Server.Application.Staff
             return true;
         }
 
+        /// <summary>
+        /// Gameplay-owned ordinary-player visibility hook. It is deliberately not exposed
+        /// through a player chat command. Hidden players are removed from ordinary AOI while
+        /// all server-authorized staff retain visibility. Future Hide gameplay can drive this
+        /// same hook without another observer system or network message.
+        /// </summary>
+        public bool TrySetPlayerHidden(long accountId, bool hidden, out string detail)
+        {
+            detail = string.Empty;
+            StaffSessionState state = OpenSession(accountId);
+            if (state == null)
+            {
+                detail = "player visibility session is unavailable";
+                return false;
+            }
+
+            if (state.PlayerHiddenFromPlayers == hidden)
+            {
+                detail = hidden ? "already hidden from players" : "already visible to players";
+                return true;
+            }
+
+            state.PlayerHiddenFromPlayers = hidden;
+            Touch(state);
+            detail = hidden ? "hidden from ordinary players" : "visible to players";
+            return true;
+        }
+
+        public bool IsPlayerHidden(long accountId) =>
+            accountId > 0 &&
+            _sessions.TryGetValue(accountId, out StaffSessionState state) &&
+            state.PlayerHiddenFromPlayers;
+
+        /// <summary>
+        /// Writes a player-originated moderation report through the already-existing durable
+        /// audit stream. This intentionally reuses StaffAuditRecord/StaffAuditFileSink rather
+        /// than introducing a second moderation log or a new client/server message.
+        /// </summary>
+        public bool TryWritePlayerReport(
+            long reporterAccountId,
+            long reporterCharacterId,
+            long targetCharacterId,
+            string reason,
+            out string detail)
+        {
+            detail = string.Empty;
+            string prepared = (reason ?? string.Empty).Trim();
+            if (reporterAccountId <= 0 || reporterCharacterId <= 0 || targetCharacterId <= 0)
+            {
+                detail = "reporter or target is unavailable";
+                return false;
+            }
+            if (reporterCharacterId == targetCharacterId)
+            {
+                detail = "you cannot report yourself";
+                return false;
+            }
+            if (prepared.Length < 5 || prepared.Length > 500)
+            {
+                detail = "report reason must be 5-500 characters";
+                return false;
+            }
+
+            long sequence = ++_auditSequence;
+            if (sequence <= 0) sequence = _auditSequence = 1;
+            AuditWritten?.Invoke(new StaffAuditRecord
+            {
+                sequence = sequence,
+                utcTicks = DateTime.UtcNow.Ticks,
+                accountId = reporterAccountId,
+                characterId = reporterCharacterId,
+                action = "PlayerReport",
+                targetCharacterId = targetCharacterId,
+                detail = prepared,
+                success = true,
+            });
+            detail = "report submitted";
+            return true;
+        }
+
         public bool CanObserverSee(long observerAccountId, long targetAccountId)
         {
             if (observerAccountId <= 0 || targetAccountId <= 0 || observerAccountId == targetAccountId)
                 return true;
-            if (!_sessions.TryGetValue(targetAccountId, out StaffSessionState target) || !target.IsAuthorized)
-                return true;
-            if (target.VisibilityMode != StaffVisibilityMode.HiddenObserver && target.VisibilityMode != StaffVisibilityMode.Spectating)
+            if (!_sessions.TryGetValue(targetAccountId, out StaffSessionState target))
                 return true;
 
-            // Hidden staff remain visible only to other authorized observers. This prevents
-            // ordinary players from learning hidden-GM presence through replication/nameplates.
-            return _sessions.TryGetValue(observerAccountId, out StaffSessionState observer) &&
-                   observer.IsAuthorized && observer.Has(StaffCapability.ObservePlayers);
+            bool observerIsStaff =
+                _sessions.TryGetValue(observerAccountId, out StaffSessionState observer) &&
+                observer.IsAuthorized;
+
+            // Authorized staff always retain visibility of hidden actors, including other
+            // hidden/spectating staff and gameplay-hidden players. Ordinary players do not.
+            if (target.IsAuthorized &&
+                (target.VisibilityMode == StaffVisibilityMode.HiddenObserver ||
+                 target.VisibilityMode == StaffVisibilityMode.Spectating))
+            {
+                return observerIsStaff;
+            }
+
+            if (target.PlayerHiddenFromPlayers)
+                return observerIsStaff;
+
+            return true;
         }
 
         public bool IsHiddenObserver(long accountId) =>
