@@ -8,6 +8,7 @@ namespace Player.Networking
     {
         public const ushort Snapshot = 700;
         public const ushort Action = 701;
+        public const ushort OwnerLiveInterest = 702;
     }
 
     public static class EconomyRequestTypes
@@ -25,6 +26,14 @@ namespace Player.Networking
         public const ushort StorageState = 66;
     }
 
+    [Flags]
+    public enum OwnerLiveInterestKind : uint
+    {
+        None = 0,
+        FriendsPresence = 1u << 0,
+        GuildPresence = 1u << 1,
+    }
+
     public enum FriendActionKind : byte { Accept = 1, Decline = 2, Remove = 3 }
     public enum TradeActionKind : byte { Accept = 1, Decline = 2, Offer = 3, RemoveOffer = 4, Lock = 5, Unlock = 6, Confirm = 7, Cancel = 8 }
     public enum StorageTransferKind : byte { Deposit = 1, Withdraw = 2 }
@@ -33,6 +42,13 @@ namespace Player.Networking
     {
         public void Serialize(NetDataWriter writer) { }
         public void Deserialize(NetDataReader reader) { }
+    }
+
+    public struct OwnerLiveInterestRequestMessage : INetSerializable
+    {
+        public uint interests;
+        public void Serialize(NetDataWriter writer) { writer.Put(interests); }
+        public void Deserialize(NetDataReader reader) { interests = reader.GetUInt(); }
     }
 
     public struct FriendActionRequestMessage : INetSerializable

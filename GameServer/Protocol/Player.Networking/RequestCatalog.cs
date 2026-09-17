@@ -3,11 +3,6 @@ using System.Collections.Generic;
 
 namespace Player.Networking
 {
-    /// <summary>
-    /// Core request ids that belong to the LiteNetLib session bootstrap rather than a
-    /// gameplay subsystem. Keeping them in the protocol catalog removes transport-local
-    /// magic numbers and lets startup validation cover the complete implemented surface.
-    /// </summary>
     public static class CorePlayerRequestTypes
     {
         public const ushort EnterGame = 0;
@@ -30,11 +25,6 @@ namespace Player.Networking
         public override string ToString() => $"{Id} {Name} ({Range.Name})";
     }
 
-    /// <summary>
-    /// Canonical catalog of implemented reliable player requests. The catalog validates
-    /// duplicate ids at type initialization so protocol collisions fail at startup instead
-    /// of silently shadowing a handler in a central switch.
-    /// </summary>
     public static class PlayerRequestCatalog
     {
         private static readonly Dictionary<ushort, PlayerRequestDescriptor> ById = Build();
@@ -95,6 +85,7 @@ namespace Player.Networking
 
             Add(result, FriendRequestTypes.Snapshot, "Friends.Snapshot");
             Add(result, FriendRequestTypes.Action, "Friends.Action");
+            Add(result, FriendRequestTypes.OwnerLiveInterest, "Social.OwnerLiveInterest");
             Add(result, EconomyRequestTypes.TradeAction, "Trade.Action");
             Add(result, EconomyRequestTypes.TradeSnapshot, "Trade.Snapshot");
             Add(result, EconomyRequestTypes.StorageSnapshot, "Storage.Snapshot");

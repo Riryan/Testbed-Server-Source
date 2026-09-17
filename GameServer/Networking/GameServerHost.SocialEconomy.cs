@@ -27,6 +27,7 @@ internal sealed partial class GameServerHost
     }
 
     private readonly Dictionary<long, StorageAccess> _storageAccessByCharacter = new();
+    private readonly Dictionary<long, OwnerLiveInterestKind> _ownerLiveInterestsByCharacter = new();
     private SocialEconomyRuntime _socialEconomy;
 
     private void RegisterSocialEconomyRequests(
@@ -46,10 +47,96 @@ internal sealed partial class GameServerHost
 
         RegisterRequest(handlers, FriendRequestTypes.Snapshot, HandleFriendsSnapshot);
         RegisterRequest(handlers, FriendRequestTypes.Action, HandleFriendAction);
+        RegisterRequest(handlers, FriendRequestTypes.OwnerLiveInterest, HandleOwnerLiveInterest);
         RegisterRequest(handlers, EconomyRequestTypes.TradeAction, HandleTradeAction);
         RegisterRequest(handlers, EconomyRequestTypes.TradeSnapshot, HandleTradeSnapshot);
         RegisterRequest(handlers, EconomyRequestTypes.StorageSnapshot, HandleStorageSnapshot);
         RegisterRequest(handlers, EconomyRequestTypes.StorageTransfer, HandleStorageTransfer);
+    }
+
+    private void HandleOwnerLiveInterest(ClientSession session, uint requestId, NetDataReader reader)
+    {
+        var request = new OwnerLiveInterestRequestMessage();
+        request.Deserialize(reader);
+        if (!TryGetInWorldRuntime(session, out PlayerRuntime runtime))
+        {
+            SendResponse(session, requestId,
+                SocialEconomyMutationResponseMessage.Failed(1, "character is not in world"));
+            return;
+        }
+
+        const OwnerLiveInterestKind supported =
+            OwnerLiveInterestKind.FriendsPresence | OwnerLiveInterestKind.GuildPresence;
+        OwnerLiveInterestKind requested = (OwnerLiveInterestKind)request.interests & supported;
+        long characterId = runtime.CharacterId.Value;
+        _ownerLiveInterestsByCharacter.TryGetValue(characterId, out OwnerLiveInterestKind previous);
+
+        if (requested == OwnerLiveInterestKind.None)
+            _ownerLiveInterestsByCharacter.Remove(characterId);
+        else
+            _ownerLiveInterestsByCharacter[characterId] = requested;
+
+        SendResponse(session, requestId, SocialEconomyMutationResponseMessage.Ok());
+
+        // Enabling presence interest reconciles immediately from the already-hydrated
+        // GameServer cache. This intentionally performs no Gateway/database reload.
+        bool friendsEnabledNow = (requested & OwnerLiveInterestKind.FriendsPresence) != 0;
+        bool friendsWasEnabled = (previous & OwnerLiveInterestKind.FriendsPresence) != 0;
+        if (friendsEnabledNow && !friendsWasEnabled)
+        {
+            SendClientMessage(
+                session,
+                SocialEconomyMessageTypes.FriendsState,
+                BuildFriendsState(_socialEconomy.GetFriendView(characterId)),
+                DeliveryMethod.ReliableOrdered);
+        }
+    }
+
+    private bool HasOwnerLiveInterest(long characterId, OwnerLiveInterestKind interest) =>
+        _ownerLiveInterestsByCharacter.TryGetValue(characterId, out OwnerLiveInterestKind value) &&
+        (value & interest) != 0;
+
+    private void PublishFriendPresenceToInterestedOwners(long changedCharacterId)
+    {
+        if (_socialEconomy == null || changedCharacterId <= 0 || _ownerLiveInterestsByCharacter.Count == 0)
+            return;
+
+        // Presence is optional live state. Only owners with an active consumer receive it.
+        // Membership remains in the existing authoritative StateChanged path and is pushed
+        // regardless of whether the Friends UI is open.
+        var interestedOwners = new List<long>(_ownerLiveInterestsByCharacter.Count);
+        foreach (KeyValuePair<long, OwnerLiveInterestKind> pair in _ownerLiveInterestsByCharacter)
+        {
+            if ((pair.Value & OwnerLiveInterestKind.FriendsPresence) != 0)
+                interestedOwners.Add(pair.Key);
+        }
+
+        for (int i = 0; i < interestedOwners.Count; ++i)
+        {
+            long ownerCharacterId = interestedOwners[i];
+            if (ownerCharacterId == changedCharacterId ||
+                !HasOwnerLiveInterest(ownerCharacterId, OwnerLiveInterestKind.FriendsPresence))
+                continue;
+
+            FriendView view = _socialEconomy.GetFriendView(ownerCharacterId);
+            BackendFriendEntryDto[] friends = view?.Friends ?? Array.Empty<BackendFriendEntryDto>();
+            bool affected = false;
+            for (int j = 0; j < friends.Length; ++j)
+            {
+                if (friends[j]?.characterId != changedCharacterId) continue;
+                affected = true;
+                break;
+            }
+            if (!affected) continue;
+
+            ClientSession owner = FindReadySessionByCharacterId(ownerCharacterId);
+            if (owner == null || owner.Entity?.Runtime == null) continue;
+            SendClientMessage(
+                owner,
+                SocialEconomyMessageTypes.FriendsState,
+                BuildFriendsState(view),
+                DeliveryMethod.ReliableOrdered);
+        }
     }
 
     private void HandleFriendsSnapshot(ClientSession session, uint requestId, NetDataReader reader)
@@ -530,7 +617,7 @@ internal sealed partial class GameServerHost
     private void BeginSocialEconomyReady(ClientSession session, PlayerRuntime runtime)
     {
         if (_socialEconomy == null || runtime == null) return;
-        _socialEconomy.NotifyPresenceChanged(runtime.CharacterId.Value);
+        PublishFriendPresenceToInterestedOwners(runtime.CharacterId.Value);
         RunFriendsReadyAsync(session, runtime).Forget();
     }
 
@@ -553,8 +640,9 @@ internal sealed partial class GameServerHost
 
     private void CloseSocialEconomyForCharacter(long characterId)
     {
+        _ownerLiveInterestsByCharacter.Remove(characterId);
         _storageAccessByCharacter.Remove(characterId);
         _socialEconomy?.CancelForCharacter(characterId);
-        _socialEconomy?.NotifyPresenceChanged(characterId);
+        PublishFriendPresenceToInterestedOwners(characterId);
     }
 }
