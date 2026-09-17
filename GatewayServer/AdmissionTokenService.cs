@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using Game.Shared.Backend;
 
 namespace Game.BackendServer;
 
@@ -39,11 +40,17 @@ internal sealed class AdmissionTokenService
         return new IssuedAdmission(token, expiresTicks);
     }
 
-    public bool TryQueueRedeem(string token, out Task<long> completion)
+    public bool TryQueueRedeem(string token, out Task<BackendAdmissionRedeemResponse> completion)
     {
         if (string.IsNullOrWhiteSpace(token) || token.Length > 256)
         {
-            completion = Task.FromResult(0L);
+            completion = Task.FromResult(new BackendAdmissionRedeemResponse
+            {
+                success = false,
+                accountId = 0,
+                policy = null,
+                error = "admission unavailable",
+            });
             return true;
         }
 

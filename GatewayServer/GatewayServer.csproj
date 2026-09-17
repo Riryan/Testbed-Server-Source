@@ -13,6 +13,8 @@
   <ItemGroup>
     <!-- Compile the same primitives-only wire contracts and portable name/failure policy
          from the standalone Game.Shared source snapshot. No Unity Assets dependency. -->
+    <Compile Include="..\Game.Shared\Source\Accounts\AccountPolicyContracts.cs" Link="Shared\AccountPolicyContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Staff\StaffContracts.cs" Link="Shared\StaffContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Backend\BackendServiceContracts.cs" Link="Shared\BackendServiceContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Backend\BackendGuildContracts.cs" Link="Shared\BackendGuildContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Content\GameplayContentDefinitions.cs" Link="Shared\GameplayContentDefinitions.cs" />

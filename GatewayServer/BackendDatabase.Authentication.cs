@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Game.Shared.Accounts;
 using Game.Shared.Authentication;
 using Game.Shared.Backend;
 using Game.Shared.Characters;
@@ -79,6 +80,7 @@ internal sealed partial class BackendDatabase
                     if (conn.Insert(CredentialRow.From(row.accountId, credential, utcNowTicks)) != 1)
                         throw new InvalidOperationException("Credential insert failed.");
 
+                    EnsureAccountPolicyRow(conn, row.accountId, utcNowTicks);
                     createdAccountId = row.accountId;
                 });
             });
@@ -136,12 +138,18 @@ internal sealed partial class BackendDatabase
         });
     }
 
-    public long TryConsumeAdmission(string tokenHash, long utcNowTicks)
+    public BackendAdmissionRedeemResponse TryConsumeAdmission(string tokenHash, long utcNowTicks)
     {
+        var result = new BackendAdmissionRedeemResponse
+        {
+            success = false,
+            accountId = 0,
+            policy = null,
+            error = "admission unavailable",
+        };
         if (string.IsNullOrWhiteSpace(tokenHash))
-            return 0;
+            return result;
 
-        long accountId = 0;
         Execute(conn =>
         {
             conn.RunInTransaction(() =>
@@ -152,19 +160,28 @@ internal sealed partial class BackendDatabase
                     row.expiresUtcTicks <= utcNowTicks)
                     return;
 
+                AccountPolicySnapshot policy = GetAccountPolicy(row.accountId, utcNowTicks);
+                if (policy == null || !policy.IsAccessAllowedAt(utcNowTicks))
+                    return;
+
                 int changed = conn.Execute(
                     "UPDATE auth_admissions SET consumedUtcTicks=? " +
                     "WHERE tokenHash=? AND consumedUtcTicks=0 AND expiresUtcTicks>?",
                     utcNowTicks,
                     tokenHash,
                     utcNowTicks);
-                if (changed == 1)
-                    accountId = row.accountId;
+                if (changed != 1)
+                    return;
+
+                result.success = true;
+                result.accountId = row.accountId;
+                result.policy = policy;
+                result.error = string.Empty;
             });
 
             DeleteExpiredAdmissionsIfDue(conn, utcNowTicks);
         });
-        return accountId;
+        return result;
     }
 
     private void DeleteExpiredAdmissionsIfDue(SQLiteConnection conn, long utcNowTicks)

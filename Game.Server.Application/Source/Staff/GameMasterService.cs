@@ -51,6 +51,56 @@ namespace Game.Server.Application.Staff
 
         public int AuthorizedAccountCount => _authorizations.Count;
 
+        /// <summary>
+        /// Replaces the cached authorization for one authenticated account. Persistent
+        /// account policy can therefore supersede the legacy bootstrap JSON without a
+        /// second staff-authority system. A future staff dashboard can reuse this same
+        /// method after an authoritative Backend promotion/demotion.
+        /// </summary>
+        public void SetAuthorization(StaffAuthorizationSnapshot authorization)
+        {
+            if (authorization == null || authorization.accountId <= 0)
+                return;
+
+            long accountId = authorization.accountId;
+            StaffCapability capabilities = authorization.CapabilityMask;
+            string roleName = authorization.roleName ?? string.Empty;
+
+            if (capabilities == StaffCapability.None)
+            {
+                _authorizations.Remove(accountId);
+            }
+            else
+            {
+                _authorizations[accountId] = new StaffAuthorizationSnapshot
+                {
+                    accountId = accountId,
+                    roleName = roleName,
+                    capabilities = authorization.capabilities,
+                };
+            }
+
+            if (!_sessions.TryGetValue(accountId, out StaffSessionState state))
+                return;
+
+            bool wasAuthorized = state.IsAuthorized;
+            if (state.RoleName == roleName && state.Capabilities == capabilities)
+                return;
+
+            state.RoleName = roleName;
+            state.Capabilities = capabilities;
+            if (!state.IsAuthorized)
+            {
+                state.VisibilityMode = StaffVisibilityMode.NormalPlayer;
+                state.SpectateCharacterId = 0;
+            }
+            else if (!wasAuthorized && state.VisibilityMode == StaffVisibilityMode.NormalPlayer)
+            {
+                state.VisibilityMode = StaffVisibilityMode.VisibleStaff;
+            }
+            Touch(state);
+        }
+
         public StaffSessionState OpenSession(long accountId)
         {
             if (accountId <= 0) return null;
@@ -62,7 +112,9 @@ namespace Game.Server.Application.Staff
                 AccountId = accountId,
                 RoleName = authorization?.roleName ?? string.Empty,
                 Capabilities = authorization?.CapabilityMask ?? StaffCapability.None,
-                VisibilityMode = StaffVisibilityMode.VisibleStaff,
+                VisibilityMode = authorization != null && authorization.CapabilityMask != StaffCapability.None
+                    ? StaffVisibilityMode.VisibleStaff
+                    : StaffVisibilityMode.NormalPlayer,
                 Revision = 1,
             };
             _sessions[accountId] = state;

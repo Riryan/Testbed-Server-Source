@@ -25,6 +25,9 @@ internal sealed class BackendOptions
     // once at startup, every five minutes, and manual refresh is locally capped at 60s.
     public int HealthChecksPerMinutePerIp { get; set; } = 120;
     public int CharacterLimit { get; set; } = 4;
+    // Development/test bootstrap only. Leave empty in production. When the named account
+    // authenticates successfully, its persistent account policy is promoted to Admin.
+    public string DevelopmentAdminAccount { get; set; } = string.Empty;
 
     public void Validate()
     {

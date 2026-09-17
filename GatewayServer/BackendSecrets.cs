@@ -7,6 +7,7 @@ internal sealed class BackendSecrets
 {
     public string GameServerKey { get; set; }
     public string CertificatePassword { get; set; }
+    public string AccountTelemetryHmacKey { get; set; }
 
     public static BackendSecrets LoadOrCreate(string secretsPath, string gameServerKeyPath)
     {
@@ -21,24 +22,36 @@ internal sealed class BackendSecrets
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
 
-        if (secrets == null ||
-            string.IsNullOrWhiteSpace(secrets.GameServerKey) ||
-            string.IsNullOrWhiteSpace(secrets.CertificatePassword))
+        string existingGameServerKey = File.Exists(gameServerKeyPath)
+            ? File.ReadAllText(gameServerKeyPath).Trim()
+            : string.Empty;
+
+        secrets ??= new BackendSecrets();
+        bool changed = false;
+        if (string.IsNullOrWhiteSpace(secrets.GameServerKey))
         {
-            string existingGameServerKey = File.Exists(gameServerKeyPath)
-                ? File.ReadAllText(gameServerKeyPath).Trim()
-                : string.Empty;
+            // Preserve the key created by the earlier AuthServer foundation when
+            // upgrading in place. Generate a new one only for a fresh deployment.
+            secrets.GameServerKey = !string.IsNullOrWhiteSpace(existingGameServerKey)
+                ? existingGameServerKey
+                : Base64Url.Encode(RandomNumberGenerator.GetBytes(32));
+            changed = true;
+        }
+        if (string.IsNullOrWhiteSpace(secrets.CertificatePassword))
+        {
+            secrets.CertificatePassword = Base64Url.Encode(RandomNumberGenerator.GetBytes(32));
+            changed = true;
+        }
+        if (string.IsNullOrWhiteSpace(secrets.AccountTelemetryHmacKey))
+        {
+            // Keyed hashing keeps stored IP/device observations comparable for moderation
+            // without retaining raw addresses or client installation identifiers.
+            secrets.AccountTelemetryHmacKey = Base64Url.Encode(RandomNumberGenerator.GetBytes(32));
+            changed = true;
+        }
 
-            secrets = new BackendSecrets
-            {
-                // Preserve the key created by the earlier AuthServer foundation when
-                // upgrading in place. Generate a new one only for a fresh deployment.
-                GameServerKey = !string.IsNullOrWhiteSpace(existingGameServerKey)
-                    ? existingGameServerKey
-                    : Base64Url.Encode(RandomNumberGenerator.GetBytes(32)),
-                CertificatePassword = Base64Url.Encode(RandomNumberGenerator.GetBytes(32)),
-            };
-
+        if (changed || !File.Exists(secretsPath))
+        {
             File.WriteAllText(
                 secretsPath,
                 JsonSerializer.Serialize(secrets, new JsonSerializerOptions { WriteIndented = true }));

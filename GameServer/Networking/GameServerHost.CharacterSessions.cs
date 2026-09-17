@@ -12,6 +12,9 @@ using Game.Server.Application.World;
 using Game.Server.Domain.Characters;
 using Game.Server.Domain.Players;
 using Game.Shared.Abilities;
+using Game.Shared.Staff;
+using Game.Shared.Backend;
+using Game.Shared.Accounts;
 using Game.Shared.Characters;
 using Game.Shared.Combat;
 using Game.Shared.Content;
@@ -132,11 +135,11 @@ internal sealed partial class GameServerHost
 
     private async Task AuthenticateAdmissionAsync(ClientSession session, uint requestId, string token)
     {
-        AccountId accountId = default;
+        BackendAdmissionRedeemResponse admission = null;
         Exception failure = null;
         try
         {
-            accountId = await _runtime.Backend.RedeemAdmissionAsync(token, CancellationToken.None)
+            admission = await _runtime.Backend.RedeemAdmissionAsync(token, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -150,7 +153,16 @@ internal sealed partial class GameServerHost
                 return;
 
             session.AuthenticationInFlight = false;
-            if (failure != null || !accountId.IsValid)
+            AccountPolicySnapshot policy = admission?.policy;
+            AccountId accountId = admission != null && admission.success && admission.accountId > 0
+                ? new AccountId(admission.accountId)
+                : default;
+            long nowUtcTicks = DateTime.UtcNow.Ticks;
+            if (failure != null ||
+                !accountId.IsValid ||
+                policy == null ||
+                policy.accountId != accountId.Value ||
+                !policy.IsAccessAllowedAt(nowUtcTicks))
             {
                 _runtime.SessionService.CancelAuthentication(session.SessionHandle);
                 TryGetAuthoritativeSession(session, out PlayerSession failedSession);
@@ -173,6 +185,17 @@ internal sealed partial class GameServerHost
             }
 
             session.AuthenticatedAccountId = accountId.Value;
+            session.AccountPolicy = policy;
+
+            // Persistent Backend account policy is authoritative for staff access. The legacy
+            // JSON authorization file may still bootstrap emergency/test entries at startup,
+            // but every authenticated account replaces that entry with its current policy.
+            _runtime.GameMasters.SetAuthorization(new StaffAuthorizationSnapshot
+            {
+                accountId = accountId.Value,
+                roleName = policy.staffRole.ToString(),
+                capabilities = policy.staffCapabilities,
+            });
             _runtime.GameMasters.OpenSession(accountId.Value);
 
             SendResponse(session, requestId, new AdmissionAuthenticationResponseMessage

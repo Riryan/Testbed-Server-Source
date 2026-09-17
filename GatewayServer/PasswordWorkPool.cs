@@ -20,14 +20,23 @@ internal sealed class PasswordWorkPool : IAsyncDisposable
         public Operation Kind { get; }
         public string Account { get; }
         public string Password { get; }
+        public string RemoteIp { get; }
+        public string DeviceId { get; }
         public TaskCompletionSource<AuthOperationResult> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public WorkItem(Operation kind, string account, string password)
+        public WorkItem(
+            Operation kind,
+            string account,
+            string password,
+            string remoteIp,
+            string deviceId)
         {
             Kind = kind;
             Account = account;
             Password = password;
+            RemoteIp = remoteIp;
+            DeviceId = deviceId;
         }
     }
 
@@ -76,19 +85,31 @@ internal sealed class PasswordWorkPool : IAsyncDisposable
         }
     }
 
-    public bool TryQueueLogin(string account, string password, out Task<AuthOperationResult> completion) =>
-        TryQueue(Operation.Login, account, password, out completion);
+    public bool TryQueueLogin(
+        string account,
+        string password,
+        string remoteIp,
+        string deviceId,
+        out Task<AuthOperationResult> completion) =>
+        TryQueue(Operation.Login, account, password, remoteIp, deviceId, out completion);
 
-    public bool TryQueueCreate(string account, string password, out Task<AuthOperationResult> completion) =>
-        TryQueue(Operation.Create, account, password, out completion);
+    public bool TryQueueCreate(
+        string account,
+        string password,
+        string remoteIp,
+        string deviceId,
+        out Task<AuthOperationResult> completion) =>
+        TryQueue(Operation.Create, account, password, remoteIp, deviceId, out completion);
 
     private bool TryQueue(
         Operation operation,
         string account,
         string password,
+        string remoteIp,
+        string deviceId,
         out Task<AuthOperationResult> completion)
     {
-        var work = new WorkItem(operation, account, password);
+        var work = new WorkItem(operation, account, password, remoteIp, deviceId);
         completion = work.Completion.Task;
         try
         {
@@ -116,8 +137,8 @@ internal sealed class PasswordWorkPool : IAsyncDisposable
             try
             {
                 AuthOperationResult result = work.Kind == Operation.Login
-                    ? _accounts.Login(work.Account, work.Password)
-                    : _accounts.Create(work.Account, work.Password);
+                    ? _accounts.Login(work.Account, work.Password, work.RemoteIp, work.DeviceId)
+                    : _accounts.Create(work.Account, work.Password, work.RemoteIp, work.DeviceId);
                 work.Completion.TrySetResult(result);
             }
             catch (Exception ex)

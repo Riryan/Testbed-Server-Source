@@ -26,6 +26,9 @@ options.Validate();
 if (builder.Environment.IsEnvironment("LoadTest"))
     Console.WriteLine("WARNING: LOAD-TEST authentication limits are active. Do not use this environment for public production deployment.");
 
+if (!string.IsNullOrWhiteSpace(options.DevelopmentAdminAccount))
+    Console.WriteLine($"WARNING: DEVELOPMENT ADMIN BOOTSTRAP is active for '{options.DevelopmentAdminAccount}'. Clear GatewayServer:DevelopmentAdminAccount before production.");
+
 string contentRoot = builder.Environment.ContentRootPath;
 string databasePath = PathUtility.Resolve(contentRoot, options.DatabasePath);
 string gameplayContentPath = PathUtility.Resolve(contentRoot, options.ContentDefinitionsPath);
@@ -35,6 +38,7 @@ string certificatePath = PathUtility.Resolve(contentRoot, options.CertificatePat
 string certificateFingerprintPath = PathUtility.Resolve(contentRoot, options.CertificateFingerprintPath);
 
 BackendSecrets secrets = BackendSecrets.LoadOrCreate(secretsPath, gameServerKeyPath);
+using var accountTelemetry = new AccountAccessTelemetry(secrets.AccountTelemetryHmacKey);
 using var certificate = CertificateBootstrap.LoadOrCreate(
     certificatePath,
     secrets.CertificatePassword,
@@ -119,7 +123,7 @@ using var databaseWork = new BackendDatabaseDispatcher(
 var admissions = new AdmissionTokenService(
     databaseWork,
     TimeSpan.FromSeconds(options.AdmissionLifetimeSeconds));
-var accounts = new AccountAuthService(databaseWork, admissions, options);
+var accounts = new AccountAuthService(databaseWork, admissions, options, accountTelemetry);
 await using var passwordWork = new PasswordWorkPool(
     accounts,
     options.PasswordWorkerCount,
@@ -258,7 +262,13 @@ app.MapPost("/v1/accounts/login", async Task<IResult> (HttpContext context, Back
     if (!IsPublic(context))
         return Results.NotFound();
 
-    if (!passwordWork.TryQueueLogin(request?.account, request?.password, out Task<AuthOperationResult> completion))
+    string remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? string.Empty;
+    if (!passwordWork.TryQueueLogin(
+            request?.account,
+            request?.password,
+            remoteIp,
+            request?.deviceId,
+            out Task<AuthOperationResult> completion))
     {
         return Results.Json(
             AuthFailed("authentication busy"),
@@ -267,7 +277,7 @@ app.MapPost("/v1/accounts/login", async Task<IResult> (HttpContext context, Back
 
     AuthOperationResult result = await completion.ConfigureAwait(false);
     return result.Success
-        ? Results.Ok(AuthSucceeded(result.Admission))
+        ? Results.Ok(AuthSucceeded(result))
         : Results.Json(AuthFailed("login unavailable"), statusCode: StatusCodes.Status401Unauthorized);
 }).RequireRateLimiting("login");
 
@@ -276,7 +286,13 @@ app.MapPost("/v1/accounts/create", async Task<IResult> (HttpContext context, Bac
     if (!IsPublic(context))
         return Results.NotFound();
 
-    if (!passwordWork.TryQueueCreate(request?.account, request?.password, out Task<AuthOperationResult> completion))
+    string remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? string.Empty;
+    if (!passwordWork.TryQueueCreate(
+            request?.account,
+            request?.password,
+            remoteIp,
+            request?.deviceId,
+            out Task<AuthOperationResult> completion))
     {
         return Results.Json(
             AuthFailed("authentication busy"),
@@ -285,7 +301,7 @@ app.MapPost("/v1/accounts/create", async Task<IResult> (HttpContext context, Bac
 
     AuthOperationResult result = await completion.ConfigureAwait(false);
     return result.Success
-        ? Results.Ok(AuthSucceeded(result.Admission))
+        ? Results.Ok(AuthSucceeded(result))
         : Results.Json(AuthFailed("account creation unavailable"), statusCode: StatusCodes.Status400BadRequest);
 }).RequireRateLimiting("create");
 
@@ -300,13 +316,13 @@ app.MapPost("/v1/internal/admissions/redeem", async Task<IResult> (
     if (!IsInternal(context))
         return Results.NotFound();
 
-    if (!admissions.TryQueueRedeem(request?.token, out Task<long> completion))
+    if (!admissions.TryQueueRedeem(request?.token, out Task<BackendAdmissionRedeemResponse> completion))
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
 
-    long accountId;
+    BackendAdmissionRedeemResponse result;
     try
     {
-        accountId = await completion.WaitAsync(context.RequestAborted).ConfigureAwait(false);
+        result = await completion.WaitAsync(context.RequestAborted).ConfigureAwait(false);
     }
     catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
     {
@@ -318,19 +334,17 @@ app.MapPost("/v1/internal/admissions/redeem", async Task<IResult> (
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
 
-    return accountId > 0
-        ? Results.Ok(new BackendAdmissionRedeemResponse
-        {
-            success = true,
-            accountId = accountId,
-            error = string.Empty,
-        })
-        : Results.Json(new BackendAdmissionRedeemResponse
-        {
-            success = false,
-            accountId = 0,
-            error = "admission unavailable",
-        }, statusCode: StatusCodes.Status401Unauthorized);
+    return result != null && result.success && result.accountId > 0 && result.policy != null
+        ? Results.Ok(result)
+        : Results.Json(
+            result ?? new BackendAdmissionRedeemResponse
+            {
+                success = false,
+                accountId = 0,
+                policy = null,
+                error = "admission unavailable",
+            },
+            statusCode: StatusCodes.Status401Unauthorized);
 });
 
 app.MapPost("/v1/internal/characters/list", async Task<IResult> (
@@ -899,13 +913,14 @@ static async Task WriteContentRevisionEventAsync(
     await response.Body.FlushAsync(cancellationToken);
 }
 
-static BackendAuthResponse AuthSucceeded(IssuedAdmission admission) =>
+static BackendAuthResponse AuthSucceeded(AuthOperationResult result) =>
     new()
     {
         success = true,
         error = string.Empty,
-        admissionToken = admission.Token,
-        expiresUtcTicks = admission.ExpiresUtcTicks,
+        admissionToken = result.Admission.Token,
+        expiresUtcTicks = result.Admission.ExpiresUtcTicks,
+        policy = result.Policy,
     };
 
 static BackendAuthResponse AuthFailed(string error) =>
@@ -915,4 +930,5 @@ static BackendAuthResponse AuthFailed(string error) =>
         error = error,
         admissionToken = string.Empty,
         expiresUtcTicks = 0,
+        policy = null,
     };

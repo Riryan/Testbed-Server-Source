@@ -20,6 +20,10 @@ namespace Game.Shared.Staff
         Suspend = 1UL << 10,
         SpawnTestEntity = 1UL << 11,
         ManageWorld = 1UL << 12,
+        ModerateAccounts = 1UL << 13,
+        BanAccounts = 1UL << 14,
+        ManageEntitlements = 1UL << 15,
+        ManageStaff = 1UL << 16,
         All = ulong.MaxValue,
     }
 

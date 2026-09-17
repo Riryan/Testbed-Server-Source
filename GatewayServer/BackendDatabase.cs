@@ -67,6 +67,7 @@ internal sealed partial class BackendDatabase : IDisposable
         {
             conn.Execute("PRAGMA foreign_keys=ON");
             conn.CreateTable<AccountRow>();
+            InitializeAccountPolicySchema(conn);
             conn.CreateTable<CredentialRow>();
             conn.CreateTable<AdmissionRow>();
             conn.CreateTable<CharacterRow>();

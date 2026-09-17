@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using Game.Shared.Accounts;
 using Game.Server.Application.Sessions;
 using Game.Server.Domain.Resources;
 using Game.Server.Domain.StatusEffects;
@@ -15,6 +16,9 @@ internal sealed class ClientSession
     public DateTime AuthenticationDeadlineUtc { get; }
     public bool AuthenticationInFlight { get; set; }
     public long AuthenticatedAccountId { get; set; }
+    // Authoritative account-level entitlement/moderation snapshot captured at admission.
+    // GameServer uses this for staff authority and future account-gated gameplay.
+    public AccountPolicySnapshot AccountPolicy { get; set; }
     public bool CharacterCreateInFlight { get; set; }
     public bool CharacterDeleteInFlight { get; set; }
     public bool CharacterLoadInFlight { get; set; }

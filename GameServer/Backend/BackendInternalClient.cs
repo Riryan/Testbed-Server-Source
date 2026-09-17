@@ -6,7 +6,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Game.Shared.Backend;
-using Game.Shared.Identity;
 
 namespace Game.UnityIntegration.Backend
 {
@@ -52,21 +51,25 @@ namespace Game.UnityIntegration.Backend
             _eventHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         }
 
-        public async Task<AccountId> RedeemAdmissionAsync(
+        public Task<BackendAdmissionRedeemResponse> RedeemAdmissionAsync(
             string token,
             CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(token))
-                return default(AccountId);
+            {
+                return Task.FromResult(new BackendAdmissionRedeemResponse
+                {
+                    success = false,
+                    accountId = 0,
+                    policy = null,
+                    error = "admission unavailable",
+                });
+            }
 
-            BackendAdmissionRedeemResponse response = await PostAsync<BackendAdmissionRedeemRequest, BackendAdmissionRedeemResponse>(
+            return PostAsync<BackendAdmissionRedeemRequest, BackendAdmissionRedeemResponse>(
                 "/v1/internal/admissions/redeem",
                 new BackendAdmissionRedeemRequest { token = token },
-                cancellationToken).ConfigureAwait(false);
-
-            return response != null && response.success && response.accountId > 0
-                ? new AccountId(response.accountId)
-                : default(AccountId);
+                cancellationToken);
         }
 
         public Task<BackendCharacterListResponse> ListCharactersAsync(
