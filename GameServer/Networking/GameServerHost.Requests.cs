@@ -26,6 +26,7 @@ internal sealed partial class GameServerHost
         var handlers = new Dictionary<ushort, Action<ClientSession, uint, NetDataReader>>();
         RegisterCoreAndCharacterRequests(handlers);
         RegisterPlayerItemRequests(handlers);
+        RegisterSocialEconomyRequests(handlers);
         RegisterWorldItemRequests(handlers);
         RegisterResourceStatusRequests(handlers);
         RegisterProgressionRequests(handlers);

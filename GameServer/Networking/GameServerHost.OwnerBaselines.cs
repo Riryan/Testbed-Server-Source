@@ -72,6 +72,10 @@ internal sealed partial class GameServerHost
                 PlayerGameplayActionMessageTypes.CombatOwnerState,
                 ToGameplayWire(_runtime.CombatLoadout.Capture(runtime, _scheduler.ServerTime)),
                 DeliveryMethod.ReliableOrdered);
+
+            // Friends are durable but low-frequency social state. Prime that cache once
+            // after Ready; later mutations and same-GameServer presence changes are push-only.
+            BeginSocialEconomyReady(session, runtime);
         }
         catch (Exception ex)
         {

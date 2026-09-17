@@ -93,6 +93,13 @@ namespace Player.Networking
 
             Add(result, CraftingRequestTypes.Craft, "Crafting.Craft");
 
+            Add(result, FriendRequestTypes.Snapshot, "Friends.Snapshot");
+            Add(result, FriendRequestTypes.Action, "Friends.Action");
+            Add(result, EconomyRequestTypes.TradeAction, "Trade.Action");
+            Add(result, EconomyRequestTypes.TradeSnapshot, "Trade.Snapshot");
+            Add(result, EconomyRequestTypes.StorageSnapshot, "Storage.Snapshot");
+            Add(result, EconomyRequestTypes.StorageTransfer, "Storage.Transfer");
+
             Add(result, StaffRequestTypes.Status, "Staff.Status");
             Add(result, StaffRequestTypes.SetVisibility, "Staff.SetVisibility");
             Add(result, StaffRequestTypes.Spectate, "Staff.Spectate");

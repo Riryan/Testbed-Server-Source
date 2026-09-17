@@ -674,6 +674,11 @@ internal sealed partial class GameServerHost
             if (instant.ResultCode != InteractionResultCode.ConsentRequired)
             {
                 SendResponse(client, requestId, ToContextInteractionWire(request.target, instant));
+                if (instant.ResultCode == InteractionResultCode.Success &&
+                    request.ActionId == InteractionActionId.OpenStorage)
+                {
+                    OpenStorageFor(client, source, stableId);
+                }
                 return;
             }
         }

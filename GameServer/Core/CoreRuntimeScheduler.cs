@@ -1119,7 +1119,7 @@ namespace LiteNetLibManager
 
             entry.OverrunStrikes++;
 
-            if (_serverTime >= entry.NextWarningTime)
+            if (entry.OverrunStrikes > 1 && _serverTime >= entry.NextWarningTime)
             {
                 CoreRuntimeSchedulerLog.Warning(
                     $"[CoreRuntimeScheduler] System '{entry.Name}' in channel '{channel.Config.name}' took {elapsedMilliseconds:F3} ms " +

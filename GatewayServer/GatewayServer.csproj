@@ -17,6 +17,7 @@
     <Compile Include="..\Game.Shared\Source\Staff\StaffContracts.cs" Link="Shared\StaffContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Backend\BackendServiceContracts.cs" Link="Shared\BackendServiceContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Backend\BackendGuildContracts.cs" Link="Shared\BackendGuildContracts.cs" />
+    <Compile Include="..\Game.Shared\Source\Backend\BackendSocialEconomyContracts.cs" Link="Shared\BackendSocialEconomyContracts.cs" />
     <Compile Include="..\Game.Shared\Source\Content\GameplayContentDefinitions.cs" Link="Shared\GameplayContentDefinitions.cs" />
     <Compile Include="..\Game.Shared\Source\Content\RecoveryContentDefinitions.cs" Link="Shared\RecoveryContentDefinitions.cs" />
     <Compile Include="..\Game.Shared\Source\Progression\ProgressionContracts.cs" Link="Shared\ProgressionContracts.cs" />

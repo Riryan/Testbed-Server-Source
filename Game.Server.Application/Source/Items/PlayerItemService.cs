@@ -586,6 +586,58 @@ namespace Game.Server.Application.Items
                 : AmmoReloadInventoryResult.Failed(installed);
         }
 
+        /// <summary>
+        /// Installs state returned by an external authoritative item transaction (trade/storage).
+        /// Call this only while the matching PlayerItemService serialization gate is held.
+        /// </summary>
+        public PlayerItemOperationResult InstallExternalPersistedState(
+            PlayerRuntime runtime,
+            PlayerItemSystemsRuntimeSnapshot current,
+            PlayerSystemsPersistenceRecord persisted,
+            string operationName) =>
+            InstallPersistedState(runtime, current, persisted, string.IsNullOrWhiteSpace(operationName) ? "external item" : operationName);
+
+        /// <summary>Serializes one external item transaction with ordinary inventory/equipment mutations.</summary>
+        public Task<T> RunExternalSerializedAsync<T>(
+            PlayerRuntime runtime,
+            Func<CancellationToken, Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            if (runtime == null) throw new ArgumentNullException(nameof(runtime));
+            if (operation == null) throw new ArgumentNullException(nameof(operation));
+            return RunSerializedAsync(runtime, cancellationToken, operation, default(T));
+        }
+
+        /// <summary>
+        /// Serializes a two-player transaction with both players' normal item mutation gates.
+        /// Deterministic character-id ordering prevents cross-trade deadlocks.
+        /// </summary>
+        public async Task<T> RunExternalPairSerializedAsync<T>(
+            PlayerRuntime left,
+            PlayerRuntime right,
+            Func<CancellationToken, Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            if (left == null) throw new ArgumentNullException(nameof(left));
+            if (right == null) throw new ArgumentNullException(nameof(right));
+            if (ReferenceEquals(left, right) || left.CharacterId.Value == right.CharacterId.Value)
+                throw new ArgumentException("External pair transaction requires two distinct players.");
+            if (operation == null) throw new ArgumentNullException(nameof(operation));
+
+            PlayerRuntime first = left.CharacterId.Value < right.CharacterId.Value ? left : right;
+            PlayerRuntime second = ReferenceEquals(first, left) ? right : left;
+            SemaphoreSlim firstGate = _operationGates.GetValue(first, _ => new SemaphoreSlim(1, 1));
+            SemaphoreSlim secondGate = _operationGates.GetValue(second, _ => new SemaphoreSlim(1, 1));
+            await firstGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await secondGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try { return await operation(cancellationToken).ConfigureAwait(false); }
+                finally { secondGate.Release(); }
+            }
+            finally { firstGate.Release(); }
+        }
+
         private PlayerItemOperationResult InstallPersistedState(
             PlayerRuntime runtime,
             PlayerItemSystemsRuntimeSnapshot current,

@@ -244,6 +244,7 @@ internal sealed partial class GameServerHost
         }
         _mainThreadCompletions.Enqueue(() =>
         {
+            _socialEconomy?.OnPlayerItemsChanged(runtime);
             ClientSession owner = FindReadySession(runtime);
             if (owner == null)
                 return;

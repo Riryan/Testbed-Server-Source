@@ -258,6 +258,7 @@ internal sealed partial class GameServerHost
             // Run it while the ready-session/entity indexes are still intact so any peer
             // cancellation/occupancy release observes the same authoritative participant.
             _runtime.InteractionSessions.NotifyDisconnect(entity.Runtime.CharacterId.Value);
+            CloseSocialEconomyForCharacter(entity.Runtime.CharacterId.Value);
             DeactivatePlayerGameplayRuntime(session, entity.Runtime);
         }
         UnregisterReadySessionIndexes(session);
