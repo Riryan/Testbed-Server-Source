@@ -61,7 +61,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     private float _lastSnapshotX;
     private float _lastSnapshotY;
     private float _lastSnapshotZ;
-    private float _lastSnapshotYaw;
+    private byte _lastSnapshotWireYaw;
     private byte _lastSnapshotFlags;
     private byte _lastSnapshotMoveState = byte.MaxValue;
     private bool _lastSnapshotDead;
@@ -153,7 +153,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
         _lastSnapshotZ = Z;
-        _lastSnapshotYaw = YawDegrees;
+        _lastSnapshotWireYaw = QuantizeYaw(YawDegrees);
         _lastSnapshotDead = IsDead;
         _lastCommandTimestampMs = Environment.TickCount64;
         _rateWindowStartMs = _lastCommandTimestampMs;
@@ -356,7 +356,11 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         bool moved =
             DistanceSquared(X, Y, Z, _lastSnapshotX, _lastSnapshotY, _lastSnapshotZ) >=
             PositionPrecision * PositionPrecision;
-        bool rotated = MathF.Abs(DeltaAngle(_lastSnapshotYaw, YawDegrees)) >= 0.5f;
+        // Dirty rotation must match the actual wire representation. If quantization still
+        // produces the same byte, the client cannot observe a rotation change and there is
+        // no reason to wake replication for it.
+        byte wireYaw = QuantizeYaw(YawDegrees);
+        bool rotated = wireYaw != _lastSnapshotWireYaw;
         bool flagsChanged = flags != _lastSnapshotFlags;
         bool movementStateChanged = moveState != _lastSnapshotMoveState;
         bool deathStateChanged = dead != _lastSnapshotDead;
@@ -382,7 +386,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
         _lastSnapshotZ = Z;
-        _lastSnapshotYaw = YawDegrees;
+        _lastSnapshotWireYaw = wireYaw;
         _lastSnapshotFlags = flags;
         _lastSnapshotMoveState = moveState;
         _lastSnapshotDead = dead;
@@ -410,7 +414,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
         _lastSnapshotZ = Z;
-        _lastSnapshotYaw = YawDegrees;
+        _lastSnapshotWireYaw = QuantizeYaw(YawDegrees);
         _lastSnapshotFlags = 0;
         _lastSnapshotMoveState = byte.MaxValue;
         _lastSnapshotDead = IsDead;

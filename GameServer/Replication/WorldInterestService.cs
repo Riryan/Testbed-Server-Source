@@ -167,7 +167,8 @@ internal sealed class WorldInterestService
 
         // The new player is both an observer and a target. With only one registered
         // player the mandatory self edge is already complete, so there is no addition
-        // work to queue. The second+ registration scans both directed phases.
+        // work to queue. The second+ registration scans nearby candidates once and
+        // evaluates both directed visibility edges from that shared spatial result.
         if (_entries.Count > 1)
             QueueAdditionScan(entry);
         return _changes;
@@ -604,52 +605,54 @@ internal sealed class WorldInterestService
         int centerX = ToCellCoordinate(center.X);
         int centerZ = ToCellCoordinate(center.Z);
 
-        while (center.AdditionScanPhase is 1 or 2)
+        // One spatial candidate pass updates both directed edges. Visibility remains
+        // directional; only the shared partition/distance lookup is coalesced. Combat and
+        // other AOI consumers still see the same observer -> target graph.
+        while (center.AdditionCellOffset < cellCount)
         {
-            bool centerIsObserver = center.AdditionScanPhase == 1;
-            while (center.AdditionCellOffset < cellCount)
-            {
-                int offset = center.AdditionCellOffset;
-                int dx = (offset % diameter) - _queryCellRadius;
-                int dz = (offset / diameter) - _queryCellRadius;
-                var key = new CellKey(center.MapId, center.InstanceId, centerX + dx, centerZ + dz);
+            int offset = center.AdditionCellOffset;
+            int dx = (offset % diameter) - _queryCellRadius;
+            int dz = (offset / diameter) - _queryCellRadius;
+            var key = new CellKey(center.MapId, center.InstanceId, centerX + dx, centerZ + dz);
 
-                if (!_grid.TryGetValue(key, out SpatialCell cell))
+            if (!_grid.TryGetValue(key, out SpatialCell cell))
+            {
+                center.AdditionCellOffset++;
+                center.AdditionSessionIndex = 0;
+                continue;
+            }
+
+            List<ClientSession> sessions = cell.Sessions;
+            while (center.AdditionSessionIndex < sessions.Count)
+            {
+                if (remainingCandidateChecks <= 0 || _changes.Count >= maxEdgeAdditions)
+                    return false;
+
+                // Do not advance the resumable cursor until both directed decisions have
+                // been attempted. If the first edge consumes the final edge-budget slot,
+                // the next pass revisits this candidate, observes that edge already exists,
+                // and safely completes the reverse direction.
+                ClientSession candidateSession = sessions[center.AdditionSessionIndex];
+                remainingCandidateChecks--;
+
+                if (!_entries.TryGetValue(candidateSession, out Entry candidate) ||
+                    !IsInterestEligible(candidateSession) ||
+                    !SamePartition(center, candidate) ||
+                    DistanceSquared(center, candidate) > _enterRangeSquared)
                 {
-                    center.AdditionCellOffset++;
-                    center.AdditionSessionIndex = 0;
+                    center.AdditionSessionIndex++;
                     continue;
                 }
 
-                List<ClientSession> sessions = cell.Sessions;
-                while (center.AdditionSessionIndex < sessions.Count)
-                {
-                    if (remainingCandidateChecks <= 0 || _changes.Count >= maxEdgeAdditions)
-                        return false;
+                AddEdge(center.Session, candidateSession);
+                if (_changes.Count >= maxEdgeAdditions)
+                    return false;
 
-                    ClientSession candidateSession = sessions[center.AdditionSessionIndex++];
-                    remainingCandidateChecks--;
-
-                    if (!_entries.TryGetValue(candidateSession, out Entry candidate) ||
-                        !IsInterestEligible(candidateSession) ||
-                        !SamePartition(center, candidate) ||
-                        DistanceSquared(center, candidate) > _enterRangeSquared)
-                    {
-                        continue;
-                    }
-
-                    if (centerIsObserver)
-                        AddEdge(center.Session, candidateSession);
-                    else
-                        AddEdge(candidateSession, center.Session);
-                }
-
-                center.AdditionCellOffset++;
-                center.AdditionSessionIndex = 0;
+                AddEdge(candidateSession, center.Session);
+                center.AdditionSessionIndex++;
             }
 
-            center.AdditionScanPhase++;
-            center.AdditionCellOffset = 0;
+            center.AdditionCellOffset++;
             center.AdditionSessionIndex = 0;
         }
 

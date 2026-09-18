@@ -269,6 +269,66 @@ internal sealed partial class GameServerHost
             state.Tokens + seconds * _options.OutboundBytesPerConnectionSecond);
     }
 
+    /// <summary>
+    /// Sends latest-state traffic immediately only when the existing per-connection
+    /// outbound token budget permits it. Unlike QueueOutbound, this never copies or queues
+    /// the packet: callers retain their coalescible authoritative latest state instead of
+    /// building a stale packet backlog while a connection is over budget.
+    /// </summary>
+    private bool TrySendImmediateOutbound(
+        ClientSession session,
+        NetDataWriter writer,
+        DeliveryMethod deliveryMethod,
+        OutboundPriority priority,
+        OutboundFamily family)
+    {
+        if (!IsCurrent(session) ||
+            session.Peer.ConnectionState != ConnectionState.Connected ||
+            writer == null || writer.Length <= 0)
+        {
+            return false;
+        }
+
+        if (!_outboundStates.TryGetValue(session, out OutboundConnectionState state))
+        {
+            state = new OutboundConnectionState(session, _options.OutboundBurstBytesPerConnection);
+            _outboundStates.Add(session, state);
+        }
+
+        RefillOutboundTokens(state);
+
+        // Immediate latest-state traffic must not leapfrog already queued work at the same
+        // or a higher priority. Lower-priority background work does not block movement.
+        int highestBlockingLane = Math.Min((int)priority, state.Queues.Length - 1);
+        for (int i = 0; i <= highestBlockingLane; ++i)
+        {
+            if (state.Queues[i].Count == 0)
+                continue;
+
+            state.DeferredFramesWindow++;
+            _outboundBudgetDeferrals++;
+            return false;
+        }
+
+        int length = writer.Length;
+        bool critical = priority == OutboundPriority.Critical;
+        double permitted = state.Tokens + (critical ? _options.OutboundCriticalReserveBytes : 0d);
+        if (length > permitted)
+        {
+            state.DeferredFramesWindow++;
+            _outboundBudgetDeferrals++;
+            return false;
+        }
+
+        state.Tokens -= length;
+        session.Peer.Send(writer, 0, deliveryMethod);
+        state.SentBytesWindow += length;
+        state.SentPacketsWindow++;
+        _outboundFamilyBytes[(int)family] += length;
+        _outboundFamilyPackets[(int)family]++;
+        return true;
+    }
+
     private static bool TryPeekNextOutbound(OutboundConnectionState state, out OutboundPacket packet)
     {
         for (int i = 0; i < state.Queues.Length; ++i)

@@ -369,6 +369,7 @@ internal sealed partial class GameServerHost
         {
             BeginSnapshotPacket(out int objectCountPosition);
             ushort objectCount = 0;
+            bool packetPriority = false;
             batch.PacketScratch.Clear();
 
             while (keyIndex < batch.KeyScratch.Count)
@@ -416,6 +417,7 @@ internal sealed partial class GameServerHost
 
                 _writer.Put(_replicationObjectWriter.Data.AsSpan(0, objectLength));
                 batch.PacketScratch.Add(objectId);
+                packetPriority |= snapshot.Priority;
                 objectCount++;
                 keyIndex++;
             }
@@ -427,7 +429,19 @@ internal sealed partial class GameServerHost
             if (packetBytes > globalBytesRemaining)
                 break;
 
-            CompleteAndSendSnapshotPacket(recipient, objectCountPosition, objectCount);
+            // Ordinary transform traffic spends the existing normal per-connection
+            // outbound tokens. Priority state transitions use the existing critical reserve.
+            // If budget is unavailable, keep these authoritative states pending so newer
+            // state can coalesce over them instead of queueing a stale serialized packet.
+            if (!TryCompleteAndSendSnapshotPacket(
+                    recipient,
+                    objectCountPosition,
+                    objectCount,
+                    packetPriority))
+            {
+                break;
+            }
+
             packetsSent++;
             globalPacketsRemaining--;
             globalBytesRemaining -= packetBytes;
@@ -449,23 +463,37 @@ internal sealed partial class GameServerHost
         _writer.Put((ushort)0);
     }
 
-    private void CompleteAndSendSnapshotPacket(
+    private bool TryCompleteAndSendSnapshotPacket(
         ClientSession recipient,
         int objectCountPosition,
-        ushort objectCount)
+        ushort objectCount,
+        bool priorityPacket)
     {
         if (objectCount == 0)
-            return;
+            return false;
 
         int endPosition = _writer.Length;
         _writer.SetPosition(objectCountPosition);
         _writer.Put(objectCount);
         _writer.SetPosition(endPosition);
 
+        OutboundPriority priority = priorityPacket
+            ? OutboundPriority.Critical
+            : OutboundPriority.Normal;
+        if (!TrySendImmediateOutbound(
+                recipient,
+                _writer,
+                DeliveryMethod.Unreliable,
+                priority,
+                OutboundFamily.Movement))
+        {
+            return false;
+        }
+
         _replicationSnapshotsSent += objectCount;
         _replicationSnapshotPacketsSent++;
         _replicationPayloadBytes += _writer.Length;
-        Send(recipient, _writer, DeliveryMethod.Unreliable);
+        return true;
     }
 
     private void WriteSnapshotObject(
