@@ -301,7 +301,16 @@ namespace Game.Server.Application.Combat
                 double defense = Math.Max(0d, target.GetStat(defenseStatId, 0f));
                 double penetrationPercent = Clamp01(armorPenetrationPercent);
                 defense = Math.Max(0d, (defense * (1d - penetrationPercent)) - Math.Max(0f, armorPenetrationFlat));
+                bool hadPositivePreDefenseDamage = resolved > 0d;
                 resolved = Math.Max(0d, resolved - defense);
+
+                // Armor/defense is not an immunity mechanic. If a legitimate positive hit
+                // reaches this stage, defense may reduce it to the configured floor but may
+                // not bypass minimumDamageAfterDefense by landing on exact zero. Explicit
+                // block/immunity/damage-response rules still run outside/after this branch
+                // and remain able to produce zero effective damage.
+                if (hadPositivePreDefenseDamage && rules.minimumDamageAfterDefense > 0)
+                    resolved = Math.Max(rules.minimumDamageAfterDefense, resolved);
             }
 
             if (canRespond)
@@ -537,7 +546,10 @@ namespace Game.Server.Application.Combat
                         defenseStatId = typed.defenseStatId;
                     double defense = Math.Max(0d, target.GetStat(defenseStatId, 0f));
                     defense = Math.Max(0d, (defense * (1d - Clamp01(armorPenetrationPercent))) - Math.Max(0f, armorPenetrationFlat));
+                    bool hadPositivePreDefenseDamage = resolved > 0d;
                     resolved = Math.Max(0d, resolved - defense);
+                    if (hadPositivePreDefenseDamage && rules.minimumDamageAfterDefense > 0)
+                        resolved = Math.Max(rules.minimumDamageAfterDefense, resolved);
                 }
 
                 if (canRespond)
