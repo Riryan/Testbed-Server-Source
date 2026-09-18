@@ -790,6 +790,86 @@ app.MapPost("/v1/internal/player-systems/craft", async Task<IResult> (
         context.RequestAborted);
 });
 
+app.MapPost("/v1/internal/friends/load", async Task<IResult> (
+    HttpContext context,
+    BackendFriendLoadRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Normal,
+        db => db.LoadFriends(request?.characterId ?? 0),
+        context.RequestAborted);
+});
+
+app.MapPost("/v1/internal/friends/add", async Task<IResult> (
+    HttpContext context,
+    BackendFriendMutationRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Critical,
+        db => db.AddFriend(request),
+        context.RequestAborted);
+});
+
+app.MapPost("/v1/internal/friends/remove", async Task<IResult> (
+    HttpContext context,
+    BackendFriendMutationRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Critical,
+        db => db.RemoveFriend(request),
+        context.RequestAborted);
+});
+
+app.MapPost("/v1/internal/trade/commit", async Task<IResult> (
+    HttpContext context,
+    BackendTradeCommitRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    GameplayContentSnapshot content = contentDefinitions.GetCurrent();
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Critical,
+        db => db.CommitTrade(request, content),
+        context.RequestAborted);
+});
+
+app.MapPost("/v1/internal/storage/load", async Task<IResult> (
+    HttpContext context,
+    BackendStorageLoadRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Normal,
+        db => db.LoadStorage(request),
+        context.RequestAborted);
+});
+
+app.MapPost("/v1/internal/storage/transfer", async Task<IResult> (
+    HttpContext context,
+    BackendStorageTransferRequest request) =>
+{
+    if (!IsInternal(context))
+        return Results.NotFound();
+
+    return await ExecuteDatabaseAsync(
+        DatabaseWorkPriority.Critical,
+        db => db.TransferStorage(request),
+        context.RequestAborted);
+});
+
+
 app.MapPost("/v1/internal/guilds/load", async Task<IResult> (
     HttpContext context,
     BackendGuildLoadRequest request) =>
