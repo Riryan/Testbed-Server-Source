@@ -297,9 +297,11 @@ internal sealed partial class GameServerHost
 
         RefillOutboundTokens(state);
 
-        // Immediate latest-state traffic must not leapfrog already queued work at the same
-        // or a higher priority. Lower-priority background work does not block movement.
-        int highestBlockingLane = Math.Min((int)priority, state.Queues.Length - 1);
+        // Immediate latest-state movement must not leapfrog already queued Critical or
+        // ReliableOrdered High traffic (spawn/control causality). Normal/background work
+        // does not block the latest authoritative transform.
+        int highestBlockingLane = Math.Max((int)priority, (int)OutboundPriority.High);
+        highestBlockingLane = Math.Min(highestBlockingLane, state.Queues.Length - 1);
         for (int i = 0; i <= highestBlockingLane; ++i)
         {
             if (state.Queues[i].Count == 0)
@@ -469,9 +471,9 @@ internal sealed partial class GameServerHost
         {
             summary =
                 $"Outbound/10s: total={totalPackets}/{totalBytes}B, " +
-                $"maxCCU={maxConnectionPackets}/{maxConnectionBytes}B, " +
-                $"deferredFrames={_outboundBudgetDeferrals} (maxCCU={maxConnectionDeferrals}), " +
-                $"unreliableDropped={_outboundDroppedUnreliable} (maxCCU={maxConnectionDrops}), " +
+                $"maxConn={maxConnectionPackets}/{maxConnectionBytes}B, " +
+                $"deferredFrames={_outboundBudgetDeferrals} (maxConn={maxConnectionDeferrals}), " +
+                $"unreliableDropped={_outboundDroppedUnreliable} (maxConn={maxConnectionDrops}), " +
                 $"queueLimitDisconnects={_outboundQueueLimitDisconnects}, " +
                 $"queueMax={_outboundMaxPendingPackets}pkt/{_outboundMaxPendingBytes}B/{_outboundMaxQueueAgeMilliseconds}ms, " +
                 $"families=" + FormatOutboundFamilies();

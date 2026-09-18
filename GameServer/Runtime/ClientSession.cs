@@ -31,6 +31,24 @@ internal sealed class ClientSession
     public bool SimulationDirty { get; set; }
     public int SimulationActiveIndex { get; set; } = -1;
 
+    // Per-connection proof that this client already owns the current immutable/public
+    // Gameplay Settings catalog. This is transport cache state only; it is never gameplay
+    // authority and is discarded with the connection.
+    public long GameplaySettingsValidatedRevision { get; set; }
+
+    // Per-connection proofs for durable owner-visible caches. These suppress only the
+    // corresponding Ready baseline after an exact authoritative revision comparison.
+    public long PlayerItemsValidatedContentRevision { get; set; }
+    public long PlayerItemsValidatedInventoryRevision { get; set; }
+    public long PlayerItemsValidatedEquipmentRevision { get; set; }
+    public long ProgressionValidatedContentRevision { get; set; }
+    public long ProgressionValidatedRevision { get; set; }
+
+    // Friends currently has no persisted backend revision, so the client advertises a
+    // durable-membership fingerprint. The GameServer still hydrates authoritative membership
+    // before comparing it; this field can never grant membership authority.
+    public long FriendsKnownRevision { get; set; }
+
     // Sequence for one-shot presentation pulses carried by the existing snapshot actionId byte.
     // This is transport/session state only; it is not durable gameplay state.
     public byte PresentationActionId { get; set; }

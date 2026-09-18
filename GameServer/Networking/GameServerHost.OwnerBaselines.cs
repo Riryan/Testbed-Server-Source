@@ -20,16 +20,24 @@ internal sealed partial class GameServerHost
 
         try
         {
-            // Settings first: status/ability presentation metadata is available before the
-            // following owner-state baselines are consumed on the same reliable stream.
-            SendClientMessage(
-                session,
-                GameplaySettingsMessageTypes.Snapshot,
-                BuildGameplaySettingsSnapshot(),
-                DeliveryMethod.ReliableOrdered);
+            // Settings first unless this exact connection already proved it has the current
+            // persistent public catalog. A stale/missing cache keeps the established full
+            // baseline and ordering so compact owner-state IDs are always resolvable.
+            long currentSettingsRevision = _runtime.Content.Revision;
+            if (session.GameplaySettingsValidatedRevision != currentSettingsRevision)
+            {
+                SendClientMessage(
+                    session,
+                    GameplaySettingsMessageTypes.Snapshot,
+                    BuildGameplaySettingsSnapshot(),
+                    DeliveryMethod.ReliableOrdered);
+            }
 
             var items = _runtime.PlayerItems.GetSnapshot(runtime);
-            if (items != null)
+            if (items != null &&
+                (session.PlayerItemsValidatedContentRevision != items.contentRevision ||
+                 session.PlayerItemsValidatedInventoryRevision != items.inventoryRevision ||
+                 session.PlayerItemsValidatedEquipmentRevision != items.equipmentRevision))
             {
                 SendClientMessage(
                     session,
@@ -61,11 +69,16 @@ internal sealed partial class GameServerHost
                     DeliveryMethod.ReliableOrdered);
             }
 
-            SendClientMessage(
-                session,
-                ProgressionMessageTypes.Snapshot,
-                BuildProgressionSnapshot(runtime),
-                DeliveryMethod.ReliableOrdered);
+            ProgressionSnapshotMessage progression = BuildProgressionSnapshot(runtime);
+            if (session.ProgressionValidatedContentRevision != progression.contentRevision ||
+                session.ProgressionValidatedRevision != progression.revision)
+            {
+                SendClientMessage(
+                    session,
+                    ProgressionMessageTypes.Snapshot,
+                    progression,
+                    DeliveryMethod.ReliableOrdered);
+            }
 
             SendClientMessage(
                 session,
@@ -75,7 +88,7 @@ internal sealed partial class GameServerHost
 
             // Friends are durable but low-frequency social state. Prime that cache once
             // after Ready; later mutations and same-GameServer presence changes are push-only.
-            BeginSocialEconomyReady(session, runtime);
+            BeginCacheAwareFriendsReady(session, runtime);
         }
         catch (Exception ex)
         {

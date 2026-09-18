@@ -22,8 +22,31 @@ namespace Player.Networking
 
     public struct PlayerItemsSnapshotRequestMessage : INetSerializable
     {
-        public void Serialize(NetDataWriter writer) { }
-        public void Deserialize(NetDataReader reader) { }
+        public long knownContentRevision;
+        public long knownInventoryRevision;
+        public long knownEquipmentRevision;
+
+        public void Serialize(NetDataWriter writer)
+        {
+            // Preserve the legacy empty request when no reconnect cache is being probed.
+            if (knownContentRevision == 0 && knownInventoryRevision == 0 && knownEquipmentRevision == 0)
+                return;
+            writer.Put(knownContentRevision);
+            writer.Put(knownInventoryRevision);
+            writer.Put(knownEquipmentRevision);
+        }
+
+        public void Deserialize(NetDataReader reader)
+        {
+            knownContentRevision = 0;
+            knownInventoryRevision = 0;
+            knownEquipmentRevision = 0;
+            if (reader == null || reader.AvailableBytes < sizeof(long) * 3)
+                return;
+            knownContentRevision = reader.GetLong();
+            knownInventoryRevision = reader.GetLong();
+            knownEquipmentRevision = reader.GetLong();
+        }
     }
 
     public struct MoveInventoryRequestMessage : INetSerializable
@@ -391,12 +414,15 @@ namespace Player.Networking
 
     public struct PlayerItemsResponseMessage : INetSerializable
     {
+        public const string NotModifiedMarker = "not_modified";
         public const int MaxInventoryEntries = 512;
         public const int MaxEquipmentSlots = 64;
         public bool success; public byte status; public string error;
         public long contentRevision; public long inventoryRevision; public long equipmentRevision;
         public int inventoryCapacity; public float inventoryWeight; public float armor; public float attackPower;
         public PlayerItemWire[] inventory; public EquipmentSlotWire[] equipment;
+
+        public bool IsNotModified => success && string.Equals(error, NotModifiedMarker, StringComparison.Ordinal);
 
         public void Serialize(NetDataWriter writer)
         {
@@ -423,6 +449,21 @@ namespace Player.Networking
             equipment = new EquipmentSlotWire[eqCount];
             for (int i = 0; i < eqCount; ++i) { EquipmentSlotWire slot = default; slot.Deserialize(reader); equipment[i] = slot; }
         }
+
+        public static PlayerItemsResponseMessage NotModified(
+            long contentRevision,
+            long inventoryRevision,
+            long equipmentRevision) => new PlayerItemsResponseMessage
+        {
+            success = true,
+            status = (byte)Game.Shared.Protocol.PlayerItemOperationStatus.Success,
+            error = NotModifiedMarker,
+            contentRevision = contentRevision,
+            inventoryRevision = inventoryRevision,
+            equipmentRevision = equipmentRevision,
+            inventory = Array.Empty<PlayerItemWire>(),
+            equipment = Array.Empty<EquipmentSlotWire>(),
+        };
 
         public static PlayerItemsResponseMessage Failed(byte status, string error) => new PlayerItemsResponseMessage
         {

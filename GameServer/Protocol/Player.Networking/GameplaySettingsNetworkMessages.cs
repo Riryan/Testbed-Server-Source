@@ -202,8 +202,19 @@ namespace Player.Networking
 
     public struct GameplaySettingsSnapshotRequestMessage : INetSerializable
     {
-        public void Serialize(NetDataWriter writer) { }
-        public void Deserialize(NetDataReader reader) { }
+        // Existing request 450 doubles as the reconnect cache probe. Zero means the
+        // client has no reusable local snapshot. Older clients serialize no payload;
+        // the bounded read below deliberately treats that as revision zero.
+        public long knownRevision;
+
+        public void Serialize(NetDataWriter writer) => writer.Put(knownRevision);
+
+        public void Deserialize(NetDataReader reader)
+        {
+            knownRevision = reader != null && reader.AvailableBytes >= sizeof(long)
+                ? reader.GetLong()
+                : 0L;
+        }
     }
 
     public struct GameplaySettingsSnapshotMessage : INetSerializable
@@ -213,6 +224,7 @@ namespace Player.Networking
         public const int MaxStatuses = 1024;
         public const int MaxItems = 4096;
         public const int MaxEquipmentSlots = 255;
+        public const string NotModifiedMarker = "not_modified";
 
         public bool success;
         public string error;
@@ -337,6 +349,28 @@ namespace Player.Networking
                 equipmentSlots[i] = slot;
             }
         }
+
+        public bool IsNotModified =>
+            success && revision > 0 &&
+            string.Equals(error, NotModifiedMarker, StringComparison.Ordinal);
+
+        public static GameplaySettingsSnapshotMessage NotModified(long revision) =>
+            new GameplaySettingsSnapshotMessage
+            {
+                success = revision > 0,
+                error = revision > 0 ? NotModifiedMarker : string.Empty,
+                revision = Math.Max(0L, revision),
+                moveSpeed = 0f,
+                sprintSpeed = 0f,
+                gravity = 0f,
+                jumpSpeed = 0f,
+                basicAttackInterval = 0f,
+                resourceRates = Array.Empty<GameplayResourceRateWire>(),
+                abilities = Array.Empty<GameplayAbilityReferenceWire>(),
+                statuses = Array.Empty<GameplayStatusReferenceWire>(),
+                items = Array.Empty<GameplayItemReferenceWire>(),
+                equipmentSlots = Array.Empty<GameplayEquipmentSlotReferenceWire>(),
+            };
 
         public static GameplaySettingsSnapshotMessage Failed(string error) =>
             new GameplaySettingsSnapshotMessage

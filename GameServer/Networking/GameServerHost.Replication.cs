@@ -389,6 +389,15 @@ internal sealed partial class GameServerHost
                     continue;
                 }
 
+                // Never let ordinary movement hitch a ride on the critical reserve just
+                // because it shares a packet with a forced/death/presentation snapshot.
+                // KeyScratch is priority-first, so ending this packet here preserves order
+                // while the next packet handles the other budget class.
+                if (objectCount == 0)
+                    packetPriority = snapshot.Priority;
+                else if (snapshot.Priority != packetPriority)
+                    break;
+
                 WriteSnapshotObject(
                     _replicationObjectWriter,
                     entity,
@@ -417,7 +426,6 @@ internal sealed partial class GameServerHost
 
                 _writer.Put(_replicationObjectWriter.Data.AsSpan(0, objectLength));
                 batch.PacketScratch.Add(objectId);
-                packetPriority |= snapshot.Priority;
                 objectCount++;
                 keyIndex++;
             }

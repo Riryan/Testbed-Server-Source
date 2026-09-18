@@ -40,8 +40,18 @@ namespace Player.Networking
 
     public struct EmptySocialRequestMessage : INetSerializable
     {
-        public void Serialize(NetDataWriter writer) { }
-        public void Deserialize(NetDataReader reader) { }
+        // Optional reconnect/cache hint. Zero preserves the legacy empty request.
+        public long knownRevision;
+        public void Serialize(NetDataWriter writer)
+        {
+            if (knownRevision != 0) writer.Put(knownRevision);
+        }
+        public void Deserialize(NetDataReader reader)
+        {
+            knownRevision = reader != null && reader.AvailableBytes >= sizeof(long)
+                ? reader.GetLong()
+                : 0L;
+        }
     }
 
     public struct OwnerLiveInterestRequestMessage : INetSerializable
@@ -96,6 +106,52 @@ namespace Player.Networking
         public bool online;
         public void Serialize(NetDataWriter writer) { writer.Put(characterId); writer.Put(name ?? string.Empty); writer.Put(online); }
         public void Deserialize(NetDataReader reader) { characterId = reader.GetLong(); name = reader.GetString(); online = reader.GetBool(); }
+    }
+
+
+    public static class FriendsStateRevision
+    {
+        // Stable order-independent fingerprint of durable membership only. Presence and
+        // pending invites are live/session state and deliberately do not affect the cache key.
+        public static long Compute(FriendEntryWire[] friends)
+        {
+            FriendEntryWire[] values = friends ?? Array.Empty<FriendEntryWire>();
+            ulong xor = 0UL;
+            ulong sum = 0UL;
+            int count = 0;
+            for (int i = 0; i < values.Length; ++i)
+            {
+                if (values[i].characterId <= 0) continue;
+                ulong hash = 1469598103934665603UL;
+                unchecked
+                {
+                    ulong id = (ulong)values[i].characterId;
+                    for (int b = 0; b < 8; ++b)
+                    {
+                        hash ^= (byte)(id >> (b * 8));
+                        hash *= 1099511628211UL;
+                    }
+                    string name = values[i].name ?? string.Empty;
+                    for (int c = 0; c < name.Length; ++c)
+                    {
+                        char ch = name[c];
+                        hash ^= (byte)ch; hash *= 1099511628211UL;
+                        hash ^= (byte)(ch >> 8); hash *= 1099511628211UL;
+                    }
+                    xor ^= hash;
+                    sum += hash * 0x9E3779B185EBCA87UL;
+                }
+                count++;
+            }
+            unchecked
+            {
+                ulong result = 0xD6E8FEB86659FD93UL ^ (ulong)count;
+                result ^= xor + 0x9E3779B97F4A7C15UL + (result << 6) + (result >> 2);
+                result ^= sum + 0xC2B2AE3D27D4EB4FUL + (result << 6) + (result >> 2);
+                if (result == 0) result = 1;
+                return (long)result;
+            }
+        }
     }
 
     public struct FriendsStateMessage : INetSerializable

@@ -15,7 +15,21 @@ namespace Player.Networking
     }
 
     public struct ProgressionSnapshotRequestMessage : INetSerializable
-    { public void Serialize(NetDataWriter writer) { } public void Deserialize(NetDataReader reader) { } }
+    {
+        public long knownContentRevision;
+        public long knownRevision;
+        public void Serialize(NetDataWriter writer)
+        {
+            if (knownContentRevision == 0 && knownRevision == 0) return;
+            writer.Put(knownContentRevision); writer.Put(knownRevision);
+        }
+        public void Deserialize(NetDataReader reader)
+        {
+            knownContentRevision = 0; knownRevision = 0;
+            if (reader == null || reader.AvailableBytes < sizeof(long) * 2) return;
+            knownContentRevision = reader.GetLong(); knownRevision = reader.GetLong();
+        }
+    }
 
     public struct ProgressTrackWire : INetSerializable
     {
@@ -40,9 +54,11 @@ namespace Player.Networking
 
     public struct ProgressionSnapshotMessage : INetSerializable
     {
+        public const string NotModifiedMarker = "not_modified";
         public const int MaxTracks = 512, MaxReputation = 512, MaxHeat = 256, MaxRecipes = 4096;
         public bool success; public string error; public long contentRevision; public long revision; public long experience; public int level; public ushort factionDataId;
         public ProgressTrackWire[] tracks; public ReputationWire[] reputation; public HeatWire[] heat; public ushort[] knownRecipeDataIds;
+        public bool IsNotModified => success && string.Equals(error, NotModifiedMarker, StringComparison.Ordinal);
 
         public void Serialize(NetDataWriter writer)
         {
@@ -60,6 +76,11 @@ namespace Player.Networking
             int hc=reader.GetUShort(); if(hc>MaxHeat) throw new InvalidOperationException("heat snapshot too large"); heat=new HeatWire[hc]; for(int i=0;i<hc;++i){var v=default(HeatWire);v.Deserialize(reader);heat[i]=v;}
             int kc=reader.GetUShort(); if(kc>MaxRecipes) throw new InvalidOperationException("known recipe snapshot too large"); knownRecipeDataIds=new ushort[kc]; for(int i=0;i<kc;++i) knownRecipeDataIds[i]=reader.GetUShort();
         }
+        public static ProgressionSnapshotMessage NotModified(long contentRevision, long revision) => new ProgressionSnapshotMessage
+        {
+            success=true, error=NotModifiedMarker, contentRevision=contentRevision, revision=revision,
+            tracks=Array.Empty<ProgressTrackWire>(), reputation=Array.Empty<ReputationWire>(), heat=Array.Empty<HeatWire>(), knownRecipeDataIds=Array.Empty<ushort>()
+        };
         public static ProgressionSnapshotMessage Failed(string error) => new ProgressionSnapshotMessage { success=false, error=error ?? string.Empty, tracks=Array.Empty<ProgressTrackWire>(), reputation=Array.Empty<ReputationWire>(), heat=Array.Empty<HeatWire>(), knownRecipeDataIds=Array.Empty<ushort>() };
     }
 
