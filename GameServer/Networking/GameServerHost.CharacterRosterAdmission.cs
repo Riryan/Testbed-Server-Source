@@ -3,7 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Game.GameServer.Runtime;
 using Game.Shared.Characters;
-using Game.Shared.Protocol;
+using LiteNetLib.Utils;
 using Player.Networking;
 
 namespace Game.GameServer.Networking;
