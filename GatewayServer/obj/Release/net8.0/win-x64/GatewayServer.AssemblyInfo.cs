@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("GatewayServer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c5f6de2289b8e99b6f613d5c70666322ff29dc73")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+79020ecf37656822cd908a92d30f0af151897a27")]
 [assembly: System.Reflection.AssemblyProductAttribute("GatewayServer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("GatewayServer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

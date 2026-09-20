@@ -227,6 +227,24 @@ namespace Game.Server.Application.Combat
         public PlayerRuntime ResolveRuntime(long characterId) =>
             _byCharacterId.TryGetValue(characterId, out PlayerRuntime runtime) ? runtime : null;
 
+        public bool TryGetPopulationByCharacterId(
+            long characterId,
+            out PopulationActorRuntime population)
+        {
+            population = null;
+            if (characterId <= 0 ||
+                !_byCharacterId.TryGetValue(characterId, out PlayerRuntime runtime) ||
+                runtime == null ||
+                !_populationByRuntime.TryGetValue(runtime, out population) ||
+                population?.Actor == null)
+            {
+                population = null;
+                return false;
+            }
+
+            return true;
+        }
+
         public string ExecuteDeveloperAction(
             CombatTestDummyView view,
             InteractionActionId actionId,
@@ -457,7 +475,6 @@ namespace Game.Server.Application.Combat
                 new KeyValuePair<string, float>("Mana.Max", 100f),
                 new KeyValuePair<string, float>("Stamina.Max", 100f),
                 new KeyValuePair<string, float>("Armor", 0f),
-                new KeyValuePair<string, float>("AttackPower", 0f),
             };
             return new StatsState(values);
         }

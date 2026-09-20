@@ -94,7 +94,15 @@ namespace Game.Server.Application.Abilities
             PlayerRuntime source,
             PlayerRuntime target,
             BasicAttackInputKind inputKind,
-            double now)
+            double now) =>
+            TryAttack(source, target, inputKind, now, CombatDamageCause.Combat);
+
+        public BasicAttackResult TryAttack(
+            PlayerRuntime source,
+            PlayerRuntime target,
+            BasicAttackInputKind inputKind,
+            double now,
+            CombatDamageCause damageCause)
         {
             long sourceId = source?.CharacterId.Value ?? 0L;
             long targetId = target?.CharacterId.Value ?? 0L;
@@ -200,7 +208,7 @@ namespace Game.Server.Application.Abilities
                 profile.PenetrationFlat,
                 profile.PenetrationPercent,
                 now,
-                CombatDamageCause.Combat,
+                damageCause,
                 CombatService.StandardDamagePolicy);
 
             BasicAttackResultCode code = damage.resultCode == CombatDamageResultCode.Applied ||

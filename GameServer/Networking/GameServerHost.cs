@@ -252,7 +252,8 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                         entity.Runtime.CharacterId.Value,
                         location.MapId,
                         location.InstanceId,
-                        new WorldPosition(entity.X, entity.Y, entity.Z)));
+                        new WorldPosition(entity.X, entity.Y, entity.Z),
+                        !entity.IsDead));
                 }
 
                 _owner._runtime.Population.PrepareBudgetedTick(_players, context.Now);
@@ -490,6 +491,7 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         _runtime.InteractionSessions.Changed += OnInteractionSessionChanged;
         _runtime.Progression.Changed += OnAuthoritativeProgressionChanged;
         _runtime.Combat.DamageResolved += OnCombatDamageResolved;
+        InitializePopulationReactiveCombat();
         _runtime.Abilities.CastStateChanged += OnAbilityCastStateChanged;
         InitializeCombatPresentation();
         InitializeFirearmActions();
@@ -1183,11 +1185,19 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         NetPacketReader reader,
         UnconnectedMessageType messageType) => reader.Recycle();
 
-    private void OnPopulationCombatRuntimeActivated(PlayerRuntime runtime) =>
+    private void OnPopulationCombatRuntimeActivated(PlayerRuntime runtime)
+    {
+        _resourceScheduler?.Activate(runtime);
+        _combatStateScheduler?.Activate(runtime);
         _statusEffectScheduler?.Activate(runtime);
+    }
 
-    private void OnPopulationCombatRuntimeDeactivated(PlayerRuntime runtime) =>
+    private void OnPopulationCombatRuntimeDeactivated(PlayerRuntime runtime)
+    {
         _statusEffectScheduler?.Deactivate(runtime);
+        _combatStateScheduler?.Deactivate(runtime);
+        _resourceScheduler?.Deactivate(runtime);
+    }
 
     public void Dispose()
     {
@@ -1196,6 +1206,7 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         _runtime.WorldInteractables.Changed -= OnAuthoritativeWorldInteractableChanged;
         _runtime.InteractionSessions.Changed -= OnInteractionSessionChanged;
         _runtime.Progression.Changed -= OnAuthoritativeProgressionChanged;
+        DisposePopulationReactiveCombat();
         _runtime.Combat.DamageResolved -= OnCombatDamageResolved;
         _runtime.BasicAttacks.Resolved -= OnBasicAttackResolved;
         _runtime.Abilities.CastStateChanged -= OnAbilityCastStateChanged;

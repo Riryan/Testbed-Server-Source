@@ -18,13 +18,20 @@ namespace Game.Server.Application.Population
         public string MapId { get; }
         public string InstanceId { get; }
         public WorldPosition Position { get; }
+        public bool Alive { get; }
 
-        public PopulationPlayerView(long characterId, string mapId, string instanceId, WorldPosition position)
+        public PopulationPlayerView(
+            long characterId,
+            string mapId,
+            string instanceId,
+            WorldPosition position,
+            bool alive = true)
         {
             CharacterId = characterId;
             MapId = mapId ?? string.Empty;
             InstanceId = instanceId ?? string.Empty;
             Position = position;
+            Alive = alive;
         }
     }
 
@@ -60,6 +67,9 @@ namespace Game.Server.Application.Population
         internal WorldPosition LastProgressPosition;
         internal WorldPosition ThreatPosition;
         internal double ThreatUntil;
+        internal long ThreatCharacterId;
+        internal WorldPosition ThreatAnchorPosition;
+        internal float ThreatEngageRange;
         internal long LastPortalId;
         internal PopulationPortalSequencePhase PortalPhase;
         internal int PortalRespawnAttempts;
@@ -111,7 +121,7 @@ namespace Game.Server.Application.Population
     /// common authoritative CharacterMotor. Far actors advance as route progress only; nearby
     /// actors are promoted to grounded/collision-aware kinematic movement.
     /// </summary>
-    public sealed class PopulationSimulationService
+    public sealed partial class PopulationSimulationService
     {
         private sealed class MapGraph
         {
@@ -156,6 +166,8 @@ namespace Game.Server.Application.Population
         private sealed class PlayerSpatialPartition
         {
             public readonly List<PopulationPlayerView> Players = new List<PopulationPlayerView>(16);
+            public readonly Dictionary<long, PopulationPlayerView> ByCharacterId =
+                new Dictionary<long, PopulationPlayerView>();
             public readonly Dictionary<long, List<PopulationPlayerView>> Cells =
                 new Dictionary<long, List<PopulationPlayerView>>();
             public readonly Stack<List<PopulationPlayerView>> CellPool =
@@ -171,11 +183,14 @@ namespace Game.Server.Application.Population
                 }
                 Cells.Clear();
                 Players.Clear();
+                ByCharacterId.Clear();
             }
 
             public void Add(PopulationPlayerView player)
             {
                 Players.Add(player);
+                if (player.CharacterId > 0)
+                    ByCharacterId[player.CharacterId] = player;
                 int x = ToPlayerCell(player.Position.X);
                 int z = ToPlayerCell(player.Position.Z);
                 long key = PackPlayerCell(x, z);
@@ -437,23 +452,12 @@ namespace Game.Server.Application.Population
 
             if (pop.ThreatUntil > now)
             {
-                TickThreat(pop, Math.Min(fixedDelta, 0.25f), now);
+                TickReactiveThreat(pop, Math.Min(fixedDelta, 0.25f), now);
                 return;
             }
             if (pop.AiState == PopulationAiState.Fleeing || pop.AiState == PopulationAiState.Fighting)
             {
-                pop.RouteReason = PopulationRouteReason.Recovery;
-                if (pop.MovementBehavior == SharedAiMovementMode.Route)
-                {
-                    pop.AiState = PopulationAiState.Recovering;
-                    ReattachToNearestRoute(pop);
-                }
-                else
-                {
-                    pop.AiState = PopulationAiState.Idle;
-                    pop.HasRoamTarget = false;
-                    pop.NextRoamDecisionAt = now;
-                }
+                EndThreatBehavior(pop, now);
             }
 
             if (pop.WaitUntil > now)
@@ -598,18 +602,23 @@ namespace Game.Server.Application.Population
                 WakeImmediately(pop, now, catchUp: true);
 
             severity = Math.Clamp(severity, 0f, 1f);
+            pop.ThreatCharacterId = 0L;
             pop.ThreatPosition = threatPosition;
+            pop.ThreatAnchorPosition = threatPosition;
+            pop.ThreatEngageRange = 0f;
             pop.ThreatUntil = now + 5d + severity * 8d;
             // External threats wake even a logical/far actor immediately instead of waiting
             // for its coarse next-due cadence.
             ScheduleNow(pop, now);
             float fightScore = pop.Aggression * 0.55f + pop.Courage * 0.30f + pop.CombatSkill * 0.15f;
             float fleeScore = (1f - pop.Courage) * 0.65f + (1f - pop.Aggression) * 0.25f + severity * 0.10f;
-            if (fightScore > fleeScore && pop.Actor.HealthCurrent > pop.Actor.HealthMaximum * 0.35f)
+            float totalScore = Math.Max(0.0001f, fightScore + fleeScore);
+            float fightChance = Math.Clamp(fightScore / totalScore, 0f, 1f);
+            double behaviorRoll = pop.Random?.NextDouble() ?? 0.5d;
+            if (behaviorRoll < fightChance && pop.Actor.HealthCurrent > pop.Actor.HealthMaximum * 0.35f)
             {
                 pop.AiState = PopulationAiState.Fighting;
                 pop.RouteReason = PopulationRouteReason.Pursuing;
-                FightIntent?.Invoke(pop);
             }
             else
             {

@@ -37,7 +37,8 @@ internal sealed class ServerPopulationPresentationEntity : IPlayerEntityPresenta
             // PlayerEntity presentation contract expects world speed, so feed its authored
             // movement speed while motion is active rather than coupling animation cadence
             // to Population simulation LOD/cadence.
-            return Population.AiState == Game.Shared.Population.PopulationAiState.Fleeing
+            return Population.AiState == Game.Shared.Population.PopulationAiState.Fleeing ||
+                   Population.AiState == Game.Shared.Population.PopulationAiState.Fighting
                 ? Math.Max(0f, Population.RunSpeed)
                 : Math.Max(0f, Population.WalkSpeed);
         }

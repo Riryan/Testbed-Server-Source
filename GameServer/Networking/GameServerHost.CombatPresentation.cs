@@ -135,7 +135,10 @@ internal sealed partial class GameServerHost
             ClientSession targetSession = FindReadySessionByCharacterId(result.TargetCharacterId);
             if (sourceSession?.Entity == null ||
                 !TryGetGameplayRuntime(sourceSession, out PlayerRuntime sourceRuntime))
+            {
+                TryQueuePopulationBasicAttackPresentation(result, targetSession);
                 return;
+            }
 
             bool hasNetworkTarget = TryGetCombatTargetReference(
                 result.TargetCharacterId,
@@ -232,6 +235,8 @@ internal sealed partial class GameServerHost
     {
         if (session?.Entity != null)
             return ToTargetReference(session);
+        if (TryGetPopulationPresentationReference(characterId, out PlayerTargetReferenceWire populationReference))
+            return populationReference;
         return IsCombatTestDummyCharacter(characterId) && _combatTestDummyEntity != null
             ? new PlayerTargetReferenceWire
             {
