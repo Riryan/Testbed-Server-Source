@@ -42,12 +42,19 @@ namespace Player.Networking
         public byte sessionState;
         public string error;
 
+        // Stable fingerprint of the authoritative character-select roster at admission time.
+        // Zero means the sender does not support roster reconciliation or could not resolve
+        // the roster, in which case the client safely falls back to one CharacterList request.
+        // Kept as an optional trailing field for protocol compatibility with older peers.
+        public long rosterRevision;
+
         public void Serialize(NetDataWriter writer)
         {
             writer.Put(success);
             writer.Put(accountId);
             writer.Put(sessionState);
             writer.Put(error ?? string.Empty);
+            writer.Put(rosterRevision);
         }
 
         public void Deserialize(NetDataReader reader)
@@ -56,6 +63,9 @@ namespace Player.Networking
             accountId = reader.GetLong();
             sessionState = reader.GetByte();
             error = reader.GetString(256);
+            rosterRevision = reader != null && reader.AvailableBytes >= sizeof(long)
+                ? reader.GetLong()
+                : 0L;
         }
 
         public static AdmissionAuthenticationResponseMessage Failed(byte state, string errorMessage) =>
@@ -65,6 +75,7 @@ namespace Player.Networking
                 accountId = 0,
                 sessionState = state,
                 error = errorMessage ?? string.Empty,
+                rosterRevision = 0L,
             };
     }
 
@@ -101,6 +112,79 @@ namespace Player.Networking
             characterId = reader.GetLong();
             name = reader.GetString(128);
             mapId = reader.GetString(128);
+        }
+    }
+
+
+    /// <summary>
+    /// Stable order-independent fingerprint of character-select roster state. This is a
+    /// cache reconciliation token only, never authority. Membership, display name, and map
+    /// are included because all three are rendered by Character Select.
+    /// </summary>
+    public static class CharacterRosterStateRevision
+    {
+        public static long Compute(CharacterSessionCharacterSummary[] characters)
+        {
+            CharacterSessionCharacterSummary[] values = characters ?? Array.Empty<CharacterSessionCharacterSummary>();
+            ulong xor = 0UL;
+            ulong sum = 0UL;
+            int count = 0;
+
+            for (int i = 0; i < values.Length; ++i)
+            {
+                CharacterSessionCharacterSummary value = values[i];
+                if (value.characterId <= 0)
+                    continue;
+
+                ulong hash = 1469598103934665603UL;
+                unchecked
+                {
+                    ulong id = (ulong)value.characterId;
+                    for (int b = 0; b < 8; ++b)
+                    {
+                        hash ^= (byte)(id >> (b * 8));
+                        hash *= 1099511628211UL;
+                    }
+
+                    AddString(ref hash, value.name);
+                    AddString(ref hash, value.mapId);
+
+                    xor ^= hash;
+                    sum += hash * 0x9E3779B185EBCA87UL;
+                }
+                count++;
+            }
+
+            unchecked
+            {
+                ulong result = 0xA24BAED4963EE407UL ^ (ulong)count;
+                result ^= xor + 0x9E3779B97F4A7C15UL + (result << 6) + (result >> 2);
+                result ^= sum + 0xC2B2AE3D27D4EB4FUL + (result << 6) + (result >> 2);
+                if (result == 0UL)
+                    result = 1UL;
+                return (long)result;
+            }
+        }
+
+        private static void AddString(ref ulong hash, string value)
+        {
+            string text = value ?? string.Empty;
+            unchecked
+            {
+                for (int i = 0; i < text.Length; ++i)
+                {
+                    char ch = text[i];
+                    hash ^= (byte)ch;
+                    hash *= 1099511628211UL;
+                    hash ^= (byte)(ch >> 8);
+                    hash *= 1099511628211UL;
+                }
+
+                // Delimit adjacent string fields so ["ab", "c"] cannot hash the same
+                // byte stream as ["a", "bc"].
+                hash ^= 0xFF;
+                hash *= 1099511628211UL;
+            }
         }
     }
 
