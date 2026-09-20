@@ -15,6 +15,14 @@ namespace Game.Shared.Characters
         PaletteIndex = 1,
     }
 
+    public static class CharacterVisualProfileIds
+    {
+        // Client-local presentation profile selected through the existing appearance recipe.
+        // Profile 0 continues to mean "use the client default profile".
+        public const ushort PopulationPolice = 2;
+    }
+
+
     [Serializable, DataContract]
     public struct CharacterMeshSelection
     {

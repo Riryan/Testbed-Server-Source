@@ -78,6 +78,19 @@ namespace Game.Server.Application.Combat
             public CombatTestDummyPreset Preset;
         }
 
+        private readonly struct PopulationWeaponSelection
+        {
+            public ItemDefinition Weapon { get; }
+            public ItemDefinition Ammo { get; }
+            public bool HasWeapon => Weapon != null;
+
+            public PopulationWeaponSelection(ItemDefinition weapon, ItemDefinition ammo)
+            {
+                Weapon = weapon;
+                Ammo = ammo;
+            }
+        }
+
         private readonly Dictionary<string, DummyEntry> _dummiesByWorldId =
             new Dictionary<string, DummyEntry>(StringComparer.Ordinal);
         private readonly Dictionary<PlayerRuntime, DummyEntry> _dummiesByRuntime =
@@ -86,6 +99,17 @@ namespace Game.Server.Application.Combat
             new Dictionary<PlayerRuntime, PopulationActorRuntime>();
         private readonly Dictionary<long, PlayerRuntime> _byCharacterId =
             new Dictionary<long, PlayerRuntime>();
+
+        // Population combat loadouts are derived from the already-loaded gameplay item catalog.
+        // The cache only rebuilds when the content revision changes; ambient Population still has
+        // no PlayerRuntime/item state until combat activation.
+        private long _populationWeaponCatalogRevision = long.MinValue;
+        private ItemDefinition[] _populationFirearms = Array.Empty<ItemDefinition>();
+        private ItemDefinition[] _populationMeleeWeapons = Array.Empty<ItemDefinition>();
+        private readonly Dictionary<string, ItemDefinition[]> _populationAmmoByFamily =
+            new Dictionary<string, ItemDefinition[]>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<long> _ordinaryRangedRoster = new HashSet<long>();
+        private bool _ordinaryRangedRosterDirty = true;
 
         private readonly PopulationSimulationService _population;
         private readonly GameplayContentCatalog _content;
@@ -113,6 +137,7 @@ namespace Game.Server.Application.Combat
                 BuildCombatTestFixtures(maps);
 
             _population.Changed += SynchronizePopulationLocation;
+            _population.Added += MarkPopulationWeaponRosterDirty;
             _population.Removed += DetachPopulation;
         }
 
@@ -331,6 +356,7 @@ namespace Game.Server.Application.Combat
             _disposed = true;
 
             _population.Changed -= SynchronizePopulationLocation;
+            _population.Added -= MarkPopulationWeaponRosterDirty;
             _population.Removed -= DetachPopulation;
 
             foreach (PlayerRuntime runtime in _populationByRuntime.Keys)
@@ -339,6 +365,7 @@ namespace Game.Server.Application.Combat
 
         private void DetachPopulation(PopulationActorRuntime pop)
         {
+            _ordinaryRangedRosterDirty = true;
             if (pop?.CombatRuntime == null)
                 return;
 
@@ -378,16 +405,341 @@ namespace Game.Server.Application.Combat
                 change.Maximum);
         }
 
+        private void MarkPopulationWeaponRosterDirty(PopulationActorRuntime _) =>
+            _ordinaryRangedRosterDirty = true;
+
+        /// <summary>
+        /// Police are the only Population archetype with infinite reserve ammunition.
+        /// This refills the existing transient magazine directly from authored compatible
+        /// ammo content; it never creates inventory stacks and never touches persistence.
+        /// </summary>
+        public bool TryRefillPoliceInfiniteReserve(PlayerRuntime runtime)
+        {
+            if (runtime == null ||
+                !_populationByRuntime.TryGetValue(runtime, out PopulationActorRuntime pop) ||
+                pop?.Actor == null ||
+                pop.NpcType != PopulationNpcType.Police)
+            {
+                return false;
+            }
+
+            PlayerItemSystemsRuntimeSnapshot state = runtime.CapturePlayerItemSystems();
+            ItemInstanceState mainHand = state?.Equipment?.Get("MainHand");
+            if (mainHand == null ||
+                !_content.TryGetItem(mainHand.DefinitionId, out ItemDefinition weapon) ||
+                !IsFirearmDefinition(weapon) ||
+                weapon.firearmMagazineCapacity <= 0 ||
+                mainHand.LoadedRounds > 0)
+            {
+                return false;
+            }
+
+            EnsurePopulationWeaponCatalog();
+            ItemDefinition ammo = SelectCompatibleAmmo(
+                weapon,
+                pop.Actor.Handle.actorId,
+                0x504F4C494345414DUL); // "POLICEAM" salt
+            if (ammo == null)
+                return false;
+
+            long nextMagazineRevision = checked(mainHand.MagazineRevision + 1);
+            return runtime.TryCommitItemMagazine(
+                mainHand.ItemInstanceId,
+                mainHand.MagazineRevision,
+                ammo.definitionId,
+                Math.Max(1, weapon.firearmMagazineCapacity),
+                nextMagazineRevision);
+        }
+
+        /// <summary>
+        /// Non-Police ranged Population carries a finite transient magazine in this pass.
+        /// Once empty, remove the transient firearm and let the canonical loadout service
+        /// fall back to Unarmed rather than repeatedly publishing predictable NoAmmo rejects.
+        /// </summary>
+        public bool TryFallbackEmptyPopulationFirearmToUnarmed(PlayerRuntime runtime)
+        {
+            if (runtime == null ||
+                !_populationByRuntime.TryGetValue(runtime, out PopulationActorRuntime pop) ||
+                pop?.Actor == null ||
+                pop.NpcType == PopulationNpcType.Police)
+            {
+                return false;
+            }
+
+            PlayerItemSystemsRuntimeSnapshot state = runtime.CapturePlayerItemSystems();
+            ItemInstanceState mainHand = state?.Equipment?.Get("MainHand");
+            if (mainHand == null || mainHand.LoadedRounds > 0 ||
+                !_content.TryGetItem(mainHand.DefinitionId, out ItemDefinition weapon) ||
+                !IsFirearmDefinition(weapon))
+            {
+                return false;
+            }
+
+            var unarmedEquipment = new EquipmentState(
+                checked(state.Equipment.Revision + 1));
+            return runtime.TryCommitPlayerItemSystems(
+                state.Inventory.Revision,
+                state.Equipment.Revision,
+                state.Inventory,
+                unarmedEquipment,
+                state.Stats);
+        }
+
+        private PopulationWeaponSelection ResolvePopulationWeaponSelection(PopulationActorRuntime pop)
+        {
+            if (pop?.Actor == null)
+                return default;
+
+            EnsurePopulationWeaponCatalog();
+            long actorId = pop.Actor.Handle.actorId;
+
+            // These archetypes are ranged-capable by design. If the active content has no
+            // valid firearm+ammo pair, fail safely to an authored melee weapon or unarmed.
+            if (pop.NpcType == PopulationNpcType.Police ||
+                pop.NpcType == PopulationNpcType.Hunter ||
+                pop.NpcType == PopulationNpcType.GangMember)
+            {
+                PopulationWeaponSelection firearm = SelectFirearm(actorId, 0x52414E474544504FUL);
+                if (firearm.HasWeapon)
+                    return firearm;
+                return SelectMelee(actorId, 0x5350454349414C4DUL);
+            }
+
+            if (!IsOrdinaryWeaponEligible(pop))
+                return default;
+
+            EnsureOrdinaryRangedRoster();
+            if (_ordinaryRangedRoster.Contains(actorId))
+            {
+                PopulationWeaponSelection firearm = SelectFirearm(actorId, 0x4F5244494E415259UL);
+                if (firearm.HasWeapon)
+                    return firearm;
+            }
+
+            // The current generic melee bucket intentionally reuses existing weapon
+            // definitions. No knife/dagger semantic is invented until content needs it.
+            ulong meleeRoll = StablePopulationLoadoutScore(actorId, 0x4D454C4545333050UL);
+            if ((meleeRoll % 100UL) < 30UL)
+                return SelectMelee(actorId, 0x4D454C454553454CUL);
+
+            return default;
+        }
+
+        private void EnsureOrdinaryRangedRoster()
+        {
+            if (!_ordinaryRangedRosterDirty)
+                return;
+
+            var scored = new List<KeyValuePair<ulong, long>>();
+            foreach (PopulationActorRuntime candidate in _population.All)
+            {
+                if (!IsOrdinaryWeaponEligible(candidate) || candidate?.Actor == null)
+                    continue;
+                long actorId = candidate.Actor.Handle.actorId;
+                scored.Add(new KeyValuePair<ulong, long>(
+                    StablePopulationLoadoutScore(actorId, 0x52414E4745443543UL),
+                    actorId));
+            }
+
+            scored.Sort((a, b) =>
+            {
+                int score = a.Key.CompareTo(b.Key);
+                return score != 0 ? score : a.Value.CompareTo(b.Value);
+            });
+
+            _ordinaryRangedRoster.Clear();
+            int maximumRanged = scored.Count / 20; // hard roster cap: <= 5%
+            for (int i = 0; i < maximumRanged; ++i)
+                _ordinaryRangedRoster.Add(scored[i].Value);
+            _ordinaryRangedRosterDirty = false;
+        }
+
+        private static bool IsOrdinaryWeaponEligible(PopulationActorRuntime pop)
+        {
+            if (pop?.Actor == null || pop.SpawnKind == ServerSpawnKind.Monster)
+                return false;
+
+            return pop.NpcType == PopulationNpcType.Civilian ||
+                   pop.NpcType == PopulationNpcType.Resident ||
+                   pop.NpcType == PopulationNpcType.Shopper ||
+                   pop.NpcType == PopulationNpcType.Worker ||
+                   pop.NpcType == PopulationNpcType.Homeless ||
+                   pop.NpcType == PopulationNpcType.Nightlife ||
+                   pop.NpcType == PopulationNpcType.Criminal;
+        }
+
+        private void EnsurePopulationWeaponCatalog()
+        {
+            long revision = _content.Revision;
+            if (_populationWeaponCatalogRevision == revision)
+                return;
+
+            ItemDefinition[] items = _content.GetItems() ?? Array.Empty<ItemDefinition>();
+            var ammoLists = new Dictionary<string, List<ItemDefinition>>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < items.Length; ++i)
+            {
+                ItemDefinition item = items[i];
+                if (item == null || item.kind != ItemKind.Ammo || string.IsNullOrWhiteSpace(item.ammoFamily))
+                    continue;
+                string family = item.ammoFamily.Trim();
+                if (!ammoLists.TryGetValue(family, out List<ItemDefinition> list))
+                {
+                    list = new List<ItemDefinition>();
+                    ammoLists.Add(family, list);
+                }
+                list.Add(item);
+            }
+
+            _populationAmmoByFamily.Clear();
+            foreach (KeyValuePair<string, List<ItemDefinition>> pair in ammoLists)
+            {
+                pair.Value.Sort(CompareItemDefinitions);
+                _populationAmmoByFamily[pair.Key] = pair.Value.ToArray();
+            }
+
+            var firearms = new List<ItemDefinition>();
+            var melee = new List<ItemDefinition>();
+            for (int i = 0; i < items.Length; ++i)
+            {
+                ItemDefinition item = items[i];
+                if (!IsUsableMainHandWeapon(item))
+                    continue;
+
+                if (IsFirearmDefinition(item))
+                {
+                    string family = (item.ammoFamily ?? string.Empty).Trim();
+                    if (item.firearmMagazineCapacity > 0 &&
+                        family.Length > 0 &&
+                        _populationAmmoByFamily.TryGetValue(family, out ItemDefinition[] ammo) &&
+                        ammo.Length > 0)
+                    {
+                        firearms.Add(item);
+                    }
+                }
+                else
+                {
+                    melee.Add(item);
+                }
+            }
+
+            firearms.Sort(CompareItemDefinitions);
+            melee.Sort(CompareItemDefinitions);
+            _populationFirearms = firearms.ToArray();
+            _populationMeleeWeapons = melee.ToArray();
+            _populationWeaponCatalogRevision = revision;
+        }
+
+        private PopulationWeaponSelection SelectFirearm(long actorId, ulong salt)
+        {
+            if (_populationFirearms.Length == 0)
+                return default;
+            int index = (int)(StablePopulationLoadoutScore(actorId, salt) % (ulong)_populationFirearms.Length);
+            ItemDefinition weapon = _populationFirearms[index];
+            ItemDefinition ammo = SelectCompatibleAmmo(weapon, actorId, salt ^ 0xA66A66A66A66A66AUL);
+            return ammo == null ? default : new PopulationWeaponSelection(weapon, ammo);
+        }
+
+        private PopulationWeaponSelection SelectMelee(long actorId, ulong salt)
+        {
+            if (_populationMeleeWeapons.Length == 0)
+                return default;
+            int index = (int)(StablePopulationLoadoutScore(actorId, salt) % (ulong)_populationMeleeWeapons.Length);
+            return new PopulationWeaponSelection(_populationMeleeWeapons[index], null);
+        }
+
+        private ItemDefinition SelectCompatibleAmmo(ItemDefinition weapon, long actorId, ulong salt)
+        {
+            if (weapon == null || string.IsNullOrWhiteSpace(weapon.ammoFamily))
+                return null;
+            string family = weapon.ammoFamily.Trim();
+            if (!_populationAmmoByFamily.TryGetValue(family, out ItemDefinition[] ammo) || ammo.Length == 0)
+                return null;
+            int index = (int)(StablePopulationLoadoutScore(actorId, salt) % (ulong)ammo.Length);
+            return ammo[index];
+        }
+
+        private static bool IsUsableMainHandWeapon(ItemDefinition item)
+        {
+            if (item == null ||
+                item.kind != ItemKind.Equipment ||
+                item.subtype != EquipmentItemSubtype.Weapon ||
+                string.IsNullOrWhiteSpace(item.definitionId))
+            {
+                return false;
+            }
+
+            string[] slots = item.allowedEquipmentSlots ?? Array.Empty<string>();
+            if (slots.Length == 0)
+                return true;
+            for (int i = 0; i < slots.Length; ++i)
+                if (string.Equals(slots[i], "MainHand", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        private static bool IsFirearmDefinition(ItemDefinition item) =>
+            item != null &&
+            (item.firearmMagazineCapacity > 0 || !string.IsNullOrWhiteSpace(item.ammoFamily));
+
+        private static int CompareItemDefinitions(ItemDefinition a, ItemDefinition b) =>
+            string.CompareOrdinal(a?.definitionId ?? string.Empty, b?.definitionId ?? string.Empty);
+
+        private static ulong StablePopulationLoadoutScore(long actorId, ulong salt)
+        {
+            unchecked
+            {
+                ulong value = ((ulong)actorId) ^ salt;
+                value ^= value >> 30;
+                value *= 0xBF58476D1CE4E5B9UL;
+                value ^= value >> 27;
+                value *= 0x94D049BB133111EBUL;
+                value ^= value >> 31;
+                return value;
+            }
+        }
+
+        private static EquipmentState BuildPopulationEquipment(
+            long syntheticCharacterId,
+            PopulationWeaponSelection loadout)
+        {
+            if (!loadout.HasWeapon)
+                return new EquipmentState(0);
+
+            ItemDefinition weapon = loadout.Weapon;
+            bool firearm = IsFirearmDefinition(weapon);
+            int loadedRounds = firearm && loadout.Ammo != null
+                ? Math.Max(0, weapon.firearmMagazineCapacity)
+                : 0;
+            string loadedAmmoDefinitionId = loadedRounds > 0
+                ? loadout.Ammo.definitionId
+                : string.Empty;
+
+            var item = new ItemInstanceState(
+                new ItemInstanceId(syntheticCharacterId),
+                weapon.definitionId,
+                1,
+                Math.Max(0, weapon.maxDurability),
+                0,
+                loadedAmmoDefinitionId,
+                loadedRounds,
+                0);
+            return new EquipmentState(
+                0,
+                new[] { new EquippedItemState("MainHand", item) });
+        }
+
         private PlayerRuntime CreatePopulationRuntime(PopulationActorRuntime pop)
         {
             int healthMaximum = Math.Max(1, pop.Actor.HealthMaximum);
+            PopulationWeaponSelection loadout = ResolvePopulationWeaponSelection(pop);
             PlayerRuntime runtime = CreateRuntime(
                 pop.Actor.DisplayName,
                 pop.Actor.MapId,
                 pop.Actor.InstanceId,
                 pop.Actor.Position,
                 pop.Actor.YawDegrees,
-                BuildPopulationStats(healthMaximum));
+                BuildPopulationStats(healthMaximum),
+                loadout);
 
             if (pop.Actor.HealthCurrent < healthMaximum &&
                 runtime.TryGetCharacterResource(CharacterResourceId.Health, out _, out CharacterResourceState health))
@@ -449,7 +801,17 @@ namespace Game.Server.Application.Combat
             string instanceId,
             WorldPosition position,
             float yawDegrees,
-            StatsState stats)
+            StatsState stats) =>
+            CreateRuntime(label, mapId, instanceId, position, yawDegrees, stats, default);
+
+        private PlayerRuntime CreateRuntime(
+            string label,
+            string mapId,
+            string instanceId,
+            WorldPosition position,
+            float yawDegrees,
+            StatsState stats,
+            PopulationWeaponSelection loadout)
         {
             long ordinal = Interlocked.Increment(ref _nextSyntheticId);
             long accountValue = 7_000_000_000_000_000_000L +
@@ -462,7 +824,8 @@ namespace Game.Server.Application.Combat
                 new CharacterLocationState(mapId, instanceId, position, yawDegrees),
                 0);
 
-            runtime.InitializePlayerItemSystems(new InventoryState(1, 0), new EquipmentState(0), stats);
+            EquipmentState equipment = BuildPopulationEquipment(ordinal, loadout);
+            runtime.InitializePlayerItemSystems(new InventoryState(1, 0), equipment, stats);
             runtime.InitializeCharacterResources(_resources.CreateInitialState(stats, 0, null));
             return runtime;
         }

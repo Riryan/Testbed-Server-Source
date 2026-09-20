@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using Game.GameServer.Runtime;
+using Game.Server.Application.Abilities;
 using Game.Server.Application.Combat;
 using Game.Server.Application.Population;
 using Game.Server.Domain.Characters;
@@ -8,6 +10,7 @@ using Game.Shared.Abilities;
 using Game.Shared.Combat;
 using Game.Shared.Protocol;
 using Player.Networking;
+using Player.Shared;
 
 namespace Game.GameServer.Networking;
 
@@ -142,18 +145,120 @@ internal sealed partial class GameServerHost
         if (actionState.ActiveCast.IsActive || now + 0.000001d < actionState.BasicAttackRecoveryEnd)
             return;
 
-        BasicAttackResult result = _runtime.BasicAttacks.TryAttack(
-            source,
-            target,
-            BasicAttackInputKind.Primary,
-            now,
-            CombatDamageCause.PopulationBasicAttack);
+        CombatOwnerStateSnapshot ownerState = _runtime.CombatLoadout.Capture(source, now);
+        BasicAttackResult result;
+
+        if (ownerState.Available && ownerState.Mode == BasicAttackMode.Firearm)
+        {
+            // Clean-server suppression: never call the attack authority with a locally-known
+            // empty Population magazine. Police refill from infinite transient reserve; every
+            // other ranged Population falls back to the already-proven unarmed path.
+            if (ownerState.LoadedRounds <= 0)
+            {
+                if (_runtime.PopulationCombat.TryRefillPoliceInfiniteReserve(source))
+                    return;
+
+                if (_runtime.PopulationCombat.TryFallbackEmptyPopulationFirearmToUnarmed(source))
+                {
+                    _runtime.CombatLoadout.ResetForEquipmentChange(source);
+                    CombatOwnerStateSnapshot fallback = _runtime.CombatLoadout.Capture(source, now);
+                    _runtime.Population.UpdateReactiveThreatEngageRange(
+                        population.Actor.Handle.actorId,
+                        fallback.BasicAttackRange > 0f
+                            ? fallback.BasicAttackRange
+                            : CombatRangePolicy.UnarmedRange,
+                        now);
+                }
+                return;
+            }
+
+            FirearmActionResolution firearm = _runtime.BasicAttacks.TryFirearmAction(
+                source,
+                target,
+                BasicAttackInputKind.Primary,
+                1,
+                0f,
+                aiming: true,
+                enforceRecovery: true,
+                now: now,
+                damageCause: CombatDamageCause.PopulationBasicAttack);
+            result = firearm.Action;
+            if (firearm.Success && firearm.RoundsFired > 0)
+                QueuePopulationFireCycle(population, firearm);
+        }
+        else
+        {
+            result = _runtime.BasicAttacks.TryAttack(
+                source,
+                target,
+                BasicAttackInputKind.Primary,
+                now,
+                CombatDamageCause.PopulationBasicAttack);
+        }
 
         if (result.Code == BasicAttackResultCode.RejectedDead ||
             result.Code == BasicAttackResultCode.RejectedDifferentWorld ||
             result.Code == BasicAttackResultCode.RejectedInvalidTarget)
         {
             _runtime.Population.CancelReactiveThreat(population.Actor.Handle.actorId, now);
+        }
+    }
+
+    private void QueuePopulationFireCycle(
+        PopulationActorRuntime population,
+        in FirearmActionResolution resolution)
+    {
+        if (population?.Actor == null ||
+            !_populationPresentations.TryGetValue(
+                population.Actor.Handle.actorId,
+                out PopulationPresentationState state) ||
+            state?.Entity == null ||
+            resolution.RoundsFired <= 0)
+        {
+            return;
+        }
+
+        byte sequence = unchecked((byte)resolution.Action.ActionRevision);
+        CombatFireCycleWire cycle = CombatFireCycleWire.Create(
+            state.Entity.ObjectId,
+            state.Entity.Generation,
+            resolution.Profile.PresentationId,
+            sequence,
+            resolution.RoundsFired,
+            true,
+            resolution.Profile.FireMode,
+            ResolveCycleSpan(
+                resolution.Profile,
+                resolution.RoundsFired,
+                (float)_options.CombatTickRate));
+
+        float maxDistance = Math.Max(
+            1f,
+            Math.Min(_options.AoiRange, _options.CombatPresentationRange));
+        float maxDistanceSq = maxDistance * maxDistance;
+
+        foreach (ClientSession observer in state.Observers)
+        {
+            if (observer?.Entity == null || !IsCurrent(observer) || !observer.Ready)
+                continue;
+
+            float dx = observer.Entity.X - state.Entity.X;
+            float dy = observer.Entity.Y - state.Entity.Y;
+            float dz = observer.Entity.Z - state.Entity.Z;
+            if ((dx * dx) + (dy * dy) + (dz * dz) > maxDistanceSq)
+                continue;
+
+            if (!_fireCycleQueues.TryGetValue(observer, out List<CombatFireCycleWire> queue))
+            {
+                queue = new List<CombatFireCycleWire>(8);
+                _fireCycleQueues.Add(observer, queue);
+            }
+            if (queue.Count >= PlayerCombatFireCycleBatchMessage.MaximumCycles)
+                continue;
+
+            queue.Add(cycle);
+            if (_fireCycleDirtySet.Add(observer))
+                _fireCycleDirty.Enqueue(observer);
         }
     }
 

@@ -494,6 +494,10 @@ internal sealed partial class GameServerHost
     {
         ServerPopulationPresentationEntity entity = state.Entity;
         AuthoritativeActorRuntime actor = entity.Population.Actor;
+        ushort visualProfileId = entity.Population.NpcType == PopulationNpcType.Police
+            ? CharacterVisualProfileIds.PopulationPolice
+            : CharacterAppearanceRecipe.DefaultVisualProfileId;
+
         var appearance = new PlayerEntityAppearance
         {
             generation = entity.Generation,
@@ -506,7 +510,7 @@ internal sealed partial class GameServerHost
             guildName = string.Empty,
             populationInteractionFlags = state.PublicInteractionFlags,
             equipmentVisuals = Array.Empty<PlayerEquipmentVisualSelection>(),
-            appearance = CharacterAppearanceRecipe.CreateDefault(),
+            appearance = CharacterAppearanceRecipe.CreateDefault(visualProfileId),
             presentation = CharacterPresentationPreferences.CreateDefault(),
         };
         appearance.Serialize(writer);

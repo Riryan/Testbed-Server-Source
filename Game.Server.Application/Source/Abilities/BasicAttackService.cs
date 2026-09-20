@@ -259,7 +259,15 @@ namespace Game.Server.Application.Abilities
 
         public FirearmActionResolution TryFirearmAction(
             PlayerRuntime source, PlayerRuntime target, BasicAttackInputKind inputKind,
-            int requestedRounds, float startingBloom, bool aiming, bool enforceRecovery, double now)
+            int requestedRounds, float startingBloom, bool aiming, bool enforceRecovery, double now) =>
+            TryFirearmAction(
+                source, target, inputKind, requestedRounds, startingBloom, aiming, enforceRecovery, now,
+                CombatDamageCause.Combat);
+
+        public FirearmActionResolution TryFirearmAction(
+            PlayerRuntime source, PlayerRuntime target, BasicAttackInputKind inputKind,
+            int requestedRounds, float startingBloom, bool aiming, bool enforceRecovery, double now,
+            CombatDamageCause damageCause)
         {
             long sourceId = source?.CharacterId.Value ?? 0L;
             long targetId = target?.CharacterId.Value ?? 0L;
@@ -316,7 +324,7 @@ namespace Game.Server.Application.Abilities
             CombatDamageVolleyResult volley = _combat.ApplyDamageVolley(
                 source, target, consumed, attack.DamageMin, attack.DamageMax, attack.DamageTypeId, attack.DamageFlags,
                 attack.PenetrationFlat, attack.PenetrationPercent, firearm.BaseHitChance,
-                startingBloom, bloomGain, firearm.MaximumBloom, now, CombatDamageCause.Combat, CombatService.StandardDamagePolicy);
+                startingBloom, bloomGain, firearm.MaximumBloom, now, damageCause, CombatService.StandardDamagePolicy);
 
             var result = Publish(new BasicAttackResult(
                 BasicAttackResultCode.Applied, sourceId, targetId, committed.Revision, nextRecovery,
