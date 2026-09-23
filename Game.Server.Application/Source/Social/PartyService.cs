@@ -32,6 +32,20 @@ namespace Game.Server.Application.Social
         }
     }
 
+    public readonly struct PartyInviteSnapshot
+    {
+        public long InviterCharacterId { get; }
+        public string InviterName { get; }
+        public DateTime ExpiresUtc { get; }
+
+        public PartyInviteSnapshot(long inviterCharacterId, string inviterName, DateTime expiresUtc)
+        {
+            InviterCharacterId = inviterCharacterId;
+            InviterName = inviterName ?? string.Empty;
+            ExpiresUtc = expiresUtc;
+        }
+    }
+
     public readonly struct PartyOperationResult
     {
         public bool Success { get; }
@@ -55,8 +69,9 @@ namespace Game.Server.Application.Social
     }
 
     /// <summary>
-    /// V1 Party authority: temporary in-memory membership and invitations only.
-    /// No persistence, XP, loot, combat, inventory, or world-authority coupling.
+    /// Canonical temporary Party authority. Membership/invitations remain in-memory and
+    /// intentionally do not grant XP, skill credit, loot, combat, inventory, or world authority.
+    /// StateChanged is a lightweight owner-state notification hook for the transport/UI layer.
     /// </summary>
     public sealed class PartyService
     {
@@ -91,6 +106,8 @@ namespace Game.Server.Application.Social
         private readonly Dictionary<long, PendingInvite> _inviteByTarget = new Dictionary<long, PendingInvite>();
         private ulong _nextPartyId = 1;
         private long _nextJoinOrder = 1;
+
+        public event Action<long> StateChanged;
 
         public PartyOperationResult Invite(PlayerRuntime inviter, PlayerRuntime target)
         {
@@ -130,6 +147,7 @@ namespace Game.Server.Application.Social
                 ExpiresUtc = DateTime.UtcNow + InviteLifetime,
             };
 
+            NotifyStateChanged(targetId);
             return PartyOperationResult.Ok($"Party invite sent to {targetName}.", targetId);
         }
 
@@ -140,17 +158,22 @@ namespace Game.Server.Application.Social
             if (_partyByCharacter.ContainsKey(targetId))
                 return PartyOperationResult.Fail("You are already in a party.");
             if (!TryTakeValidInvite(targetId, out PendingInvite invite))
+            {
+                NotifyStateChanged(targetId);
                 return PartyOperationResult.Fail("You do not have a pending party invite.");
+            }
 
             Party party;
             if (invite.PartyId == 0)
             {
                 if (_partyByCharacter.ContainsKey(invite.InviterCharacterId))
                 {
-                    // The inviter joined/created another party after sending this invite.
                     ulong currentId = _partyByCharacter[invite.InviterCharacterId];
                     if (!_parties.TryGetValue(currentId, out party) || party.LeaderCharacterId != invite.InviterCharacterId)
+                    {
+                        NotifyStateChanged(targetId);
                         return PartyOperationResult.Fail("That party invite is no longer valid.");
+                    }
                 }
                 else
                 {
@@ -174,11 +197,15 @@ namespace Game.Server.Application.Social
                      !_partyByCharacter.TryGetValue(invite.InviterCharacterId, out ulong inviterPartyId) ||
                      inviterPartyId != party.PartyId)
             {
+                NotifyStateChanged(targetId);
                 return PartyOperationResult.Fail("That party invite is no longer valid.");
             }
 
             if (party.Members.Count >= MaxMembers)
+            {
+                NotifyStateChanged(targetId);
                 return PartyOperationResult.Fail("The party is full.");
+            }
 
             party.Members.Add(new Member
             {
@@ -188,7 +215,9 @@ namespace Game.Server.Application.Social
             });
             _partyByCharacter[targetId] = party.PartyId;
 
-            return PartyOperationResult.Ok($"Joined {invite.InviterName}'s party.", invite.InviterCharacterId, Snapshot(party));
+            PartySnapshot snapshot = Snapshot(party);
+            NotifySnapshotMembers(snapshot);
+            return PartyOperationResult.Ok($"Joined {invite.InviterName}'s party.", invite.InviterCharacterId, snapshot);
         }
 
         public PartyOperationResult Decline(PlayerRuntime target)
@@ -196,7 +225,11 @@ namespace Game.Server.Application.Social
             if (!TryIdentity(target, out long targetId, out _))
                 return PartyOperationResult.Fail("Party decline is unavailable.");
             if (!TryTakeValidInvite(targetId, out PendingInvite invite))
+            {
+                NotifyStateChanged(targetId);
                 return PartyOperationResult.Fail("You do not have a pending party invite.");
+            }
+            NotifyStateChanged(targetId);
             return PartyOperationResult.Ok("Party invite declined.", invite.InviterCharacterId);
         }
 
@@ -207,18 +240,22 @@ namespace Game.Server.Application.Social
             if (!TryGetParty(characterId, out Party party))
                 return PartyOperationResult.Fail("You are not in a party.");
 
+            long[] affected = MemberIds(party);
             RemoveMember(party, characterId);
             if (party.Members.Count <= 1)
             {
                 long remainingId = party.Members.Count == 1 ? party.Members[0].CharacterId : 0;
                 DestroyParty(party);
+                NotifyCharacters(affected);
                 return PartyOperationResult.Ok("Left the party. The party was disbanded.", remainingId);
             }
 
             if (party.LeaderCharacterId == characterId)
                 party.LeaderCharacterId = OldestMemberId(party);
 
-            return PartyOperationResult.Ok($"{name} left the party.", 0, Snapshot(party));
+            PartySnapshot snapshot = Snapshot(party);
+            NotifyCharacters(affected);
+            return PartyOperationResult.Ok($"{name} left the party.", 0, snapshot);
         }
 
         public PartyOperationResult Kick(PlayerRuntime actor, long targetCharacterId)
@@ -234,15 +271,19 @@ namespace Game.Server.Application.Social
             if (!_partyByCharacter.TryGetValue(targetCharacterId, out ulong targetPartyId) || targetPartyId != party.PartyId)
                 return PartyOperationResult.Fail("That player is not in your party.");
 
+            long[] affected = MemberIds(party);
             string targetName = FindMemberName(party, targetCharacterId);
             RemoveMember(party, targetCharacterId);
             if (party.Members.Count <= 1)
             {
                 DestroyParty(party);
+                NotifyCharacters(affected);
                 return PartyOperationResult.Ok($"{targetName} was removed. The party was disbanded.", targetCharacterId);
             }
 
-            return PartyOperationResult.Ok($"{targetName} was removed from the party.", targetCharacterId, Snapshot(party));
+            PartySnapshot snapshot = Snapshot(party);
+            NotifyCharacters(affected);
+            return PartyOperationResult.Ok($"{targetName} was removed from the party.", targetCharacterId, snapshot);
         }
 
         public PartyOperationResult Disband(PlayerRuntime actor)
@@ -255,7 +296,9 @@ namespace Game.Server.Application.Social
                 return PartyOperationResult.Fail("Only the party leader can disband the party.");
 
             PartySnapshot snapshot = Snapshot(party);
+            long[] affected = MemberIds(party);
             DestroyParty(party);
+            NotifyCharacters(affected);
             return PartyOperationResult.Ok("Party disbanded.", 0, snapshot);
         }
 
@@ -268,6 +311,24 @@ namespace Game.Server.Application.Social
             }
             snapshot = null;
             return false;
+        }
+
+        public bool TryGetPendingInvite(long targetCharacterId, out PartyInviteSnapshot invite)
+        {
+            invite = default;
+            if (targetCharacterId <= 0 || !_inviteByTarget.TryGetValue(targetCharacterId, out PendingInvite pending))
+                return false;
+            if (pending.ExpiresUtc <= DateTime.UtcNow)
+            {
+                _inviteByTarget.Remove(targetCharacterId);
+                return false;
+            }
+
+            invite = new PartyInviteSnapshot(
+                pending.InviterCharacterId,
+                pending.InviterName,
+                pending.ExpiresUtc);
+            return true;
         }
 
         public bool TryFindMember(long actorCharacterId, string name, out long characterId)
@@ -366,6 +427,38 @@ namespace Game.Server.Application.Social
                 if (party.Members[i].CharacterId == characterId)
                     return party.Members[i].Name;
             return "Player";
+        }
+
+        private static long[] MemberIds(Party party)
+        {
+            if (party == null || party.Members.Count == 0)
+                return Array.Empty<long>();
+            var ids = new long[party.Members.Count];
+            for (int i = 0; i < party.Members.Count; ++i)
+                ids[i] = party.Members[i].CharacterId;
+            return ids;
+        }
+
+        private void NotifySnapshotMembers(PartySnapshot snapshot)
+        {
+            if (snapshot?.Members == null)
+                return;
+            for (int i = 0; i < snapshot.Members.Length; ++i)
+                NotifyStateChanged(snapshot.Members[i].CharacterId);
+        }
+
+        private void NotifyCharacters(long[] characterIds)
+        {
+            if (characterIds == null)
+                return;
+            for (int i = 0; i < characterIds.Length; ++i)
+                NotifyStateChanged(characterIds[i]);
+        }
+
+        private void NotifyStateChanged(long characterId)
+        {
+            if (characterId > 0)
+                StateChanged?.Invoke(characterId);
         }
 
         private static bool TryIdentity(PlayerRuntime runtime, out long characterId, out string name)

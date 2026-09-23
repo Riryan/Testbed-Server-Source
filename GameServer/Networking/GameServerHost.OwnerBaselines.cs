@@ -20,6 +20,11 @@ internal sealed partial class GameServerHost
 
         try
         {
+            // Party is temporary GameServer-local state and has no catalog dependency.
+            // Subscribe/push it first so an unrelated optional owner-baseline failure cannot
+            // leave later Party mutations without their event-driven UI bridge.
+            BeginPartyStateReady(session, runtime);
+
             // Settings first unless this exact connection already proved it has the current
             // persistent public catalog. A stale/missing cache keeps the established full
             // baseline and ordering so compact owner-state IDs are always resolvable.

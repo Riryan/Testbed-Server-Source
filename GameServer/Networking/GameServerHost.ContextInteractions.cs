@@ -724,10 +724,10 @@ internal sealed partial class GameServerHost
             SendHarvestStarted(client, stableId, harvestPlan);
         }
 
-        // Server-authoritative interaction entry uses the baked/authored anchor. Range and
-        // facing were already revalidated by WorldInteractableService before this warp.
-        // No NavMesh/client transform is trusted for authoritative alignment.
-        if (client.Entity != null)
+        // Interactions that require authored alignment keep the existing anchor warp.
+        // Harvest already passed authoritative range/facing checks and remains at the
+        // player's validated world position instead of snapping to the node anchor.
+        if (!isHarvest && client.Entity != null)
         {
             var aligned = new CharacterLocationState(
                 interactionSession.MapId,
