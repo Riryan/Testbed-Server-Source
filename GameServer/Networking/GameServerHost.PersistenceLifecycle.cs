@@ -321,20 +321,91 @@ internal sealed partial class GameServerHost
 
     private async Task FinalizeDisconnectedSessionAsync(PlayerSessionHandle handle)
     {
-        try
-        {
-            if (_runtime.SessionService.TryGetSession(handle, out PlayerSession session) && session.Runtime != null)
-                await _runtime.Saves.SaveAsync(session.Runtime, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Final character save failed for {handle}: {ex.Message}");
-        }
-        finally
+        // Resolve this exact session generation while still on the authoritative thread.
+        // The retained runtime remains tracked and its character lease remains held until
+        // SessionService.Close is explicitly queued after a successful (or unnecessary)
+        // final save.
+        if (!_runtime.SessionService.TryGetSession(handle, out PlayerSession session))
+            return;
+
+        PlayerRuntime runtime = session.Runtime;
+        if (runtime == null)
         {
             QueueMainThreadCompletion(
                 () => _runtime.SessionService.Close(handle),
                 MainThreadCompletionPriority.Critical);
+            return;
+        }
+
+        const int initialRetryDelayMilliseconds = 500;
+        const int maximumRetryDelayMilliseconds = 15_000;
+        const int maximumRetryJitterMilliseconds = 500;
+
+        int retryDelayMilliseconds = initialRetryDelayMilliseconds;
+        int failedAttempts = 0;
+
+        while (true)
+        {
+            // Retention is valid only while this exact disconnected session still owns the
+            // authoritative character lease. Once authority is gone, persistence fencing
+            // intentionally forbids a stale final write. Release the retained local session
+            // so a later login can acquire fresh authority and load the last durable state.
+            if (!_runtime.Leases.IsHeldBy(runtime.CharacterId, handle.SessionId))
+            {
+                Console.Error.WriteLine(
+                    $"Final character save abandoned for {handle}: authoritative lease is no longer held; " +
+                    "closing retained session without an unfenced write.");
+                QueueMainThreadCompletion(
+                    () => _runtime.SessionService.Close(handle),
+                    MainThreadCompletionPriority.Critical);
+                return;
+            }
+
+            try
+            {
+                await _runtime.Saves.SaveAsync(runtime, CancellationToken.None).ConfigureAwait(false);
+
+                // Close is the canonical ownership transition: it untracks the runtime,
+                // releases the local character lease, and removes the session. Never reach
+                // it after a failed final save while authority is still held.
+                QueueMainThreadCompletion(
+                    () => _runtime.SessionService.Close(handle),
+                    MainThreadCompletionPriority.Critical);
+                return;
+            }
+            catch (Exception ex)
+            {
+                failedAttempts++;
+
+                // Authority may have been lost between the pre-save check and the fenced
+                // persistence call. In that case the failed write is permanent for this
+                // session generation; do not retain/retry a runtime that no longer owns the
+                // character.
+                if (!_runtime.Leases.IsHeldBy(runtime.CharacterId, handle.SessionId))
+                {
+                    Console.Error.WriteLine(
+                        $"Final character save could not complete for {handle}; authoritative lease was lost " +
+                        $"after attempt {failedAttempts}. Closing retained session without an unfenced write: {ex.Message}");
+                    QueueMainThreadCompletion(
+                        () => _runtime.SessionService.Close(handle),
+                        MainThreadCompletionPriority.Critical);
+                    return;
+                }
+
+                // The lease is still valid, so this is a transient persistence failure.
+                // Stagger retained disconnect retries so a Backend/database outage followed
+                // by recovery does not make many disconnected sessions retry in lockstep.
+                int jitterMilliseconds = Random.Shared.Next(0, maximumRetryJitterMilliseconds + 1);
+                int waitMilliseconds = retryDelayMilliseconds + jitterMilliseconds;
+                Console.Error.WriteLine(
+                    $"Final character save failed for {handle} (attempt {failedAttempts}); " +
+                    $"retaining runtime/lease and retrying in {waitMilliseconds} ms: {ex.Message}");
+
+                await Task.Delay(waitMilliseconds).ConfigureAwait(false);
+                retryDelayMilliseconds = Math.Min(
+                    retryDelayMilliseconds * 2,
+                    maximumRetryDelayMilliseconds);
+            }
         }
     }
 
