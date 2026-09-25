@@ -27,6 +27,24 @@ namespace Game.Server.Application.Social
         }
     }
 
+    public sealed class GuildInviteSnapshot
+    {
+        public long InviterCharacterId { get; }
+        public string InviterName { get; }
+        public long GuildId { get; }
+        public string GuildName { get; }
+        public DateTime ExpiresUtc { get; }
+
+        public GuildInviteSnapshot(long inviterCharacterId, string inviterName, long guildId, string guildName, DateTime expiresUtc)
+        {
+            InviterCharacterId = inviterCharacterId;
+            InviterName = inviterName ?? string.Empty;
+            GuildId = guildId;
+            GuildName = guildName ?? string.Empty;
+            ExpiresUtc = expiresUtc;
+        }
+    }
+
     public sealed class GuildSnapshot
     {
         public long GuildId { get; }
@@ -128,6 +146,8 @@ namespace Game.Server.Application.Social
         private readonly Dictionary<long, GuildSnapshot> _guildByCharacter = new Dictionary<long, GuildSnapshot>();
         private readonly Dictionary<long, PendingInvite> _inviteByTarget = new Dictionary<long, PendingInvite>();
 
+        public event Action<long> StateChanged;
+
         public GuildService(IGuildRepository repository, ICharacterPersistenceLeaseProofProvider leaseProof)
         {
             _repository = repository ?? throw new ArgumentNullException(nameof(repository));
@@ -147,6 +167,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to create guild." : result.Error);
             Cache(result.Guild);
+            NotifyGuildState(result.Guild);
             return GuildOperationResult.Ok($"Guild '{result.Guild.Name}' created.", 0, result.Guild);
         }
 
@@ -183,6 +204,7 @@ namespace Game.Server.Application.Social
                 };
             }
 
+            StateChanged?.Invoke(targetId);
             return GuildOperationResult.Ok($"Guild invite sent to {targetName}.", targetId, actorGuild);
         }
 
@@ -200,6 +222,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to join guild." : result.Error);
             Cache(result.Guild);
+            NotifyGuildState(result.Guild);
             return GuildOperationResult.Ok($"Joined guild '{result.Guild.Name}'.", invite.InviterCharacterId, result.Guild);
         }
 
@@ -210,6 +233,7 @@ namespace Game.Server.Application.Social
             PendingInvite invite = TakeValidInvite(characterId);
             if (invite == null)
                 return GuildOperationResult.Fail("You do not have a pending guild invite.");
+            StateChanged?.Invoke(characterId);
             return GuildOperationResult.Ok("Guild invite declined.", invite.InviterCharacterId);
         }
 
@@ -224,6 +248,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to leave guild." : result.Error);
             Invalidate(result.Guild, characterId);
+            NotifyGuildState(result.Guild, characterId);
             return GuildOperationResult.Ok("Left the guild.", 0, result.Guild);
         }
 
@@ -241,6 +266,7 @@ namespace Game.Server.Application.Social
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to remove guild member." : result.Error);
             Invalidate(result.Guild, targetCharacterId);
             Cache(result.Guild);
+            NotifyGuildState(result.Guild, targetCharacterId);
             return GuildOperationResult.Ok("Guild member removed.", targetCharacterId, result.Guild);
         }
 
@@ -256,6 +282,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to disband guild." : result.Error);
             Invalidate(before, 0);
+            NotifyGuildState(before);
             return GuildOperationResult.Ok("Guild disbanded.", 0, before);
         }
 
@@ -280,6 +307,32 @@ namespace Game.Server.Application.Social
                 return null;
             Cache(result.Guild);
             return result.Guild;
+        }
+
+        public bool TryGetPendingInvite(long targetCharacterId, out GuildInviteSnapshot snapshot)
+        {
+            snapshot = null;
+            if (targetCharacterId <= 0)
+                return false;
+
+            lock (_gate)
+            {
+                if (!_inviteByTarget.TryGetValue(targetCharacterId, out PendingInvite invite))
+                    return false;
+                if (invite.ExpiresUtc <= DateTime.UtcNow)
+                {
+                    _inviteByTarget.Remove(targetCharacterId);
+                    return false;
+                }
+
+                snapshot = new GuildInviteSnapshot(
+                    invite.InviterCharacterId,
+                    invite.InviterName,
+                    invite.GuildId,
+                    invite.GuildName,
+                    invite.ExpiresUtc);
+                return true;
+            }
         }
 
         private PendingInvite TakeValidInvite(long targetCharacterId)
@@ -316,6 +369,22 @@ namespace Game.Server.Application.Social
                 if (removedCharacterId > 0)
                     _guildByCharacter.Remove(removedCharacterId);
             }
+        }
+
+        private void NotifyGuildState(GuildSnapshot guild, long extraCharacterId = 0)
+        {
+            if (guild != null)
+            {
+                for (int i = 0; i < guild.Members.Length; ++i)
+                {
+                    long characterId = guild.Members[i]?.CharacterId ?? 0;
+                    if (characterId > 0)
+                        StateChanged?.Invoke(characterId);
+                }
+            }
+
+            if (extraCharacterId > 0 && (guild == null || !guild.TryGetMember(extraCharacterId, out _)))
+                StateChanged?.Invoke(extraCharacterId);
         }
 
         public static bool TryValidateGuildName(string raw, out string canonical, out string error)
