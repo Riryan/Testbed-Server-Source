@@ -86,6 +86,8 @@ namespace Player.Networking
             Add(result, FriendRequestTypes.Snapshot, "Friends.Snapshot");
             Add(result, FriendRequestTypes.Action, "Friends.Action");
             Add(result, FriendRequestTypes.OwnerLiveInterest, "Social.OwnerLiveInterest");
+            Add(result, GuildRequestTypes.Snapshot, "Guild.Snapshot");
+            Add(result, GuildRequestTypes.Action, "Guild.Action");
             Add(result, EconomyRequestTypes.TradeAction, "Trade.Action");
             Add(result, EconomyRequestTypes.TradeSnapshot, "Trade.Snapshot");
             Add(result, EconomyRequestTypes.StorageSnapshot, "Storage.Snapshot");
