@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>MMODashboard</AssemblyName>
+    <RootNamespace>MMODashboard</RootNamespace>
+    <ApplicationIcon>Assets\Dashboard.ico</ApplicationIcon>
+    <Version>1.1.0</Version>
+    <Company>LeaVarius MMO</Company>
+    <Product>MMO Dashboard</Product>
+    <Description>MMO server operations, configuration, and gameplay content dashboard.</Description>
+    <DebugType>none</DebugType>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+  </PropertyGroup>
+</Project>
