@@ -37,6 +37,21 @@ artifacts/
 
 
 # ============================================================
+# Python scratch / cache artifacts
+# Python is not part of the production server source tree.
+# ============================================================
+
+*.py
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+
+# ============================================================
 # Logs / temporary runtime files
 # ============================================================
 
@@ -46,6 +61,12 @@ artifacts/
 *.pid
 *.tmp
 *.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
 
 
 # ============================================================
