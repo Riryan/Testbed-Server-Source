@@ -24,6 +24,7 @@ internal sealed partial class GameServerHost
             // Subscribe/push it first so an unrelated optional owner-baseline failure cannot
             // leave later Party mutations without their event-driven UI bridge.
             BeginPartyStateReady(session, runtime);
+            BeginGuildStateReady(session, runtime);
 
             // Settings first unless this exact connection already proved it has the current
             // persistent public catalog. A stale/missing cache keeps the established full
@@ -97,9 +98,6 @@ internal sealed partial class GameServerHost
         }
         catch (Exception ex)
         {
-            // Admission is already authoritative at this point. A failed optional baseline
-            // must not disconnect/quarantine the character; existing reconciliation requests
-            // remain available when a cache is later found missing or revision-gapped.
             Console.Error.WriteLine($"Owner baseline push failed for peer {session?.Peer?.Id}: {ex}");
         }
     }

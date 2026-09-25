@@ -31,6 +31,7 @@ internal sealed partial class GameServerHost
         RegisterCoreAndCharacterRequests(handlers);
         RegisterPlayerItemRequests(handlers);
         RegisterSocialEconomyRequests(handlers);
+        RegisterGuildRequests(handlers);
         RegisterWorldItemRequests(handlers);
         RegisterResourceStatusRequests(handlers);
         RegisterProgressionRequests(handlers);
