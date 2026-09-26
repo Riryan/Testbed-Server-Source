@@ -41,8 +41,7 @@ internal sealed class BackendOptions
             throw new InvalidOperationException("GatewayServer:ContentDefinitionsPath is required.");
         if (AdmissionLifetimeSeconds is < 30 or > 600)
             throw new InvalidOperationException("GatewayServer:AdmissionLifetimeSeconds must be 30-600 seconds.");
-        if (Pbkdf2Iterations < 100_000)
-            throw new InvalidOperationException("GatewayServer:Pbkdf2Iterations is too low.");
+        if (Pbkdf2Iterations < PasswordHasher.MinimumIterations || Pbkdf2Iterations > PasswordHasher.MaximumIterations)\n            throw new InvalidOperationException($"GatewayServer:Pbkdf2Iterations must be {PasswordHasher.MinimumIterations}-{PasswordHasher.MaximumIterations}.");
         if (PasswordWorkerCount is < 1 or > 64)
             throw new InvalidOperationException("GatewayServer:PasswordWorkerCount must be 1-64.");
         if (PasswordWorkerQueueCapacity is < 1 or > 4096)
