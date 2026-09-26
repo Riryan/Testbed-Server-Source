@@ -73,7 +73,6 @@ namespace Player.Networking
             Add(result, PlayerGameplayActionRequestTypes.CancelAbility, "Gameplay.CancelAbility");
             Add(result, PlayerGameplayActionRequestTypes.Interaction, "Gameplay.Interaction");
             Add(result, PlayerGameplayActionRequestTypes.Respawn, "Gameplay.Respawn");
-            Add(result, PlayerGameplayActionRequestTypes.InteractionMenu, "Interactions.Menu");
             Add(result, PlayerGameplayActionRequestTypes.ContextInteraction, "Interactions.Context");
             Add(result, PlayerGameplayActionRequestTypes.WorldLootOpen, "Interactions.WorldLootOpen");
             Add(result, PlayerGameplayActionRequestTypes.WorldLootTake, "Interactions.WorldLootTake");

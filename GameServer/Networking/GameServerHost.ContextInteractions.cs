@@ -27,138 +27,11 @@ internal sealed partial class GameServerHost
     private void RegisterContextInteractionRequests(
         Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
     {
-        RegisterRequest(handlers, PlayerGameplayActionRequestTypes.InteractionMenu, HandleInteractionMenu);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.ContextInteraction, HandleContextInteraction);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.WorldLootOpen, HandleWorldLootOpen);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.WorldLootTake, HandleWorldLootTake);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.WorldLootTakeAll, HandleWorldLootTakeAll);
     }
-    private void HandleInteractionMenu(ClientSession session, uint requestId, NetDataReader reader)
-    {
-        var request = new InteractionMenuRequestMessage();
-        request.Deserialize(reader);
-
-        if (!TryGetGameplayRuntime(session, out PlayerRuntime source))
-        {
-            SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(request.target, "source character is not in world"));
-            return;
-        }
-
-        switch (request.target.Kind)
-        {
-            case InteractionTargetKind.PlayerEntity:
-            {
-                var playerReference = new PlayerTargetReferenceWire
-                {
-                    objectId = request.target.objectId,
-                    generation = request.target.generation,
-                };
-                if (!TryResolvePlayerTarget(session, playerReference, out PlayerRuntime target))
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(request.target, "player target is unavailable or outside authoritative interest"));
-                    return;
-                }
-
-                InteractionActionSet set = _runtime.Interactions.DiscoverPlayerActions(source, target, _scheduler.ServerTime);
-                SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
-                return;
-            }
-
-            case InteractionTargetKind.PopulationEntity:
-            {
-                if (!TryResolvePopulationInteractionTarget(source, request.target, out AuthoritativeActorRuntime actor))
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(
-                        request.target,
-                        "population target is unavailable or outside authoritative interaction range"));
-                    return;
-                }
-
-                InteractionActionSet set = _runtime.Interactions.DiscoverActorActions(
-                    source,
-                    actor,
-                    _scheduler.ServerTime);
-                set = AppendPopulationLootAction(set, actor);
-                SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
-                return;
-            }
-
-            case InteractionTargetKind.SceneObject:
-            {
-                if (request.target.primaryId <= 0)
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(
-                        request.target,
-                        "scene object target is invalid"));
-                    return;
-                }
-
-                InteractionActionSet set = FilterStandaloneSceneObjectActions(
-                    _runtime.WorldInteractables.Discover(
-                        source,
-                        request.target.primaryId,
-                        _scheduler.ServerTime));
-                SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
-                return;
-            }
-
-            case InteractionTargetKind.CombatTestTarget:
-            {
-                if (!TryResolveCombatTestDummyInteraction(source, request.target, out CombatTestDummyView dummy, out string failure))
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(request.target, failure));
-                    return;
-                }
-
-                InteractionActionSet set = BuildCombatTestDummyActions(source, dummy);
-                SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
-                return;
-            }
-
-            case InteractionTargetKind.NetworkWorldObject:
-            {
-                if (request.target.primaryId <= 0)
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(request.target, "world target is invalid"));
-                    return;
-                }
-
-                var location = source.Location;
-                if (!_runtime.WorldItems.TryGet(location.MapId, location.InstanceId, request.target.primaryId, out WorldItemState item))
-                {
-                    SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(request.target, "world item is unavailable"));
-                    return;
-                }
-
-                string targetLabel = item.DefinitionId;
-                if (_runtime.Content.TryGetItem(item.DefinitionId, out ItemDefinition definition) &&
-                    !string.IsNullOrWhiteSpace(definition.displayName))
-                {
-                    targetLabel = definition.displayName;
-                }
-                if (item.Quantity > 1)
-                    targetLabel += $" x{item.Quantity}";
-
-                InteractionActionSet set = _runtime.Interactions.DiscoverWorldActions(
-                    source,
-                    new InteractionTargetHandle(InteractionTargetKind.NetworkWorldObject, item.ItemInstanceId.Value),
-                    targetLabel,
-                    item.MapId,
-                    item.InstanceId,
-                    item.Position,
-                    _scheduler.ServerTime);
-                SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
-                return;
-            }
-
-            default:
-                SendResponse(session, requestId, InteractionMenuResponseMessage.Failed(
-                    request.target,
-                    $"target kind {request.target.Kind} has no standalone authoritative resolver yet"));
-                return;
-        }
-    }
-
     private void HandleContextInteraction(ClientSession session, uint requestId, NetDataReader reader)
     {
         var request = new ContextInteractionRequestMessage();
@@ -474,45 +347,6 @@ internal sealed partial class GameServerHost
         return true;
     }
 
-    private InteractionActionSet BuildCombatTestDummyActions(PlayerRuntime source, CombatTestDummyView dummy)
-    {
-        bool canFeed = _runtime.Feeding.CanStart(source, dummy.Runtime, out string feedReason);
-        InteractionActionEntry[] actions =
-        {
-            new InteractionActionEntry(
-                InteractionCategoryId.Use,
-                InteractionActionId.Feed,
-                "Feed",
-                canFeed ? InteractionAvailability.Available : InteractionAvailability.Disabled,
-                canFeed ? string.Empty : feedReason,
-                InteractionConsentMode.None,
-                InteractionContentLevel.General,
-                InteractionFeature.Vampire,
-                -10),
-            DummyAction(InteractionActionId.CombatDummyResetHealth, "Reset Health", 0),
-            DummyAction(InteractionActionId.CombatDummyClearStatuses, "Clear Statuses", 10),
-            DummyAction(InteractionActionId.CombatDummyNormalDefense, "Normal Defense", 20),
-            DummyAction(InteractionActionId.CombatDummyConductivePlate, "Conductive Plate", 30),
-            DummyAction(InteractionActionId.CombatDummyPoisonResistant, "Poison Resistant", 40),
-            DummyAction(InteractionActionId.CombatDummyPoisonImmune, "Poison Immune", 50),
-            DummyAction(InteractionActionId.CombatDummyFireWeak, "Fire Weak", 60),
-            DummyAction(InteractionActionId.CombatDummyInvulnerable, "Invulnerable", 70),
-            DummyAction(InteractionActionId.CombatDummyShowStats, "Show Current Stats", 80),
-        };
-        return new InteractionActionSet(
-            new InteractionTargetHandle(InteractionTargetKind.CombatTestTarget, dummy.StableId),
-            dummy.Label,
-            actions);
-    }
-
-    private static InteractionActionEntry DummyAction(InteractionActionId actionId, string label, short sortOrder) =>
-        new InteractionActionEntry(
-            InteractionCategoryId.Use,
-            actionId,
-            label,
-            InteractionAvailability.Available,
-            sortOrder: sortOrder);
-
     private bool TryResolvePopulationInteractionTarget(
         PlayerRuntime source,
         InteractionTargetReferenceWire reference,
@@ -556,43 +390,6 @@ internal sealed partial class GameServerHost
         }
 
         return true;
-    }
-
-    private static InteractionActionSet FilterStandaloneSceneObjectActions(InteractionActionSet source)
-    {
-        InteractionActionEntry[] actions = source.Actions ?? Array.Empty<InteractionActionEntry>();
-        if (actions.Length == 0)
-            return source;
-
-        var filtered = new InteractionActionEntry[actions.Length];
-        for (int i = 0; i < actions.Length; ++i)
-        {
-            InteractionActionEntry entry = actions[i];
-
-            // SceneObject TargetAcceptance/MutualOptIn requires a second participant and a
-            // participant-addressable consent exchange. That is not the same thing as a
-            // visual client feature, and the current standalone protocol does not expose
-            // such a participant/session endpoint yet. Fail closed in discovery instead
-            // of advertising an action the server cannot complete safely.
-            if (entry.IsAvailable &&
-                (entry.ConsentMode == InteractionConsentMode.TargetAcceptance ||
-                 entry.ConsentMode == InteractionConsentMode.MutualOptIn))
-            {
-                filtered[i] = entry.WithAvailability(
-                    InteractionAvailability.Disabled,
-                    "multi-participant consent is not active on the standalone server");
-            }
-            else
-            {
-                filtered[i] = entry;
-            }
-        }
-
-        return new InteractionActionSet(
-            source.Target,
-            source.TargetLabel,
-            filtered,
-            source.Detail);
     }
 
     private void ExecuteSceneObjectInteraction(
@@ -836,52 +633,6 @@ internal sealed partial class GameServerHost
             if (!IsCurrent(session)) return;
             SendResponse(session, requestId, ToContextInteractionWire(request.target, result));
         });
-    }
-
-    private InteractionActionSet AppendPopulationLootAction(
-        InteractionActionSet set,
-        AuthoritativeActorRuntime actor)
-    {
-        if (actor == null || actor.Alive || actor.HealthCurrent > 0 || !_runtime.PopulationLoot.CanLoot(actor))
-            return set;
-
-        InteractionActionEntry[] existing = set.Actions ?? Array.Empty<InteractionActionEntry>();
-        for (int i = 0; i < existing.Length; ++i)
-            if (existing[i].ActionId == InteractionActionId.Loot)
-                return set;
-
-        var actions = new InteractionActionEntry[existing.Length + 1];
-        Array.Copy(existing, actions, existing.Length);
-        actions[existing.Length] = new InteractionActionEntry(
-            InteractionCategoryId.Interact,
-            InteractionActionId.Loot,
-            "Loot",
-            InteractionAvailability.Available,
-            string.Empty,
-            feature: InteractionFeature.Loot,
-            sortOrder: 10);
-        Array.Sort(actions, (a, b) => a.SortOrder.CompareTo(b.SortOrder));
-        return new InteractionActionSet(set.Target, set.TargetLabel, actions, set.Detail);
-    }
-
-    private static InteractionMenuResponseMessage ToInteractionMenuWire(
-        InteractionTargetReferenceWire target,
-        InteractionActionSet set)
-    {
-        InteractionActionEntry[] source = set.Actions ?? Array.Empty<InteractionActionEntry>();
-        int count = Math.Min(source.Length, InteractionMenuResponseMessage.MaxActions);
-        var actions = new InteractionActionEntryWire[count];
-        for (int i = 0; i < count; ++i)
-            actions[i] = InteractionActionEntryWire.From(source[i]);
-
-        return new InteractionMenuResponseMessage
-        {
-            success = true,
-            target = target,
-            targetLabel = set.TargetLabel,
-            detail = set.Detail,
-            actions = actions,
-        };
     }
 
     private static ContextInteractionResponseMessage ToContextInteractionWire(
