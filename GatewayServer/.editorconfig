@@ -1,0 +1,5 @@
+# Third-party SQLite source is maintained externally.
+# Suppress CA2200 only for this vendor file so first-party server code still reports it.
+
+[ThirdParty/SQLite/SQLite.cs]
+dotnet_diagnostic.CA2200.severity = none
