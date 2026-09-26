@@ -83,6 +83,19 @@ namespace Game.Server.Application.Interactions
             ServerContextualInteractionDefinition def = WorldInteractableService.FindDefinition(target.Definition, actionId);
             if (def == null || !_worldObjects.Evaluate(actor, target, def, out detail)) return false;
 
+            bool needsRemoteConsent =
+                def.consentMode == InteractionConsentMode.TargetAcceptance ||
+                def.consentMode == InteractionConsentMode.MutualOptIn;
+            if (needsRemoteConsent)
+            {
+                // Remote-consent world sessions are intentionally not started until the
+                // intended target is authoritatively bound at creation time. Leaving the
+                // target unset would let an unrelated character accept/decline the pending
+                // session. The standalone scene path already treats this feature as disabled.
+                detail = "remote-consent world interactions are not enabled";
+                return false;
+            }
+
             if (def.exclusiveOccupancy && target.ActiveSessionId != 0)
             {
                 detail = "interaction is already in use";
@@ -99,10 +112,6 @@ namespace Game.Server.Application.Interactions
 
             long id = ++_nextSessionId;
             if (id <= 0) id = _nextSessionId = 1;
-            bool needsRemoteConsent =
-                def.consentMode == InteractionConsentMode.TargetAcceptance ||
-                def.consentMode == InteractionConsentMode.MutualOptIn;
-
             session = new ServerInteractionSession
             {
                 SessionId = id,
