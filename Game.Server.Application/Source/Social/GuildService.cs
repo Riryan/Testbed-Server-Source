@@ -212,7 +212,7 @@ namespace Game.Server.Application.Social
         {
             if (!TryIdentity(target, out long accountId, out long characterId, out _))
                 return GuildOperationResult.Fail("Guild acceptance is unavailable.");
-            PendingInvite invite = TakeValidInvite(characterId);
+            PendingInvite invite = PeekValidInvite(characterId);
             if (invite == null)
                 return GuildOperationResult.Fail("You do not have a pending guild invite.");
             if (!_leaseProof.TryGetPersistenceLeaseOwnerToken(target.CharacterId, out string leaseToken))
@@ -221,6 +221,10 @@ namespace Game.Server.Application.Social
             GuildRepositoryResult result = await _repository.JoinAsync(accountId, characterId, leaseToken, invite.GuildId, cancellationToken).ConfigureAwait(false);
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to join guild." : result.Error);
+
+            // Consume only the exact invite that produced the successful durable join.
+            // Failed durable joins leave a still-valid invite retryable.
+            RemoveInviteIfSame(characterId, invite);
             Cache(result.Guild);
             NotifyGuildState(result.Guild);
             return GuildOperationResult.Ok($"Joined guild '{result.Guild.Name}'.", invite.InviterCharacterId, result.Guild);
@@ -332,6 +336,55 @@ namespace Game.Server.Application.Social
                     invite.GuildName,
                     invite.ExpiresUtc);
                 return true;
+            }
+        }
+
+        private PendingInvite PeekValidInvite(long targetCharacterId)
+        {
+            lock (_gate)
+            {
+                if (!_inviteByTarget.TryGetValue(targetCharacterId, out PendingInvite invite))
+                    return null;
+                if (invite.ExpiresUtc > DateTime.UtcNow)
+                    return invite;
+                _inviteByTarget.Remove(targetCharacterId);
+                return null;
+            }
+        }
+
+        private void RemoveInviteIfSame(long targetCharacterId, PendingInvite expected)
+        {
+            lock (_gate)
+            {
+                if (_inviteByTarget.TryGetValue(targetCharacterId, out PendingInvite current) &&
+                    ReferenceEquals(current, expected))
+                    _inviteByTarget.Remove(targetCharacterId);
+            }
+        }
+
+        public void ReleaseCharacter(long characterId)
+        {
+            if (characterId <= 0) return;
+            lock (_gate)
+            {
+                // Membership is durable in the repository; this is only a runtime cache.
+                _guildByCharacter.Remove(characterId);
+                _inviteByTarget.Remove(characterId);
+
+                DateTime now = DateTime.UtcNow;
+                List<long> remove = null;
+                foreach (KeyValuePair<long, PendingInvite> pair in _inviteByTarget)
+                {
+                    PendingInvite invite = pair.Value;
+                    if (invite == null || invite.ExpiresUtc <= now || invite.InviterCharacterId == characterId)
+                    {
+                        remove ??= new List<long>();
+                        remove.Add(pair.Key);
+                    }
+                }
+                if (remove != null)
+                    for (int n = 0; n < remove.Count; ++n)
+                        _inviteByTarget.Remove(remove[n]);
             }
         }
 
