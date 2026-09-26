@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Game.GameServer.Runtime;
+using Game.Server.Application.Interactions;
 using Game.Server.Application.Social;
 using Game.Server.Domain.Players;
 using LiteNetLib;
@@ -18,6 +19,7 @@ internal sealed partial class GameServerHost
     private void RegisterGuildRequests(
         Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
     {
+        EnsureCanonicalPlayerSocialInteractionHandlers();
         RegisterRequest(handlers, GuildRequestTypes.Snapshot,
             (session, requestId, _) => HandleGuildSnapshot(session, requestId));
         RegisterRequest(handlers, GuildRequestTypes.Action, HandleGuildAction);

@@ -76,6 +76,12 @@ namespace Game.Server.Application.Interactions
         InteractionResult Execute(in InteractionExecutionContext context);
     }
 
+    public interface IAsyncPlayerInteractionActionHandler
+    {
+        InteractionActionId ActionId { get; }
+        Task<InteractionResult> ExecuteAsync(InteractionExecutionContext context, CancellationToken cancellationToken);
+    }
+
     /// <summary>
     /// Optional presentation metadata supplied by an authoritative action owner. The
     /// server still decides whether the action is currently available; clients receive
@@ -123,6 +129,7 @@ namespace Game.Server.Application.Interactions
         }
 
         private readonly Dictionary<InteractionActionId, IInteractionActionHandler> _handlers = new Dictionary<InteractionActionId, IInteractionActionHandler>();
+        private readonly Dictionary<InteractionActionId, IAsyncPlayerInteractionActionHandler> _asyncPlayerHandlers = new Dictionary<InteractionActionId, IAsyncPlayerInteractionActionHandler>();
         private readonly Dictionary<InteractionActionId, IActorInteractionActionHandler> _actorHandlers = new Dictionary<InteractionActionId, IActorInteractionActionHandler>();
         private readonly Dictionary<WorldActionKey, IAsyncWorldInteractionActionHandler> _worldHandlers = new Dictionary<WorldActionKey, IAsyncWorldInteractionActionHandler>();
 
@@ -138,8 +145,15 @@ namespace Game.Server.Application.Interactions
 
         public bool Register(IInteractionActionHandler handler)
         {
-            if (handler == null || handler.ActionId == InteractionActionId.None || _handlers.ContainsKey(handler.ActionId)) return false;
+            if (handler == null || handler.ActionId == InteractionActionId.None || _handlers.ContainsKey(handler.ActionId) || _asyncPlayerHandlers.ContainsKey(handler.ActionId)) return false;
             _handlers.Add(handler.ActionId, handler); return true;
+        }
+
+        public bool RegisterAsyncPlayer(IAsyncPlayerInteractionActionHandler handler)
+        {
+            if (handler == null || handler.ActionId == InteractionActionId.None ||
+                _handlers.ContainsKey(handler.ActionId) || _asyncPlayerHandlers.ContainsKey(handler.ActionId)) return false;
+            _asyncPlayerHandlers.Add(handler.ActionId, handler); return true;
         }
 
         public bool RegisterActor(IActorInteractionActionHandler handler)
@@ -162,6 +176,12 @@ namespace Game.Server.Application.Interactions
         {
             if (handler == null || !_handlers.TryGetValue(handler.ActionId, out IInteractionActionHandler current) || !ReferenceEquals(current, handler)) return false;
             return _handlers.Remove(handler.ActionId);
+        }
+
+        public bool UnregisterAsyncPlayer(IAsyncPlayerInteractionActionHandler handler)
+        {
+            if (handler == null || !_asyncPlayerHandlers.TryGetValue(handler.ActionId, out IAsyncPlayerInteractionActionHandler current) || !ReferenceEquals(current, handler)) return false;
+            return _asyncPlayerHandlers.Remove(handler.ActionId);
         }
 
         public bool UnregisterActor(IActorInteractionActionHandler handler)
@@ -188,8 +208,18 @@ namespace Game.Server.Application.Interactions
         {
             InteractionTargetHandle handle = target == null ? default : InteractionTargetHandle.Player(target.CharacterId.Value);
             string targetLabel = target?.Character?.Name ?? string.Empty;
-            var entries = new List<InteractionActionEntry>(_handlers.Count);
+            var entries = new List<InteractionActionEntry>(_handlers.Count + _asyncPlayerHandlers.Count);
             foreach (KeyValuePair<InteractionActionId, IInteractionActionHandler> pair in _handlers)
+            {
+                InteractionActionEntry entry = Describe(pair.Key, pair.Value);
+                InteractionResult validation = ValidatePlayerAction(source, target, handle, pair.Key, 0, now);
+                if (validation.ResultCode == InteractionResultCode.Success)
+                    entry = entry.WithAvailability(InteractionAvailability.Available);
+                else
+                    entry = entry.WithAvailability(InteractionAvailability.Disabled, validation.Detail);
+                entries.Add(entry);
+            }
+            foreach (KeyValuePair<InteractionActionId, IAsyncPlayerInteractionActionHandler> pair in _asyncPlayerHandlers)
             {
                 InteractionActionEntry entry = Describe(pair.Key, pair.Value);
                 InteractionResult validation = ValidatePlayerAction(source, target, handle, pair.Key, 0, now);
@@ -259,6 +289,20 @@ namespace Game.Server.Application.Interactions
             if (invalid.ResultCode != InteractionResultCode.Success) return Publish(invalid);
             if (!_handlers.TryGetValue(actionId, out IInteractionActionHandler handler)) return Publish(new InteractionResult(sequence, actionId, InteractionResultCode.Unsupported, handle, "interaction action has no authoritative owner yet"));
             return Publish(handler.Execute(new InteractionExecutionContext(source, target, handle, actionId, sequence, now)));
+        }
+
+        public async Task<InteractionResult> ExecutePlayerActionAsync(PlayerRuntime source, PlayerRuntime target, InteractionActionId actionId, uint sequence, double now, CancellationToken cancellationToken)
+        {
+            InteractionTargetHandle handle = target == null ? default : InteractionTargetHandle.Player(target.CharacterId.Value);
+            InteractionResult invalid = ValidatePlayerAction(source, target, handle, actionId, sequence, now);
+            if (invalid.ResultCode != InteractionResultCode.Success) return Publish(invalid);
+
+            var context = new InteractionExecutionContext(source, target, handle, actionId, sequence, now);
+            if (_handlers.TryGetValue(actionId, out IInteractionActionHandler syncHandler))
+                return Publish(syncHandler.Execute(context));
+            if (_asyncPlayerHandlers.TryGetValue(actionId, out IAsyncPlayerInteractionActionHandler asyncHandler))
+                return Publish(await asyncHandler.ExecuteAsync(context, cancellationToken).ConfigureAwait(false));
+            return Publish(new InteractionResult(sequence, actionId, InteractionResultCode.Unsupported, handle, "interaction action has no authoritative owner yet"));
         }
 
         public InteractionResult ExecuteActorAction(
