@@ -5,6 +5,7 @@ using Game.GameServer.Runtime;
 using Game.Server.Application.Actors;
 using Game.Server.Application.Combat;
 using Game.Server.Application.Harvesting;
+using Game.Server.Application.Interactions;
 using Game.Server.Domain.Characters;
 using Game.Server.Domain.Players;
 using Game.Server.Domain.WorldItems;
@@ -58,6 +59,7 @@ internal sealed partial class GameServerHost
                 }
 
                 InteractionActionSet set = _runtime.Interactions.DiscoverPlayerActions(source, target, _scheduler.ServerTime);
+                set = AppendCanonicalPlayerSocialActions(set);
                 SendResponse(session, requestId, ToInteractionMenuWire(request.target, set));
                 return;
             }
@@ -224,6 +226,34 @@ internal sealed partial class GameServerHost
                         request.ActionId,
                         InteractionResultCode.InvalidTarget,
                         "player target is unavailable or outside authoritative interest"));
+                    return;
+                }
+
+                // Party/Guild already have canonical standalone owners. ContextInteraction
+                // is the canonical E/menu route, so reuse those owners instead of creating
+                // a second social mutation path.
+                if (request.ActionId == InteractionActionId.PartyInvite)
+                {
+                    InteractionResult partyInvite = ExecutePartyInviteInteraction(
+                        source,
+                        target,
+                        request.sequence);
+                    SendResponse(
+                        session,
+                        requestId,
+                        ToContextInteractionWire(request.target, partyInvite));
+                    return;
+                }
+
+                if (request.ActionId == InteractionActionId.GuildInvite)
+                {
+                    RunGuildInviteContextInteractionAsync(
+                        session,
+                        requestId,
+                        request.target,
+                        source,
+                        target,
+                        request.sequence).Forget();
                     return;
                 }
 
@@ -402,6 +432,107 @@ internal sealed partial class GameServerHost
                     $"target kind {request.target.Kind} has no standalone authoritative resolver yet"));
                 return;
         }
+    }
+
+    private static InteractionActionSet AppendCanonicalPlayerSocialActions(InteractionActionSet set)
+    {
+        InteractionActionEntry[] existing = set.Actions ?? Array.Empty<InteractionActionEntry>();
+        bool hasParty = false;
+        bool hasGuild = false;
+        for (int i = 0; i < existing.Length; ++i)
+        {
+            hasParty |= existing[i].ActionId == InteractionActionId.PartyInvite;
+            hasGuild |= existing[i].ActionId == InteractionActionId.GuildInvite;
+        }
+
+        int addCount = (hasParty ? 0 : 1) + (hasGuild ? 0 : 1);
+        if (addCount == 0)
+            return set;
+
+        var actions = new InteractionActionEntry[existing.Length + addCount];
+        Array.Copy(existing, actions, existing.Length);
+        int index = existing.Length;
+        if (!hasParty)
+            actions[index++] = InteractionActionCatalog.Default(InteractionActionId.PartyInvite);
+        if (!hasGuild)
+            actions[index] = InteractionActionCatalog.Default(InteractionActionId.GuildInvite);
+
+        Array.Sort(actions, (left, right) =>
+        {
+            int sort = left.SortOrder.CompareTo(right.SortOrder);
+            return sort != 0 ? sort : left.ActionId.CompareTo(right.ActionId);
+        });
+        return new InteractionActionSet(set.Target, set.TargetLabel, actions, set.Detail);
+    }
+
+    private async Task RunGuildInviteContextInteractionAsync(
+        ClientSession sourceSession,
+        uint requestId,
+        InteractionTargetReferenceWire targetReference,
+        PlayerRuntime source,
+        PlayerRuntime target,
+        uint sequence)
+    {
+        var handle = InteractionTargetHandle.Player(target?.CharacterId.Value ?? 0);
+        GuildOperationResult operation;
+        try
+        {
+            operation = await GuildSocial.InviteAsync(
+                source,
+                target,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"Guild context interaction invite failed for character {source?.CharacterId.Value ?? 0}: {ex.Message}");
+            QueueMainThreadCompletion(() =>
+            {
+                if (!IsCurrent(sourceSession))
+                    return;
+                var failed = new InteractionResult(
+                    sequence,
+                    InteractionActionId.GuildInvite,
+                    InteractionResultCode.Rejected,
+                    handle,
+                    "guild service is temporarily unavailable");
+                SendResponse(
+                    sourceSession,
+                    requestId,
+                    ToContextInteractionWire(targetReference, failed));
+            });
+            return;
+        }
+
+        QueueMainThreadCompletion(() =>
+        {
+            if (!IsCurrent(sourceSession))
+                return;
+
+            var result = new InteractionResult(
+                sequence,
+                InteractionActionId.GuildInvite,
+                operation.Success ? InteractionResultCode.Success : InteractionResultCode.Rejected,
+                handle,
+                operation.Message);
+            SendResponse(
+                sourceSession,
+                requestId,
+                ToContextInteractionWire(targetReference, result));
+
+            if (!operation.Success || target == null)
+                return;
+
+            ClientSession targetSession = FindIndexedReadySessionByCharacterId(target.CharacterId.Value);
+            if (targetSession != null && IsCurrent(targetSession))
+            {
+                string actorName = source?.Character?.Name ?? "Player";
+                string guildName = operation.Guild?.Name ?? "the guild";
+                SendSystemChat(
+                    targetSession,
+                    $"{actorName} invited you to guild '{guildName}'. Type /guild accept or /guild decline.");
+            }
+        });
     }
 
     private bool TryResolveCombatTestDummyInteraction(
