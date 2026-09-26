@@ -49,7 +49,7 @@ namespace Game.Server.Application.WorldItems
         private readonly Dictionary<long, long> _reservations = new Dictionary<long, long>();
         private readonly Dictionary<long, TransientDrop> _transientDrops = new Dictionary<long, TransientDrop>();
         private readonly MinPriorityQueue<TransientDrop, double> _expiryQueue = new MinPriorityQueue<TransientDrop, double>();
-        private readonly MinPriorityQueue<TransientDrop, long> _oldestQueue = new MinPriorityQueue<TransientDrop, long>();
+        private MinPriorityQueue<TransientDrop, long> _oldestQueue = new MinPriorityQueue<TransientDrop, long>();
         private long _nextReservation;
         private long _nextDropSequence;
         private double _droppedItemLifetimeSeconds = 300d;
@@ -397,6 +397,21 @@ namespace Game.Server.Application.WorldItems
             _transientDrops[state.ItemId] = state;
             _expiryQueue.Enqueue(state, state.ExpiresAt);
             _oldestQueue.Enqueue(state, state.Sequence);
+
+            // Stale oldest-queue entries are intentional tombstones after pickup/decay.
+            // Rebuild only when history materially exceeds live drops; this is piggybacked
+            // on drop registration and adds no polling/background work.
+            int staleAllowance = Math.Max(256, _maxTransientDroppedItems / 4);
+            if (_oldestQueue.Count > _transientDrops.Count + staleAllowance)
+                RebuildOldestQueueLocked();
+        }
+
+        private void RebuildOldestQueueLocked()
+        {
+            var rebuilt = new MinPriorityQueue<TransientDrop, long>();
+            foreach (TransientDrop drop in _transientDrops.Values)
+                rebuilt.Enqueue(drop, drop.Sequence);
+            _oldestQueue = rebuilt;
         }
 
         private List<WorldItemChange> TrimToCapacityLocked()
