@@ -27,6 +27,9 @@ internal sealed class ContentDefinitionStore : IDisposable
 
     private GameplayContentSnapshot _current;
     private bool _disposed;
+    private int _reloadRetryAttempt;
+
+    private const int MaximumReloadRetryAttempts = 5;
 
     public string ContentPath => _path;
     public event Action<long> RevisionChanged;
@@ -114,41 +117,68 @@ internal sealed class ContentDefinitionStore : IDisposable
 
         lock (_gate)
         {
-            if (_disposed || !File.Exists(_path))
+            if (_disposed)
                 return;
+
+            if (!File.Exists(_path))
+            {
+                ScheduleReloadRetryLocked("definition file is temporarily unavailable");
+                return;
+            }
 
             try
             {
                 GameplayContentSnapshot candidate = ReadSnapshot();
-
-                // Duplicate editor notifications after the same save are expected.
-                // They are ignored without producing rejection noise.
                 if (candidate != null && candidate.revision == _current.revision)
+                {
+                    _reloadRetryAttempt = 0;
                     return;
+                }
 
                 if (!GameplayContentValidation.TryValidateCompatibleUpdate(_current, candidate, out string error))
                 {
+                    // A complete but incompatible authored revision is not a transient
+                    // filesystem failure. Keep last-known-good and await the next file event.
+                    _reloadRetryAttempt = 0;
                     Console.Error.WriteLine($"[Content] Rejected definition update: {error}");
                     return;
                 }
 
-                // Warm the validation/lookup cache before publication so request paths
-                // never pay a first-use full-catalog scan for the new revision.
                 GameplayContentSnapshotCache.Warm(candidate);
-
                 long previous = _current.revision;
                 Volatile.Write(ref _current, candidate);
                 activatedRevision = candidate.revision;
+                _reloadRetryAttempt = 0;
                 Console.WriteLine($"[Content] Activated gameplay content revision {candidate.revision} (previous {previous}).");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                Console.Error.WriteLine($"[Content] Transient reload failure. Keeping revision {_current.revision}: {ex.Message}");
+                ScheduleReloadRetryLocked(ex.Message);
             }
             catch (Exception ex)
             {
+                _reloadRetryAttempt = 0;
                 Console.Error.WriteLine($"[Content] Failed to reload gameplay definitions. Keeping revision {_current.revision}: {ex.Message}");
             }
         }
 
         if (activatedRevision > 0)
             RevisionChanged?.Invoke(activatedRevision);
+    }
+
+    private void ScheduleReloadRetryLocked(string reason)
+    {
+        if (_disposed || _reloadRetryAttempt >= MaximumReloadRetryAttempts)
+        {
+            if (!_disposed)
+                Console.Error.WriteLine($"[Content] Reload reconciliation exhausted after {_reloadRetryAttempt} retry attempt(s): {reason}");
+            return;
+        }
+
+        int delayMilliseconds = 250 << _reloadRetryAttempt;
+        _reloadRetryAttempt++;
+        _reloadDebounce.Change(TimeSpan.FromMilliseconds(delayMilliseconds), Timeout.InfiniteTimeSpan);
     }
 
     private GameplayContentSnapshot ReadSnapshot()
