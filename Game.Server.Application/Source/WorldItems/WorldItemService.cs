@@ -30,7 +30,7 @@ namespace Game.Server.Application.WorldItems
         {
             public long Revision;
             public readonly Dictionary<long, WorldItemState> Items = new Dictionary<long, WorldItemState>();
-            public readonly SemaphoreSlim OperationGate = new SemaphoreSlim(1, 1);
+            public readonly SemaphoreSlim OperationGate = new SemaphoreSlim(1, 1);\n            public int OperationReferences;
         }
 
         private sealed class TransientDrop
@@ -203,7 +203,12 @@ namespace Game.Server.Application.WorldItems
             if (runtime == null) return PlayerItemOperationResult.Failed(PlayerItemOperationStatus.CharacterUnavailable, "player runtime is unavailable");
             var location = runtime.Location;
             WorldState operationWorld;
-            lock (_gate) operationWorld = GetOrCreate(location.MapId, location.InstanceId);
+            string operationWorldKey = Key(location.MapId, location.InstanceId);
+            lock (_gate)
+            {
+                operationWorld = GetOrCreate(location.MapId, location.InstanceId);
+                operationWorld.OperationReferences++;
+            }
 
             await operationWorld.OperationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
@@ -235,6 +240,8 @@ namespace Game.Server.Application.WorldItems
             finally
             {
                 operationWorld.OperationGate.Release();
+                lock (_gate)
+                    ReleaseWorldOperationReferenceLocked(operationWorldKey, operationWorld);
             }
         }
 
@@ -244,15 +251,17 @@ namespace Game.Server.Application.WorldItems
             WorldItemState item;
             WorldState operationWorld;
             long reservation;
+            string operationWorldKey = Key(context.MapId, context.InstanceId);
             lock (_gate)
             {
-                if (!_worlds.TryGetValue(Key(context.MapId, context.InstanceId), out operationWorld) || !operationWorld.Items.TryGetValue(itemId, out item))
+                if (!_worlds.TryGetValue(operationWorldKey, out operationWorld) || !operationWorld.Items.TryGetValue(itemId, out item))
                     return new InteractionResult(context.Sequence, context.ActionId, InteractionResultCode.TargetUnavailable, context.Target, "world item is unavailable");
                 if (_reservations.ContainsKey(itemId))
                     return new InteractionResult(context.Sequence, context.ActionId, InteractionResultCode.SessionBusy, context.Target, "world item is already being picked up");
                 reservation = ++_nextReservation;
                 if (reservation <= 0) { _nextReservation = 1; reservation = 1; }
                 _reservations[itemId] = reservation;
+                operationWorld.OperationReferences++;
             }
 
             bool operationGateHeld = false;
@@ -323,7 +332,11 @@ namespace Game.Server.Application.WorldItems
             {
                 if (operationGateHeld) operationWorld.OperationGate.Release();
                 lock (_gate)
-                    if (_reservations.TryGetValue(itemId, out long current) && current == reservation) _reservations.Remove(itemId);
+                {
+                    if (_reservations.TryGetValue(itemId, out long current) && current == reservation)
+                        _reservations.Remove(itemId);
+                    ReleaseWorldOperationReferenceLocked(operationWorldKey, operationWorld);
+                }
             }
         }
 
@@ -459,7 +472,25 @@ namespace Game.Server.Application.WorldItems
             world.Revision = NextRevision(world.Revision);
             _reservations.Remove(itemId);
             change = new WorldItemChange(WorldItemChangeKind.Removed, item.MapId, item.InstanceId, world.Revision, itemId, null);
+            TryReclaimWorldLocked(drop.WorldKey, world);
             return true;
+        }
+
+        private void ReleaseWorldOperationReferenceLocked(string worldKey, WorldState world)
+        {
+            if (world == null || world.OperationReferences <= 0) return;
+            world.OperationReferences--;
+            TryReclaimWorldLocked(worldKey, world);
+        }
+
+        private void TryReclaimWorldLocked(string worldKey, WorldState world)
+        {
+            // OperationReferences is acquired under _gate before async waiting begins.
+            // Reclaim only at zero so a map/instance never gets a second operation gate
+            // while an older operation still owns or waits on the first.
+            if (world == null || world.OperationReferences != 0 || world.Items.Count != 0) return;
+            if (_worlds.TryGetValue(worldKey, out WorldState current) && ReferenceEquals(current, world))
+                _worlds.Remove(worldKey);
         }
 
         private void PublishChanges(List<WorldItemChange> changes)
