@@ -7,11 +7,14 @@ internal static class PasswordHasher
 {
     public const string Algorithm = "PBKDF2-HMAC-SHA256";
     public const int Version = 1;
+    public const int MinimumIterations = 100_000;
+    public const int MaximumIterations = 1_000_000;
     private const int SaltBytes = 16;
     private const int HashBytes = 32;
 
     public static PasswordCredential Create(string password, int iterations)
     {
+        ValidateIterationCount(iterations);
         byte[] salt = RandomNumberGenerator.GetBytes(SaltBytes);
         byte[] hash = Rfc2898DeriveBytes.Pbkdf2(
             password,
@@ -40,7 +43,8 @@ internal static class PasswordHasher
     {
         if (credential == null ||
             !string.Equals(credential.Algorithm, Algorithm, StringComparison.Ordinal) ||
-            credential.Iterations < 100_000 ||
+            credential.Iterations < MinimumIterations ||
+            credential.Iterations > MaximumIterations ||
             credential.Version != Version)
             return false;
 
@@ -78,6 +82,7 @@ internal static class PasswordHasher
 
     public static void PerformDummyVerification(string password, int iterations)
     {
+        ValidateIterationCount(iterations);
         byte[] fullSalt = SHA256.HashData(Encoding.UTF8.GetBytes("Backend Server dummy credential"));
         byte[] salt = new byte[SaltBytes];
         Buffer.BlockCopy(fullSalt, 0, salt, 0, salt.Length);
@@ -90,6 +95,13 @@ internal static class PasswordHasher
         CryptographicOperations.ZeroMemory(hash);
         CryptographicOperations.ZeroMemory(salt);
         CryptographicOperations.ZeroMemory(fullSalt);
+    }
+
+    private static void ValidateIterationCount(int iterations)
+    {
+        if (iterations < MinimumIterations || iterations > MaximumIterations)
+            throw new ArgumentOutOfRangeException(nameof(iterations),
+                $"PBKDF2 iterations must be {MinimumIterations}..{MaximumIterations}.");
     }
 }
 
