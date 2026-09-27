@@ -9,10 +9,11 @@ namespace Game.GameServer.Backend;
 /// <summary>
 /// Maintains this process's ephemeral Gateway-owned GameServer directory lease.
 ///
-/// The Gateway directory is the authority for map/instance ownership. A GameServer may
-/// continue simulating sessions that are already InWorld when the directory becomes
-/// unavailable, but it must fail closed for new connections/world admission once its
-/// directory lease is no longer valid.
+/// The Gateway directory is the authority for live GameServer membership and map/instance
+/// assignment. Registration advertises which baked maps this worker can host; ResolveMapAsync
+/// returns the Gateway's current authoritative assignment. A GameServer may continue simulating
+/// sessions that are already InWorld when the directory becomes unavailable, but it must fail
+/// closed for new connections/world admission once its directory lease is no longer valid.
 /// </summary>
 internal sealed class BackendGameServerDirectoryLease : IDisposable
 {
@@ -50,7 +51,7 @@ internal sealed class BackendGameServerDirectoryLease : IDisposable
         get { lock (_gate) return _expiresUtcTicks; }
     }
 
-    public int OwnedPartitionCount => _maps.Length;
+    public int AdvertisedMapCapabilityCount => _maps.Length;
 
     public BackendGameServerDirectoryLease(
         BackendInternalClient backend,
@@ -66,8 +67,9 @@ internal sealed class BackendGameServerDirectoryLease : IDisposable
     }
 
     /// <summary>
-    /// Performs the initial registration synchronously with startup. The UDP listener is not
-    /// opened unless Gateway has accepted this process as the live owner of its partitions.
+    /// Performs the initial registration synchronously with startup. Registration establishes
+    /// this worker's directory lease and advertises map capability; ownership is resolved
+    /// separately so multiple generic workers can load the same baked world package safely.
     /// </summary>
     public void Start(CancellationToken shutdownToken)
     {
@@ -105,7 +107,7 @@ internal sealed class BackendGameServerDirectoryLease : IDisposable
 
         Console.WriteLine(
             $"GameServer directory lease active: serverId={_options.ServerId}, " +
-            $"partitions={_maps.Length}, expiresUtc={new DateTime(registration.expiresUtcTicks, DateTimeKind.Utc):O}");
+            $"mapCapabilities={_maps.Length}, expiresUtc={new DateTime(registration.expiresUtcTicks, DateTimeKind.Utc):O}");
     }
 
     public void UpdateConnectedPlayers(int connectedPlayers) =>
@@ -143,6 +145,65 @@ internal sealed class BackendGameServerDirectoryLease : IDisposable
             },
             cancellationToken);
     }
+
+    /// <summary>
+    /// Resolves the initial authoritative map set for this process from the Gateway. V1 keeps
+    /// assignment sticky for the life of the current owner lease and only activates maps owned
+    /// by this server ID, preventing duplicate Population/world simulation when generic workers
+    /// load the same world package. Dynamic activation/migration is intentionally a later layer.
+    /// </summary>
+    public IReadOnlyList<ServerMapSnapshot> ResolveInitialOwnedMaps(
+        ServerMapCatalog availableMaps,
+        CancellationToken cancellationToken)
+    {
+        if (availableMaps == null)
+            throw new ArgumentNullException(nameof(availableMaps));
+        if (!CanAdmitNewSessions)
+            throw new InvalidOperationException("GameServer directory lease is unavailable before initial map assignment.");
+
+        var owned = new List<ServerMapSnapshot>();
+        foreach (ServerMapSnapshot snapshot in availableMaps.Snapshots
+                     .Where(map => map != null && !string.IsNullOrWhiteSpace(map.mapId))
+                     .OrderBy(map => ServerMapId.Normalize(map.mapId), StringComparer.Ordinal)
+                     .ThenBy(map => (map.instanceId ?? string.Empty).Trim(), StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            BackendGameServerResolveMapResponse resolved = ResolveMapAsync(
+                    snapshot.mapId,
+                    snapshot.instanceId ?? string.Empty,
+                    cancellationToken)
+                .GetAwaiter()
+                .GetResult();
+
+            string mapId = ServerMapId.Normalize(snapshot.mapId);
+            string instanceId = (snapshot.instanceId ?? string.Empty).Trim();
+            if (resolved != null && resolved.success)
+            {
+                if (string.Equals(resolved.serverId, _options.ServerId, StringComparison.Ordinal))
+                {
+                    owned.Add(snapshot);
+                    Console.WriteLine(
+                        $"Initial authority assignment: map='{mapId}', instance='{DisplayInstance(instanceId)}' -> {_options.ServerId}");
+                }
+                else
+                {
+                    Console.WriteLine(
+                        $"Initial authority standby: map='{mapId}', instance='{DisplayInstance(instanceId)}' -> {resolved.serverId}");
+                }
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"Initial authority resolution unavailable for map='{mapId}', instance='{DisplayInstance(instanceId)}': " +
+                    $"{resolved?.error ?? "Gateway route unavailable"}");
+            }
+        }
+
+        return owned;
+    }
+
+    private static string DisplayInstance(string value) =>
+        string.IsNullOrWhiteSpace(value) ? "<default>" : value.Trim();
 
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
     {

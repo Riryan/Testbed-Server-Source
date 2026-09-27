@@ -109,9 +109,28 @@ internal sealed class GameServerRuntime : IDisposable
         bool requireMapData = false,
         string staffAuthorizationFile = "../Content/StaffAuthorizations.json",
         string staffAuditFile = "../Logs/StaffAudit.jsonl")
+        : this(
+            backendInternalUrl,
+            gameServerKey,
+            backendTimeout,
+            ServerMapDataLoader.LoadDirectory(mapDataDirectory, requireMapData),
+            requireMapData,
+            staffAuthorizationFile,
+            staffAuditFile)
+    {
+    }
+
+    public GameServerRuntime(
+        string backendInternalUrl,
+        string gameServerKey,
+        TimeSpan backendTimeout,
+        IReadOnlyList<ServerMapSnapshot> authoritativeMapSnapshots,
+        bool requireMapData,
+        string staffAuthorizationFile = "../Content/StaffAuthorizations.json",
+        string staffAuditFile = "../Logs/StaffAudit.jsonl")
     {
         Backend = new BackendInternalClient(backendInternalUrl, gameServerKey, backendTimeout);
-        Maps = new ServerMapCatalog(ServerMapDataLoader.LoadDirectory(mapDataDirectory, requireMapData));
+        Maps = new ServerMapCatalog(authoritativeMapSnapshots ?? Array.Empty<ServerMapSnapshot>());
         Spawns = new ServerSpawnService(Maps);
         Actors = new AuthoritativeActorRegistry();
         ActorContacts = new ActorContactService();
@@ -207,12 +226,13 @@ internal sealed class GameServerRuntime : IDisposable
     {
         CharacterSpawnDefinition configured = Content.Snapshot?.initialCharacterSpawn;
 
-        // Mapless mode remains available for isolated service/dev tests, but canonical
-        // character creation is deliberately unavailable until authoritative map data exists.
-        if (Maps.Count == 0 && !requireMapData)
+        // A clustered worker may be a valid live standby with zero currently assigned maps.
+        // Map-file presence was already validated before Gateway assignment when requireMapData
+        // is enabled, so zero active maps here means "not authoritative", not "missing bake".
+        if (Maps.Count == 0)
         {
             Console.WriteLine(
-                "First spawn readiness: no baked server maps are loaded; canonical character creation is disabled until map data is supplied.");
+                "First spawn readiness: this GameServer currently owns no authoritative maps; character creation is handled by the assigned map owner.");
             return;
         }
 
@@ -233,6 +253,13 @@ internal sealed class GameServerRuntime : IDisposable
         {
             throw new InvalidOperationException(
                 $"Canonical first-spawn readiness failed: initialCharacterSpawn is invalid: {ex.Message}", ex);
+        }
+
+        if (!Maps.TryGet(requested.MapId, requested.InstanceId, out _))
+        {
+            Console.WriteLine(
+                $"First spawn readiness: map '{requested.MapId}' instance '{DisplayInstance(requested.InstanceId)}' is not owned by this GameServer; validation is delegated to its authoritative owner.");
+            return;
         }
 
         if (!Spawns.TryResolveFirstSpawn(requested, out CharacterLocationState resolved, out string detail))

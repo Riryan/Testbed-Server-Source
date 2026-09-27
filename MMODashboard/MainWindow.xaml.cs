@@ -1,4 +1,5 @@
 using Microsoft.Win32;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
@@ -27,7 +28,8 @@ public partial class MainWindow : Window
     private bool _busy;
     private bool _initializing = true;
     private Process? _gatewayLauncher;
-    private Process? _gameLauncher;
+    private readonly ObservableCollection<GameServerInstanceConfig> _gameServerInstances = new();
+    private readonly IGameServerControlPlane _gameServerControl = new LocalGameServerControlPlane();
 
     private static readonly Brush Good = new SolidColorBrush(Color.FromRgb(0x3E, 0xD5, 0x98));
     private static readonly Brush Bad = new SolidColorBrush(Color.FromRgb(0xFF, 0x6B, 0x6B));
@@ -49,7 +51,7 @@ public partial class MainWindow : Window
 
         Loaded += MainWindow_Loaded;
         Closing += (_, _) => SaveConfiguration(silent: true);
-        Closed += (_, _) => { _statusTimer.Stop(); _adminWorkspace?.Dispose(); };
+        Closed += (_, _) => { _statusTimer.Stop(); _gameServerControl.Dispose(); _adminWorkspace?.Dispose(); };
     }
 
     private void FitInitialWindowToWorkArea()
@@ -77,6 +79,9 @@ public partial class MainWindow : Window
         if (!ConfigurationLooksComplete())
             AutoDetectPaths(logResult: false);
 
+        EnsureGameServerInstances();
+        BindGameServerInstances();
+
         if (!ConfigurationLooksComplete() || !RuntimeConfigurationExists())
             SetupExpander.IsExpanded = true;
 
@@ -102,6 +107,10 @@ public partial class MainWindow : Window
             BuildGameServerPathBox.Text = config.BuildGameServerBat ?? "";
             RunGatewayPathBox.Text = config.RunGatewayBat ?? "";
             RunGameServerPathBox.Text = config.RunGameServerBat ?? "";
+
+            _gameServerInstances.Clear();
+            foreach (GameServerInstanceConfig instance in config.GameServers ?? new List<GameServerInstanceConfig>())
+                _gameServerInstances.Add(instance.Clone());
         }
         catch (Exception ex)
         {
@@ -119,7 +128,8 @@ public partial class MainWindow : Window
                 BuildGatewayBat = BuildGatewayPathBox.Text.Trim(),
                 BuildGameServerBat = BuildGameServerPathBox.Text.Trim(),
                 RunGatewayBat = RunGatewayPathBox.Text.Trim(),
-                RunGameServerBat = RunGameServerPathBox.Text.Trim()
+                RunGameServerBat = RunGameServerPathBox.Text.Trim(),
+                GameServers = _gameServerInstances.Select(instance => instance.Clone()).ToList(),
             };
 
             File.WriteAllText(ConfigPath, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
@@ -235,12 +245,36 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
     private void RefreshRuntimeStatus()
     {
         var gatewayRunning = Process.GetProcessesByName("GatewayServer").Any();
-        var gameRunning = Process.GetProcessesByName("GameServer").Any();
-
         GatewayDot.Fill = gatewayRunning ? Good : Bad;
         GatewayStatus.Text = gatewayRunning ? "Running" : "Stopped";
-        GameDot.Fill = gameRunning ? Good : Bad;
-        GameStatus.Text = gameRunning ? "Running" : "Stopped";
+
+        int configured = _gameServerInstances.Count;
+        int running = 0;
+        foreach (GameServerInstanceConfig instance in _gameServerInstances)
+        {
+            if (_gameServerControl.GetStatus(instance.ServerId).Running)
+                running++;
+        }
+
+        int allNamedProcesses = 0;
+        try
+        {
+            Process[] processes = Process.GetProcessesByName("GameServer");
+            allNamedProcesses = processes.Length;
+            foreach (Process process in processes)
+                process.Dispose();
+        }
+        catch { }
+
+        int untracked = Math.Max(0, allNamedProcesses - running);
+        bool anyRunning = running > 0 || untracked > 0;
+        GameDot.Fill = anyRunning ? Good : Bad;
+        GameStatus.Text = untracked > 0
+            ? $"{running}/{configured} tracked running • {untracked} external"
+            : $"{running}/{configured} running";
+
+        GameServerInstanceCombo.Items.Refresh();
+        GameServerInstancesGrid.Items.Refresh();
     }
 
     private void SetBusy(bool busy, string activity = "Ready")
@@ -412,11 +446,24 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
         }
     }
 
-    private void StartGameServer()
+    private void StartGameServer(GameServerInstanceConfig? instance = null)
     {
-        if (Process.GetProcessesByName("GameServer").Any())
+        instance ??= GameServerInstanceCombo.SelectedItem as GameServerInstanceConfig;
+        if (instance == null)
         {
-            Append("GameServer is already running.", LogKind.Warning);
+            Append("Choose a GameServer instance first.", LogKind.Warning);
+            return;
+        }
+        if (!instance.Enabled)
+        {
+            Append($"{instance.Name} is disabled.", LogKind.Warning);
+            return;
+        }
+        if (!ValidateGameServerInstances(showMessage: true))
+            return;
+        if (_gameServerControl.GetStatus(instance.ServerId).Running)
+        {
+            Append($"{instance.Name} ({instance.ServerId}) is already running.", LogKind.Warning);
             return;
         }
         if (!RequireRuntimeConfiguration())
@@ -450,7 +497,11 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
             workingDirectory = Path.GetFullPath(workingDirectory);
 
             var arguments = new List<string>();
-            AddRuntimeArgument(arguments, "--port", GetRuntimeValue(runtimeConfig, "GAME_SERVER_PORT", "7777"));
+            AddRuntimeArgument(arguments, "--port", instance.Port.ToString());
+            AddRuntimeArgument(arguments, "--max-connections", instance.MaxConnections.ToString());
+            AddRuntimeArgument(arguments, "--server-id", instance.ServerId.Trim());
+            AddRuntimeArgument(arguments, "--advertise-host", instance.AdvertiseHost.Trim());
+            AddRuntimeArgument(arguments, "--advertise-port", instance.AdvertisePort.ToString());
             AddRuntimeArgument(arguments, "--connect-key", GetRuntimeValue(runtimeConfig, "GAME_SERVER_CONNECT_KEY", "SampleConnectKey"));
             AddRuntimeArgument(arguments, "--backend-internal", GetRuntimeValue(runtimeConfig, "GAME_SERVER_BACKEND_INTERNAL", "http://127.0.0.1:8444"));
             AddRuntimeArgument(arguments, "--backend-key-file", GetRuntimeValue(
@@ -458,9 +509,8 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
                 "GAME_SERVER_BACKEND_KEY_FILE",
                 Path.Combine(_paths.Root, "Data", "game-server-auth.key")));
 
-            AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_SERVER_ID", "--server-id");
-            AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_ADVERTISE_HOST", "--advertise-host");
-            AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_ADVERTISE_PORT", "--advertise-port");
+            // Shared content/runtime paths remain common to every GameServer instance.
+            // Instance identity and endpoint are intentionally supplied by the Dashboard.
             AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_MAP_DATA_DIR", "--map-data-dir");
             AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_STAFF_AUTH_FILE", "--staff-auth-file");
             AddOptionalRuntimeArgument(arguments, runtimeConfig, "GAME_SERVER_STAFF_AUDIT_FILE", "--staff-audit-file");
@@ -468,30 +518,31 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
             if (IsTruthy(GetRuntimeValue(runtimeConfig, "GAME_SERVER_REQUIRE_MAP_DATA", "0")))
                 arguments.Add("--require-map-data");
 
-            Append($"Starting GameServer.exe directly on UDP {GetRuntimeValue(runtimeConfig, "GAME_SERVER_PORT", "7777")}…", LogKind.Info);
-            _gameLauncher = BatchRunner.StartExecutable(
-                executable,
-                workingDirectory,
-                arguments,
-                (line, stderr) => Dispatcher.Invoke(() => AppendProcessLine("GameServer", line, stderr)),
+            string label = $"{instance.Name}/{instance.ServerId}";
+            Append($"Starting {label} on UDP {instance.Port}…", LogKind.Info);
+            bool started = _gameServerControl.Start(
+                instance,
+                new GameServerLaunchSpec(executable, workingDirectory, arguments),
+                (line, stderr) => Dispatcher.Invoke(() => AppendProcessLine(label, line, stderr)),
                 code => Dispatcher.Invoke(() =>
                 {
                     Append(
                         code == 0
-                            ? "GameServer exited normally with code 0."
-                            : $"GameServer exited with code {code}.",
+                            ? $"{label} exited normally with code 0."
+                            : $"{label} exited with code {code}.",
                         code == 0 ? LogKind.Info : LogKind.Error);
-                    _gameLauncher = null;
                     RefreshRuntimeStatus();
                 }));
 
-            if (_gameLauncher == null)
-                Append("GameServer.exe could not be started.", LogKind.Error);
+            if (!started)
+                Append($"{label} could not be started.", LogKind.Error);
         }
         catch (Exception ex)
         {
             Append($"GameServer failed to start: {ex.Message}", LogKind.Error);
         }
+
+        RefreshRuntimeStatus();
     }
 
     private static Dictionary<string, string> LoadRuntimeSetVariables(string configPath, string serverRoot)
@@ -586,12 +637,16 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
             return;
         }
 
-        if (!RequireRuntimeConfiguration()) return;
+        if (!RequireRuntimeConfiguration() || !ValidateGameServerInstances(showMessage: true)) return;
 
         StartGateway();
         await Task.Delay(1400);
-        StartGameServer();
-        await Task.Delay(800);
+        foreach (GameServerInstanceConfig instance in _gameServerInstances.Where(item => item.Enabled))
+        {
+            StartGameServer(instance);
+            await Task.Delay(250);
+        }
+        await Task.Delay(500);
         RefreshRuntimeStatus();
     }
 
@@ -614,30 +669,97 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
         RefreshRuntimeStatus();
     }
 
-    private void StopGameServer()
+    private void StopGameServer(GameServerInstanceConfig? instance = null)
     {
-        BatchRunner.TryKillTree(_gameLauncher);
-        _gameLauncher = null;
-        KillByName("GameServer");
-        Append("GameServer stop requested.", LogKind.Info);
+        instance ??= GameServerInstanceCombo.SelectedItem as GameServerInstanceConfig;
+        if (instance == null)
+        {
+            Append("Choose a GameServer instance first.", LogKind.Warning);
+            return;
+        }
+
+        bool stopped = _gameServerControl.Stop(instance.ServerId);
+        Append(
+            stopped
+                ? $"{instance.Name} ({instance.ServerId}) stop requested."
+                : $"{instance.Name} ({instance.ServerId}) is not tracked as a running local instance.",
+            stopped ? LogKind.Info : LogKind.Warning);
         RefreshRuntimeStatus();
     }
 
     private async Task StopAllAsync()
     {
-        if (_paths.StopServers is not null)
-        {
-            Append("Running StopServers.bat…", LogKind.Info);
-            await BatchRunner.RunAndWaitAsync(_paths.StopServers,
-                (line, stderr) => Dispatcher.Invoke(() => AppendProcessLine("Stop Servers", line, stderr)));
-        }
-        else
-        {
-            StopGameServer();
-            StopGateway();
-        }
+        _gameServerControl.StopAll();
+        Append("Tracked GameServer instances stop requested.", LogKind.Info);
+        StopGateway();
         await Task.Delay(500);
         RefreshRuntimeStatus();
+    }
+
+    private void EnsureGameServerInstances()
+    {
+        if (_gameServerInstances.Count > 0)
+            return;
+
+        _gameServerInstances.Add(new GameServerInstanceConfig
+        {
+            Name = "GameServer 01",
+            ServerId = "gameserver-01",
+            Port = 7777,
+            AdvertiseHost = "127.0.0.1",
+            AdvertisePort = 7777,
+            MaxConnections = 4096,
+            Enabled = true,
+        });
+        _gameServerInstances.Add(new GameServerInstanceConfig
+        {
+            Name = "GameServer 02",
+            ServerId = "gameserver-02",
+            Port = 7778,
+            AdvertiseHost = "127.0.0.1",
+            AdvertisePort = 7778,
+            MaxConnections = 4096,
+            Enabled = true,
+        });
+    }
+
+    private void BindGameServerInstances()
+    {
+        GameServerInstanceCombo.ItemsSource = _gameServerInstances;
+        GameServerInstancesGrid.ItemsSource = _gameServerInstances;
+        if (GameServerInstanceCombo.SelectedItem == null && _gameServerInstances.Count > 0)
+            GameServerInstanceCombo.SelectedIndex = 0;
+    }
+
+    private bool ValidateGameServerInstances(bool showMessage)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var ports = new HashSet<int>();
+        foreach (GameServerInstanceConfig instance in _gameServerInstances)
+        {
+            instance.Name = (instance.Name ?? string.Empty).Trim();
+            instance.ServerId = (instance.ServerId ?? string.Empty).Trim();
+            instance.AdvertiseHost = (instance.AdvertiseHost ?? string.Empty).Trim();
+
+            string? error = null;
+            if (instance.Name.Length == 0) error = "GameServer instance name is required.";
+            else if (instance.ServerId.Length == 0 || instance.ServerId.Length > 96) error = "GameServer serverId must be 1-96 characters.";
+            else if (!ids.Add(instance.ServerId)) error = $"Duplicate GameServer serverId: {instance.ServerId}.";
+            else if (instance.Port < 1 || instance.Port > 65535) error = $"{instance.ServerId} UDP port must be 1-65535.";
+            else if (!ports.Add(instance.Port)) error = $"Duplicate local GameServer UDP port: {instance.Port}.";
+            else if (instance.AdvertiseHost.Length == 0 || instance.AdvertiseHost.Length > 255) error = $"{instance.ServerId} advertise host is invalid.";
+            else if (instance.AdvertisePort < 1 || instance.AdvertisePort > 65535) error = $"{instance.ServerId} advertise port must be 1-65535.";
+            else if (instance.MaxConnections < 1 || instance.MaxConnections > 100000) error = $"{instance.ServerId} max connections must be 1-100000.";
+
+            if (error == null)
+                continue;
+
+            Append(error, LogKind.Error);
+            if (showMessage)
+                MessageBox.Show(this, error, "GameServer Instances", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
+        }
+        return true;
     }
 
     private void AutoDetectPaths(bool logResult = true)
@@ -732,6 +854,79 @@ set "GAME_SERVER_REQUIRE_MAP_DATA=0"
     private void RunGame_Click(object sender, RoutedEventArgs e) => StartGameServer();
     private void StopGateway_Click(object sender, RoutedEventArgs e) => StopGateway();
     private void StopGame_Click(object sender, RoutedEventArgs e) => StopGameServer();
+
+    private async void RunAllGames_Click(object sender, RoutedEventArgs e)
+    {
+        if (!RequireRuntimeConfiguration() || !ValidateGameServerInstances(showMessage: true)) return;
+        foreach (GameServerInstanceConfig instance in _gameServerInstances.Where(item => item.Enabled))
+        {
+            StartGameServer(instance);
+            await Task.Delay(250);
+        }
+        RefreshRuntimeStatus();
+    }
+
+    private void StopAllGames_Click(object sender, RoutedEventArgs e)
+    {
+        _gameServerControl.StopAll();
+        Append("Tracked GameServer instances stop requested.", LogKind.Info);
+        RefreshRuntimeStatus();
+    }
+
+    private void AddGameServerInstance_Click(object sender, RoutedEventArgs e)
+    {
+        int ordinal = 1;
+        var usedIds = new HashSet<string>(_gameServerInstances.Select(item => item.ServerId), StringComparer.OrdinalIgnoreCase);
+        var usedPorts = new HashSet<int>(_gameServerInstances.Select(item => item.Port));
+        while (usedIds.Contains($"gameserver-{ordinal:00}")) ordinal++;
+        int port = 7776 + ordinal;
+        while (usedPorts.Contains(port) && port < 65535) port++;
+        if (port > 65535)
+        {
+            MessageBox.Show(this, "No free UDP port is available for another local GameServer instance.", "MMO Dashboard", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var instance = new GameServerInstanceConfig
+        {
+            Name = $"GameServer {ordinal:00}",
+            ServerId = $"gameserver-{ordinal:00}",
+            Port = port,
+            AdvertiseHost = "127.0.0.1",
+            AdvertisePort = port,
+            MaxConnections = 4096,
+            Enabled = true,
+        };
+        _gameServerInstances.Add(instance);
+        GameServerInstancesGrid.SelectedItem = instance;
+        GameServerInstanceCombo.SelectedItem = instance;
+        RefreshRuntimeStatus();
+    }
+
+    private void RemoveGameServerInstance_Click(object sender, RoutedEventArgs e)
+    {
+        if (GameServerInstancesGrid.SelectedItem is not GameServerInstanceConfig instance) return;
+        if (_gameServerControl.GetStatus(instance.ServerId).Running)
+        {
+            MessageBox.Show(this, "Stop this GameServer instance before removing it.", "MMO Dashboard", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        _gameServerInstances.Remove(instance);
+        if (_gameServerInstances.Count == 0) EnsureGameServerInstances();
+        BindGameServerInstances();
+        RefreshRuntimeStatus();
+    }
+
+    private void SaveGameServerInstances_Click(object sender, RoutedEventArgs e)
+    {
+        GameServerInstancesGrid.CommitEdit(DataGridEditingUnit.Cell, true);
+        GameServerInstancesGrid.CommitEdit(DataGridEditingUnit.Row, true);
+        if (!ValidateGameServerInstances(showMessage: true)) return;
+        SaveConfiguration();
+        BindGameServerInstances();
+        RefreshRuntimeStatus();
+    }
+
     private async void StartAll_Click(object sender, RoutedEventArgs e) => await StartAllAsync();
     private async void StopAll_Click(object sender, RoutedEventArgs e) => await StopAllAsync();
     private void Clear_Click(object sender, RoutedEventArgs e) => LogBox.Document.Blocks.Clear();

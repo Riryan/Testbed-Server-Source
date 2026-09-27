@@ -33,6 +33,12 @@ internal sealed class GameServerDirectory
     private readonly object _gate = new object();
     private readonly Dictionary<string, Entry> _entries =
         new Dictionary<string, Entry>(StringComparer.Ordinal);
+    // Live authority assignments are intentionally separate from GameServer map capability.
+    // Multiple generic workers may load the same baked world package; only the worker selected
+    // here is the current authoritative owner of a map/instance partition. Assignments are
+    // ephemeral and are fenced by the owning GameServer's existing directory lease.
+    private readonly Dictionary<string, string> _assignments =
+        new Dictionary<string, string>(StringComparer.Ordinal);
 
     public GameServerDirectoryDiagnostics GetDiagnostics()
     {
@@ -42,18 +48,16 @@ internal sealed class GameServerDirectory
             RemoveExpiredLocked(now);
             int connectedPlayers = 0;
             int maxConnections = 0;
-            int mapPartitions = 0;
             foreach (Entry entry in _entries.Values)
             {
                 connectedPlayers = checked(connectedPlayers + Math.Max(0, entry.ConnectedPlayers));
                 maxConnections = checked(maxConnections + Math.Max(0, entry.MaxConnections));
-                mapPartitions = checked(mapPartitions + (entry.Maps?.Length ?? 0));
             }
             return new GameServerDirectoryDiagnostics(
                 _entries.Count,
                 connectedPlayers,
                 maxConnections,
-                mapPartitions);
+                _assignments.Count);
         }
     }
 
@@ -82,18 +86,13 @@ internal sealed class GameServerDirectory
         {
             RemoveExpiredLocked(now);
 
-            // One exact map+instance partition has one live authoritative owner. Multiple
-            // processes may host different instances of the same map, but two live server IDs
-            // are never allowed to claim the same partition simultaneously. This keeps the
-            // directory an ownership authority rather than a load-balancer over duplicate worlds.
-            if (HasPartitionConflictLocked(entry.ServerId, entry.Maps, out string conflict))
-                return RegisterFailed(conflict);
-
-            // Register is an explicit process-start/recovery operation. An authorized
-            // GameServer may replace its own stable server-ID record (for example after a
-            // Gateway restart/re-registration). Production deployments must assign unique
-            // stable server IDs to concurrently running processes.
+            // Registration advertises capability, not ownership. Generic GameServer workers
+            // are allowed to load the same baked map data. Resolve() creates one ephemeral
+            // authoritative assignment and keeps that assignment stable while its owner lease
+            // remains live. This removes the old startup conflict without creating duplicate
+            // authoritative ownership.
             _entries[entry.ServerId] = entry;
+            PruneInvalidAssignmentsLocked();
         }
 
         return new BackendGameServerRegisterResponse
@@ -170,6 +169,7 @@ internal sealed class GameServerDirectory
             }
 
             _entries.Remove(entry.ServerId);
+            RemoveAssignmentsOwnedByLocked(entry.ServerId);
             return new BackendGameServerUnregisterResponse
             {
                 success = true,
@@ -197,9 +197,26 @@ internal sealed class GameServerDirectory
             return ResolveFailed("invalid map partition");
 
         long now = DateTime.UtcNow.Ticks;
+        string partitionKey = MakePartitionKey(mapId, instanceId);
         lock (_gate)
         {
             RemoveExpiredLocked(now);
+
+            // Existing authority remains sticky for the lifetime of the owner's directory
+            // lease. Do not silently move a live partition merely because another worker is
+            // less loaded; deliberate live migration will use a later handoff protocol.
+            if (_assignments.TryGetValue(partitionKey, out string assignedServerId))
+            {
+                if (_entries.TryGetValue(assignedServerId, out Entry assigned) &&
+                    SupportsPartition(assigned, mapId, instanceId))
+                {
+                    if (assigned.MaxConnections <= 0 || assigned.ConnectedPlayers >= assigned.MaxConnections)
+                        return ResolveFailed($"authoritative GameServer '{assigned.ServerId}' is at capacity");
+                    return ToResolveResponse(assigned);
+                }
+
+                _assignments.Remove(partitionKey);
+            }
 
             Entry best = null;
             double bestLoad = double.MaxValue;
@@ -208,7 +225,7 @@ internal sealed class GameServerDirectory
             {
                 if (entry.MaxConnections <= 0 || entry.ConnectedPlayers >= entry.MaxConnections)
                     continue;
-                if (!OwnsPartition(entry, mapId, instanceId))
+                if (!SupportsPartition(entry, mapId, instanceId))
                     continue;
 
                 double load = (double)entry.ConnectedPlayers / entry.MaxConnections;
@@ -223,66 +240,33 @@ internal sealed class GameServerDirectory
             }
 
             if (best == null)
-                return ResolveFailed("no live GameServer owns the requested map partition");
+                return ResolveFailed("no live GameServer can host the requested map partition");
 
-            return new BackendGameServerResolveMapResponse
-            {
-                success = true,
-                serverId = best.ServerId,
-                advertiseHost = best.AdvertiseHost,
-                advertisePort = best.AdvertisePort,
-                connectedPlayers = best.ConnectedPlayers,
-                maxConnections = best.MaxConnections,
-                expiresUtcTicks = best.ExpiresUtcTicks,
-                error = string.Empty,
-            };
+            _assignments[partitionKey] = best.ServerId;
+            return ToResolveResponse(best);
         }
     }
 
-    private bool HasPartitionConflictLocked(
-        string registeringServerId,
-        BackendGameServerMapDto[] maps,
-        out string error)
-    {
-        maps ??= Array.Empty<BackendGameServerMapDto>();
-        foreach (Entry existing in _entries.Values)
+    private static BackendGameServerResolveMapResponse ToResolveResponse(Entry entry) =>
+        new BackendGameServerResolveMapResponse
         {
-            if (string.Equals(existing.ServerId, registeringServerId, StringComparison.Ordinal))
-                continue;
-
-            BackendGameServerMapDto[] existingMaps = existing.Maps ?? Array.Empty<BackendGameServerMapDto>();
-            for (int i = 0; i < maps.Length; ++i)
-            {
-                BackendGameServerMapDto requested = maps[i];
-                if (requested == null)
-                    continue;
-
-                for (int j = 0; j < existingMaps.Length; ++j)
-                {
-                    BackendGameServerMapDto owned = existingMaps[j];
-                    if (owned == null)
-                        continue;
-
-                    if (string.Equals(requested.mapId, owned.mapId, StringComparison.Ordinal) &&
-                        string.Equals(requested.instanceId ?? string.Empty, owned.instanceId ?? string.Empty, StringComparison.Ordinal))
-                    {
-                        error =
-                            $"map partition '{requested.mapId}' instance '{requested.instanceId ?? string.Empty}' " +
-                            $"is already owned by live GameServer '{existing.ServerId}'";
-                        return true;
-                    }
-                }
-            }
-        }
-
-        error = string.Empty;
-        return false;
-    }
+            success = true,
+            serverId = entry.ServerId,
+            advertiseHost = entry.AdvertiseHost,
+            advertisePort = entry.AdvertisePort,
+            connectedPlayers = entry.ConnectedPlayers,
+            maxConnections = entry.MaxConnections,
+            expiresUtcTicks = entry.ExpiresUtcTicks,
+            error = string.Empty,
+        };
 
     private void RemoveExpiredLocked(long now)
     {
         if (_entries.Count == 0)
+        {
+            _assignments.Clear();
             return;
+        }
 
         var expired = new List<string>();
         foreach (KeyValuePair<string, Entry> pair in _entries)
@@ -290,10 +274,49 @@ internal sealed class GameServerDirectory
                 expired.Add(pair.Key);
 
         for (int i = 0; i < expired.Count; ++i)
+        {
             _entries.Remove(expired[i]);
+            RemoveAssignmentsOwnedByLocked(expired[i]);
+        }
+
+        PruneInvalidAssignmentsLocked();
     }
 
-    private static bool OwnsPartition(Entry entry, string mapId, string instanceId)
+    private void RemoveAssignmentsOwnedByLocked(string serverId)
+    {
+        if (_assignments.Count == 0)
+            return;
+
+        var remove = new List<string>();
+        foreach (KeyValuePair<string, string> pair in _assignments)
+            if (string.Equals(pair.Value, serverId, StringComparison.Ordinal))
+                remove.Add(pair.Key);
+
+        for (int i = 0; i < remove.Count; ++i)
+            _assignments.Remove(remove[i]);
+    }
+
+    private void PruneInvalidAssignmentsLocked()
+    {
+        if (_assignments.Count == 0)
+            return;
+
+        var remove = new List<string>();
+        foreach (KeyValuePair<string, string> pair in _assignments)
+        {
+            if (!_entries.TryGetValue(pair.Value, out Entry entry) ||
+                !TrySplitPartitionKey(pair.Key, out string mapId, out string instanceId) ||
+                !SupportsPartition(entry, mapId, instanceId))
+            {
+                remove.Add(pair.Key);
+            }
+        }
+
+        for (int i = 0; i < remove.Count; ++i)
+            _assignments.Remove(remove[i]);
+    }
+
+    private static bool SupportsPartition(Entry entry, string mapId, string instanceId)
     {
         BackendGameServerMapDto[] maps = entry.Maps ?? Array.Empty<BackendGameServerMapDto>();
         for (int i = 0; i < maps.Length; ++i)
@@ -307,6 +330,23 @@ internal sealed class GameServerDirectory
             }
         }
         return false;
+    }
+
+    private static string MakePartitionKey(string mapId, string instanceId) =>
+        mapId + "\n" + (instanceId ?? string.Empty);
+
+    private static bool TrySplitPartitionKey(string key, out string mapId, out string instanceId)
+    {
+        int separator = (key ?? string.Empty).IndexOf('\n');
+        if (separator <= 0)
+        {
+            mapId = string.Empty;
+            instanceId = string.Empty;
+            return false;
+        }
+        mapId = key.Substring(0, separator);
+        instanceId = key.Substring(separator + 1);
+        return true;
     }
 
     private static BackendGameServerMapDto[] NormalizeMaps(BackendGameServerMapDto[] source)

@@ -164,17 +164,49 @@
                 <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                     <StackPanel>
-                        <TextBlock Text="GameServer" FontSize="20" FontWeight="SemiBold"/>
-                        <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                        <TextBlock Text="GameServers" FontSize="20" FontWeight="SemiBold"/>
+                        <StackPanel Orientation="Horizontal" Margin="0,7,0,0">
                             <Ellipse x:Name="GameDot" Width="10" Height="10" Fill="{StaticResource Red}" Margin="0,3,8,0"/>
-                            <TextBlock x:Name="GameStatus" Text="Stopped" Foreground="{StaticResource Muted}"/>
+                            <TextBlock x:Name="GameStatus" Text="0/0 running" Foreground="{StaticResource Muted}"/>
                         </StackPanel>
-                        <TextBlock x:Name="GameScriptText" Foreground="{StaticResource Muted}" Margin="0,8,0,0" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                        <ComboBox x:Name="GameServerInstanceCombo"
+                                  DisplayMemberPath="DisplayName"
+                                  Margin="0,8,0,0"
+                                  MinWidth="260"
+                                  Background="#F4F7FB"
+                                  Foreground="#0B1019"
+                                  BorderBrush="#7E8DA3">
+                            <ComboBox.ItemContainerStyle>
+                                <Style TargetType="ComboBoxItem">
+                                    <Setter Property="Background" Value="#F4F7FB"/>
+                                    <Setter Property="Foreground" Value="#0B1019"/>
+                                    <Setter Property="Padding" Value="8,5"/>
+                                    <Style.Triggers>
+                                        <Trigger Property="IsHighlighted" Value="True">
+                                            <Setter Property="Background" Value="#BFD7FF"/>
+                                            <Setter Property="Foreground" Value="#07111F"/>
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter Property="Background" Value="#8FC5FF"/>
+                                            <Setter Property="Foreground" Value="#07111F"/>
+                                            <Setter Property="FontWeight" Value="SemiBold"/>
+                                        </Trigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </ComboBox.ItemContainerStyle>
+                        </ComboBox>
+                        <TextBlock x:Name="GameScriptText" Foreground="{StaticResource Muted}" Margin="0,7,0,0" FontSize="11" TextTrimming="CharacterEllipsis"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                        <Button x:Name="BuildGameButton" Content="Build" Click="BuildGame_Click"/>
-                        <Button Content="Run" Click="RunGame_Click"/>
-                        <Button Content="Stop" Click="StopGame_Click" Background="#4A252B" BorderBrush="#6A333C"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="BuildGameButton" Content="Build" Click="BuildGame_Click"/>
+                            <Button Content="Run" Click="RunGame_Click"/>
+                            <Button Content="Stop" Click="StopGame_Click" Background="#4A252B" BorderBrush="#6A333C"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,7,0,0">
+                            <Button Content="Run All" Click="RunAllGames_Click" Padding="9,6"/>
+                            <Button Content="Stop All" Click="StopAllGames_Click" Padding="9,6" Background="#4A252B" BorderBrush="#6A333C"/>
+                        </StackPanel>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -274,6 +306,35 @@
                                         <DataGridTextColumn Header="Setting" Binding="{Binding Key}" IsReadOnly="True" Width="2*"/>
                                         <DataGridTextColumn Header="Value" Binding="{Binding Value, UpdateSourceTrigger=PropertyChanged}" Width="4*"/>
                                         <DataGridTextColumn Header="Type" Binding="{Binding Kind}" IsReadOnly="True" Width="1.5*"/>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </TabItem>
+
+                        <TabItem Header="GameServer Instances">
+                            <Grid Margin="8">
+                                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="Local GameServer workers" FontSize="16" FontWeight="SemiBold"/>
+                                        <TextBlock Text="One shared GameServer build; identity and local endpoint are per worker. World content remains shared." Foreground="{StaticResource Muted}" Margin="0,3,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                        <Button Content="Add" Click="AddGameServerInstance_Click"/>
+                                        <Button Content="Remove" Click="RemoveGameServerInstance_Click"/>
+                                        <Button Content="Save" Click="SaveGameServerInstances_Click" Background="#244A3B" BorderBrush="#32654F"/>
+                                    </StackPanel>
+                                </Grid>
+                                <DataGrid x:Name="GameServerInstancesGrid" Grid.Row="1" CanUserAddRows="False" AlternationCount="2" SelectionMode="Single">
+                                    <DataGrid.Columns>
+                                        <DataGridCheckBoxColumn Header="Enabled" Binding="{Binding Enabled, UpdateSourceTrigger=PropertyChanged}" Width="75"/>
+                                        <DataGridTextColumn Header="Name" Binding="{Binding Name, UpdateSourceTrigger=PropertyChanged}" Width="1.5*"/>
+                                        <DataGridTextColumn Header="Server ID" Binding="{Binding ServerId, UpdateSourceTrigger=PropertyChanged}" Width="1.8*"/>
+                                        <DataGridTextColumn Header="UDP Port" Binding="{Binding Port, UpdateSourceTrigger=PropertyChanged}" Width="95"/>
+                                        <DataGridTextColumn Header="Advertise Host" Binding="{Binding AdvertiseHost, UpdateSourceTrigger=PropertyChanged}" Width="1.5*"/>
+                                        <DataGridTextColumn Header="Advertise Port" Binding="{Binding AdvertisePort, UpdateSourceTrigger=PropertyChanged}" Width="110"/>
+                                        <DataGridTextColumn Header="Max CCU" Binding="{Binding MaxConnections, UpdateSourceTrigger=PropertyChanged}" Width="100"/>
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Grid>

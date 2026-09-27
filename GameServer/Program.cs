@@ -2,6 +2,9 @@
 using Game.GameServer.Backend;
 using Game.GameServer.Networking;
 using Game.GameServer.Runtime;
+using Game.Server.Application.World;
+using Game.Shared.World;
+using Game.UnityIntegration.Backend;
 
 namespace Game.GameServer;
 
@@ -16,10 +19,6 @@ internal static class Program
         try
         {
             GameServerOptions options = GameServerOptions.Parse(args);
-
-            // ConnectKey remains owned by the existing GameServerOptions/launcher contract.
-            // Do not introduce a second startup requirement here. The existing configured
-            // value is consumed by GameServerHost and must stay aligned with the client.
             string keyPath = Path.GetFullPath(options.BackendKeyFile, Environment.CurrentDirectory);
             if (!File.Exists(keyPath))
                 throw new FileNotFoundException("Backend game-server key was not found.", keyPath);
@@ -39,11 +38,31 @@ internal static class Program
             Console.CancelKeyPress += cancelHandler;
             AppDomain.CurrentDomain.ProcessExit += exitHandler;
 
+            // Every generic worker may load the same baked world package. Register that
+            // capability first, let Gateway establish the current authority assignment, then
+            // construct the expensive authoritative runtime from only the maps this worker owns.
+            IReadOnlyList<ServerMapSnapshot> availableSnapshots =
+                ServerMapDataLoader.LoadDirectory(options.MapDataDirectory, options.RequireMapData);
+            var availableMaps = new ServerMapCatalog(availableSnapshots);
+
+            using var directoryBackend = new BackendInternalClient(
+                options.BackendInternalBaseUrl,
+                gameServerKey,
+                TimeSpan.FromSeconds(8));
+            using var directoryLease = new BackendGameServerDirectoryLease(
+                directoryBackend,
+                options,
+                availableMaps);
+            directoryLease.Start(shutdown.Token);
+
+            IReadOnlyList<ServerMapSnapshot> authoritativeSnapshots =
+                directoryLease.ResolveInitialOwnedMaps(availableMaps, shutdown.Token);
+
             using var runtime = new GameServerRuntime(
                 options.BackendInternalBaseUrl,
                 gameServerKey,
                 TimeSpan.FromSeconds(8),
-                options.MapDataDirectory,
+                authoritativeSnapshots,
                 options.RequireMapData,
                 options.StaffAuthorizationFile,
                 options.StaffAuditFile);
@@ -52,11 +71,6 @@ internal static class Program
             // movement cutoff. Routed Population/NPC ActiveDistance remains unchanged.
             runtime.Population.FreeRoamActiveDistance = options.CombatPresentationRange;
 
-            using var directoryLease = new BackendGameServerDirectoryLease(
-                runtime.Backend,
-                options,
-                runtime.Maps);
-            directoryLease.Start(shutdown.Token);
             using var host = new GameServerHost(options, runtime, directoryLease);
 
             Console.WriteLine("GameServer starting...");
