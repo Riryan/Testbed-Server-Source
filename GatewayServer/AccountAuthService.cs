@@ -48,8 +48,6 @@ internal sealed class AccountAuthService
                 DatabaseWorkPriority.Normal,
                 db => db.PrepareAuthenticatedAccount(
                     accountId,
-                    account,
-                    _options.DevelopmentAdminAccount,
                     observation,
                     now),
                 out AccountPolicySnapshot policy) ||
@@ -113,8 +111,6 @@ internal sealed class AccountAuthService
                     db.TouchLastLogin(snapshot.AccountId, now);
                     return db.PrepareAuthenticatedAccount(
                         snapshot.AccountId,
-                        snapshot.Name,
-                        _options.DevelopmentAdminAccount,
                         observation,
                         now);
                 },

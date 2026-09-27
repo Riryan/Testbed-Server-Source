@@ -94,8 +94,6 @@ internal sealed partial class BackendDatabase
 
     public AccountPolicySnapshot PrepareAuthenticatedAccount(
         long accountId,
-        string accountName,
-        string developmentAdminAccount,
         AccountAccessObservation access,
         long utcNowTicks)
     {
@@ -109,26 +107,9 @@ internal sealed partial class BackendDatabase
             if (row == null)
                 return null;
 
-            string configuredAdmin = (developmentAdminAccount ?? string.Empty).Trim();
-            if (configuredAdmin.Length > 0 &&
-                string.Equals(
-                    AccountCredentialPolicy.NormalizeAccountKey(accountName ?? string.Empty),
-                    AccountCredentialPolicy.NormalizeAccountKey(configuredAdmin),
-                    StringComparison.Ordinal) &&
-                (AccountStaffRole)row.staffRole != AccountStaffRole.Admin)
-            {
-                row.staffRole = (byte)AccountStaffRole.Admin;
-                row.staffCapabilities = CapabilityBits(AccountStaffRole.Admin);
-                TouchPolicy(row, utcNowTicks);
-                conn.Update(row);
-                AppendAccountEvent(
-                    conn,
-                    accountId,
-                    accountId,
-                    "DevelopmentAdminBootstrap",
-                    "Configured development admin account promoted to Admin.",
-                    utcNowTicks);
-            }
+            // Staff/admin authority is persisted account policy. Authentication must never
+            // promote an account based on its name or startup configuration. Existing persisted
+            // staff roles remain intact and continue through normal policy normalization.
 
             row = NormalizePolicyForTime(conn, row, utcNowTicks);
             RecordAccountAccess(conn, accountId, access, utcNowTicks);

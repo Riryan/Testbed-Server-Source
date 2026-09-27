@@ -26,9 +26,6 @@ options.Validate();
 if (builder.Environment.IsEnvironment("LoadTest"))
     Console.WriteLine("WARNING: LOAD-TEST authentication limits are active. Do not use this environment for public production deployment.");
 
-if (!string.IsNullOrWhiteSpace(options.DevelopmentAdminAccount))
-    Console.WriteLine($"WARNING: DEVELOPMENT ADMIN BOOTSTRAP is active for '{options.DevelopmentAdminAccount}'. Clear GatewayServer:DevelopmentAdminAccount before production.");
-
 string contentRoot = builder.Environment.ContentRootPath;
 string databasePath = PathUtility.Resolve(contentRoot, options.DatabasePath);
 string gameplayContentPath = PathUtility.Resolve(contentRoot, options.ContentDefinitionsPath);

@@ -35,19 +35,23 @@ internal static class PrivateFilePermissions
     [SupportedOSPlatform("windows")]
     private static void RestrictWindowsOwnerOnly(string path)
     {
-        SecurityIdentifier owner = WindowsIdentity.GetCurrent().User
-            ?? throw new InvalidOperationException("Current Windows identity has no security identifier.");
+        // Preserve the file owner. Setting ownership requires WRITE_OWNER and can fail for a
+        // correctly non-elevated Gateway even when that process is allowed to protect the DACL.
+        // Restrict the existing ACL instead of trying to take ownership.
+        var file = new FileInfo(path);
+        FileSecurity security = file.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+        SecurityIdentifier owner = (SecurityIdentifier)security.GetOwner(typeof(SecurityIdentifier));
 
-        var security = new FileSecurity();
-        security.SetOwner(owner);
         security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-        security.AddAccessRule(new FileSystemAccessRule(
+        security.SetAccessRule(new FileSystemAccessRule(
             owner,
             FileSystemRights.FullControl,
             InheritanceFlags.None,
             PropagationFlags.None,
             AccessControlType.Allow));
 
-        new FileInfo(path).SetAccessControl(security);
+        // Keep the existing owner and grant that owner explicit control after inherited access is
+        // removed. This changes the DACL only; it does not require WRITE_OWNER/elevation.
+        file.SetAccessControl(security);
     }
 }
