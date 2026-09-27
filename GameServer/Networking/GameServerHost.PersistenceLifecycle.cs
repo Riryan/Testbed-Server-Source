@@ -328,6 +328,13 @@ internal sealed partial class GameServerHost
         if (!_runtime.SessionService.TryGetSession(handle, out PlayerSession session))
             return;
 
+        // INTENTIONAL ARCHITECTURE: do not add a retry-count/backlog admission cap here.
+        // Gateway is the admission authority, so a Gateway/persistence outage already stops
+        // new admission upstream. Retained disconnected runtimes are bounded by characters
+        // admitted (or already in flight) when the outage began. While this exact session
+        // still owns its fenced lease, retaining the dirty runtime and retrying the final save
+        // is the data-safety contract. Revisit only if profiling demonstrates this bounded set
+        // itself is a capacity problem.
         PlayerRuntime runtime = session.Runtime;
         if (runtime == null)
         {

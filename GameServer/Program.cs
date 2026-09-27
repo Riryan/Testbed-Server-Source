@@ -16,6 +16,13 @@ internal static class Program
         try
         {
             GameServerOptions options = GameServerOptions.Parse(args);
+
+            // ConnectKey is deployment configuration. Never run with the shipped sample,
+            // and never generate, rotate, or replace the operator-supplied key here.
+            if (string.IsNullOrWhiteSpace(options.ConnectKey) ||
+                string.Equals(options.ConnectKey, "SampleConnectKey", StringComparison.Ordinal))
+                throw new InvalidOperationException("A non-sample --connect-key must be explicitly supplied.");
+
             string keyPath = Path.GetFullPath(options.BackendKeyFile, Environment.CurrentDirectory);
             if (!File.Exists(keyPath))
                 throw new FileNotFoundException("Backend game-server key was not found.", keyPath);

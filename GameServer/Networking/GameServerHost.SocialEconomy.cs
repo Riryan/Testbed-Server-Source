@@ -643,6 +643,10 @@ internal sealed partial class GameServerHost
         _ownerLiveInterestsByCharacter.Remove(characterId);
         _storageAccessByCharacter.Remove(characterId);
         _socialEconomy?.CancelForCharacter(characterId);
+        // GuildService owns only a reloadable runtime cache/invite state here; durable guild
+        // membership remains repository-owned. Releasing on the existing disconnect lifecycle
+        // prevents disconnected characters from being retained without adding any wire traffic.
+        _guildService?.ReleaseCharacter(characterId);
         PublishFriendPresenceToInterestedOwners(characterId);
     }
 }
