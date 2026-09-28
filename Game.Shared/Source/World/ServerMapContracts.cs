@@ -274,6 +274,10 @@ namespace Game.Shared.World
         [DataMember(Name = "actorKind")] public AuthoritativeActorKind actorKind;
         [DataMember(Name = "archetypeId")] public string archetypeId = string.Empty;
         [DataMember(Name = "deathLootTableId")] public string deathLootTableId = string.Empty;
+        // Killed-actor respawn delay. This timer starts only after DeadDecay has
+        // completed and the previous corpse has been removed.
+        [DataMember(Name = "minimumRespawnDelay")] public float minimumRespawnDelay = 8f;
+        [DataMember(Name = "maximumRespawnDelay")] public float maximumRespawnDelay = 20f;
         [DataMember(Name = "pose")] public ServerPose pose;
         [DataMember(Name = "priority")] public int priority;
         [DataMember(Name = "enabled")] public bool enabled = true;

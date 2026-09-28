@@ -78,6 +78,14 @@ internal static class ServerMapDataLoader
                 throw new InvalidDataException($"Server map '{manifestPath}' spawn '{SpawnLabel(anchor)}' has invalid capsule/ground-snap settings.");
             }
 
+            if (!IsFinite(anchor.minimumRespawnDelay) || anchor.minimumRespawnDelay < 0f ||
+                !IsFinite(anchor.maximumRespawnDelay) || anchor.maximumRespawnDelay < anchor.minimumRespawnDelay)
+            {
+                throw new InvalidDataException(
+                    $"Server map '{manifestPath}' spawn '{SpawnLabel(anchor)}' has invalid respawn delay settings. " +
+                    "Expected 0 <= minimumRespawnDelay <= maximumRespawnDelay.");
+            }
+
             if (IsPlayerSpawnKind(anchor.kind) && anchor.actorKind != AuthoritativeActorKind.Player)
             {
                 throw new InvalidDataException(

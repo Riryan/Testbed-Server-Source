@@ -148,6 +148,9 @@ namespace Game.Server.Application.Population
         private readonly List<PopulationActorRuntime> _populationSchedule = new List<PopulationActorRuntime>();
         private readonly MinPriorityQueue<PopulationScheduleEntry, double> _dueSchedule =
             new MinPriorityQueue<PopulationScheduleEntry, double>();
+        // Generic killed-actor respawn deadlines share the existing Population due queue.
+        // No second polling loop or network message is introduced.
+        private readonly Random _respawnRandom = new Random();
         private const float PlayerSpatialCellSize = 64f;
         private const float HibernationCellSize = 96f;
 
@@ -155,11 +158,25 @@ namespace Game.Server.Application.Population
         {
             public readonly PopulationActorRuntime Actor;
             public readonly uint Version;
+            public readonly MapGraph RespawnGraph;
+            public readonly ServerSpawnAnchor RespawnAnchor;
+
+            public bool IsRespawn => RespawnAnchor != null;
 
             public PopulationScheduleEntry(PopulationActorRuntime actor, uint version)
             {
                 Actor = actor;
                 Version = version;
+                RespawnGraph = null;
+                RespawnAnchor = null;
+            }
+
+            public PopulationScheduleEntry(MapGraph graph, ServerSpawnAnchor respawnAnchor)
+            {
+                Actor = null;
+                Version = 0;
+                RespawnGraph = graph;
+                RespawnAnchor = respawnAnchor;
             }
         }
 
@@ -270,10 +287,11 @@ namespace Game.Server.Application.Population
 
         public void Tick(float fixedDelta, double now, IReadOnlyList<PopulationPlayerView> players)
         {
-            if (_populationSchedule.Count == 0 || fixedDelta <= 0f)
+            if (fixedDelta <= 0f)
                 return;
 
-            TickBudgeted(fixedDelta, now, players, _populationSchedule.Count);
+            // A spawn anchor can have a pending respawn while no live actor remains.
+            TickBudgeted(fixedDelta, now, players, Math.Max(1, _populationSchedule.Count));
         }
 
         /// <summary>
@@ -287,17 +305,15 @@ namespace Game.Server.Application.Population
             IReadOnlyList<PopulationPlayerView> players,
             int maxActors)
         {
-            if (fixedDelta <= 0f || _populationSchedule.Count == 0 || maxActors <= 0)
+            if (fixedDelta <= 0f || maxActors <= 0)
                 return 0;
 
             PrepareBudgetedTick(players, now);
             int processed = 0;
-            int toProcess = Math.Min(maxActors, _populationSchedule.Count);
-            while (processed < toProcess && TickNextBudgeted(fixedDelta, now))
+            while (processed < maxActors && TickNextBudgeted(fixedDelta, now))
                 processed++;
             return processed;
         }
-
         /// <summary>
         /// Prepares the observer/partition cache once for a scheduler AI tick. The host then
         /// calls TickNextBudgeted one actor at a time so the core scheduler can enforce its
@@ -333,7 +349,7 @@ namespace Game.Server.Application.Population
 
         public bool TickNextBudgeted(float fixedDelta, double now)
         {
-            if (fixedDelta <= 0f || _populationSchedule.Count == 0)
+            if (fixedDelta <= 0f)
                 return false;
 
             PruneStaleScheduleHeads();
@@ -342,6 +358,13 @@ namespace Game.Server.Application.Population
                 return false;
 
             _dueSchedule.Dequeue();
+
+            if (scheduled.IsRespawn)
+            {
+                ProcessScheduledRespawn(scheduled.RespawnGraph, scheduled.RespawnAnchor, now);
+                return true;
+            }
+
             PopulationActorRuntime pop = scheduled.Actor;
             if (pop == null || pop.Actor == null || scheduled.Version != pop.ScheduleVersion)
                 return true;
@@ -350,6 +373,8 @@ namespace Game.Server.Application.Population
             if (dead && pop.DeadDecayAt > 0d && now >= pop.DeadDecayAt)
             {
                 RemovePopulation(pop);
+                // The respawn min/max window starts only after DeadDecay removes the corpse.
+                ScheduleRespawnAfterDecay(pop, now);
                 return true;
             }
 
@@ -361,14 +386,16 @@ namespace Game.Server.Application.Population
             IReadOnlyList<PopulationPlayerView> partitionPlayers = GetPartitionPlayers(pop.Actor);
             TickActor(pop, actorDelta, now, partitionPlayers);
 
-            if (pop.AwaitingPlayerActivation)
-                return true;
-
+            // Death/corpse deadlines must be armed even if this actor was AOI-hibernated.
             if (!pop.Actor.Alive || pop.AiState == PopulationAiState.Dead)
             {
                 if (pop.DeadDecayAt <= 0d)
                     pop.DeadDecayAt = now + Math.Max(1d, DeadDecaySeconds);
                 Schedule(pop, pop.DeadDecayAt);
+            }
+            else if (pop.AwaitingPlayerActivation)
+            {
+                return true;
             }
             else if (pop.AiState == PopulationAiState.PortalDormant && pop.DormantUntil > now)
             {
@@ -385,6 +412,9 @@ namespace Game.Server.Application.Population
         {
             while (_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out _))
             {
+                if (scheduled.IsRespawn)
+                    return;
+
                 PopulationActorRuntime pop = scheduled.Actor;
                 if (pop != null && pop.Actor != null && scheduled.Version == pop.ScheduleVersion)
                     return;
@@ -402,6 +432,77 @@ namespace Game.Server.Application.Population
         }
 
         private void ScheduleNow(PopulationActorRuntime pop, double now) => Schedule(pop, now);
+
+        private void ScheduleRespawnAfterDecay(PopulationActorRuntime removed, double now)
+        {
+            if (removed?.Actor == null || removed.SpawnAnchorId <= 0)
+                return;
+            if (!TryGetGraph(removed.Actor, out MapGraph graph))
+                return;
+
+            ServerSpawnAnchor anchor = FindSpawnAnchor(graph, removed.SpawnAnchorId);
+            if (anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
+                return;
+
+            double minimum = Math.Max(0d, anchor.minimumRespawnDelay);
+            double maximum = Math.Max(minimum, anchor.maximumRespawnDelay);
+            double delay = minimum;
+            if (maximum > minimum + 0.000001d)
+                delay += (maximum - minimum) * _respawnRandom.NextDouble();
+
+            _dueSchedule.Enqueue(
+                new PopulationScheduleEntry(graph, anchor),
+                now + delay);
+        }
+
+        private void ProcessScheduledRespawn(MapGraph graph, ServerSpawnAnchor anchor, double now)
+        {
+            if (graph == null || anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
+                return;
+
+            // One authored spawn anchor owns one live shared-AI actor at a time.
+            if (HasActorFromSpawnAnchor(graph, anchor.stableId))
+                return;
+
+            if (TrySpawnFromAnchor(graph, anchor, now, distributeStartup: false, out _))
+                return;
+
+            // A temporarily obstructed spawn remains pending and retries at the existing
+            // dormant cadence instead of introducing a dedicated spawner polling loop.
+            _dueSchedule.Enqueue(
+                new PopulationScheduleEntry(graph, anchor),
+                now + Math.Max(0.25d, DormantCadenceSeconds));
+        }
+
+        private bool HasActorFromSpawnAnchor(MapGraph graph, long spawnAnchorId)
+        {
+            if (graph == null || spawnAnchorId <= 0)
+                return false;
+
+            foreach (PopulationActorRuntime pop in _population.Values)
+            {
+                if (pop?.Actor == null || pop.SpawnAnchorId != spawnAnchorId)
+                    continue;
+                if (string.Equals(pop.Actor.MapId, graph.Map.mapId, StringComparison.Ordinal) &&
+                    string.Equals(pop.Actor.InstanceId, graph.Map.instanceId, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static ServerSpawnAnchor FindSpawnAnchor(MapGraph graph, long stableId)
+        {
+            ServerSpawnAnchor[] anchors = graph?.Map?.spawnAnchors ?? Array.Empty<ServerSpawnAnchor>();
+            for (int i = 0; i < anchors.Length; ++i)
+            {
+                ServerSpawnAnchor anchor = anchors[i];
+                if (anchor != null && anchor.stableId == stableId)
+                    return anchor;
+            }
+            return null;
+        }
 
         private double GetSimulationCadence(PopulationActorRuntime pop)
         {
@@ -423,9 +524,8 @@ namespace Game.Server.Application.Population
         {
             float nearestPlayerSq = UpdateSimulationLod(pop);
 
-            // Canonical Population death is terminal for normal simulation until an explicit
-            // future decay/respawn policy changes it. Do not let dormant/logical route ticking
-            // overwrite Dead movement state and make a defeated Pop appear to respawn.
+            // Death is terminal for this actor identity. DeadDecay removes the corpse; any
+            // later replacement is a fresh actor created by the owning spawn anchor.
             if (!pop.Actor.Alive || pop.AiState == PopulationAiState.Dead)
             {
                 pop.Actor.MovementMode = ActorMovementMode.Dead;
@@ -597,7 +697,6 @@ namespace Game.Server.Application.Population
         {
             if (!_population.TryGetValue(populationActorId, out PopulationActorRuntime pop) || !pop.Actor.Alive)
                 return false;
-
             if (pop.AwaitingPlayerActivation)
                 WakeImmediately(pop, now, catchUp: true);
 
@@ -777,110 +876,119 @@ namespace Game.Server.Application.Population
             {
                 ServerSpawnAnchor[] anchors = graph.Map.spawnAnchors ?? Array.Empty<ServerSpawnAnchor>();
                 for (int i = 0; i < anchors.Length; ++i)
-                {
-                    ServerSpawnAnchor anchor = anchors[i];
-                    if (anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
-                        continue;
-                    if (!TryResolveSpawn(graph, anchor, out ServerPose spawnPose))
-                        continue;
-
-                    SharedAiMovementMode movementBehavior = ResolveMovementBehavior(graph, anchor);
-                    PopulationNpcType npcType = InferNpcType(anchor.archetypeId);
-                    PopulationBehaviorProfileData profile = DefaultProfile(npcType, anchor.kind);
-                    string displayName = string.IsNullOrWhiteSpace(anchor.label)
-                        ? $"{anchor.kind} {anchor.stableId}"
-                        : anchor.label;
-
-                    // Population/NPC/Monster are intentionally the same lightweight authoritative
-                    // actor family. SpawnKind + MovementBehavior select their AI; keeping the
-                    // canonical Population actor kind preserves the existing presentation,
-                    // interaction, combat-promotion, loot, AOI and replication paths.
-                    AuthoritativeActorRuntime actor = _actors.Create(
-                        AuthoritativeActorKind.Population,
-                        anchor.archetypeId,
-                        displayName,
-                        profile.faction,
-                        graph.Map.mapId,
-                        graph.Map.instanceId,
-                        spawnPose.ToWorldPosition(),
-                        spawnPose.yaw,
-                        100,
-                        profile.weightClass);
-
-                    float capsuleRadius = Math.Max(0.2f, anchor.capsuleRadius);
-                    float capsuleHeight = Math.Max(anchor.capsuleHeight, capsuleRadius * 2f);
-                    var motorSettings = new CharacterMotorSettings
-                    {
-                        Radius = capsuleRadius,
-                        Height = capsuleHeight,
-                        WalkSpeed = profile.walkSpeed,
-                        SprintSpeed = profile.runSpeed,
-                    };
-                    var pop = new PopulationActorRuntime
-                    {
-                        Actor = actor,
-                        NpcType = npcType,
-                        SpawnKind = anchor.kind,
-                        MovementBehavior = movementBehavior,
-                        SimulationLod = PopulationSimulationLod.CoarseRoute,
-                        AiState = movementBehavior == SharedAiMovementMode.Route
-                            ? PopulationAiState.FollowingRoute
-                            : PopulationAiState.Idle,
-                        RouteReason = PopulationRouteReason.Wander,
-                        WalkSpeed = profile.walkSpeed * DeterministicVariation(anchor.stableId, 0.88f, 1.12f),
-                        RunSpeed = profile.runSpeed,
-                        Aggression = Math.Clamp(profile.aggression, 0f, 1f),
-                        Courage = Math.Clamp(profile.courage, 0f, 1f),
-                        CombatSkill = Math.Clamp(profile.combatSkill, 0f, 1f),
-                        SpawnAnchorId = anchor.stableId,
-                        DeathLootTableId = anchor.deathLootTableId ?? string.Empty,
-                        Motor = new ServerCharacterMotor(motorSettings),
-                        MotorState = new CharacterMotorState(spawnPose.ToWorldPosition()),
-                        Random = new Random(unchecked((int)(anchor.stableId ^ (anchor.stableId >> 32) ^ 0x51F15EED))),
-                        LastProgressAt = 0d,
-                        LastProgressPosition = spawnPose.ToWorldPosition(),
-                        HomePosition = spawnPose.ToWorldPosition(),
-                        RoamRadius = Math.Max(2f, DefaultFreeRoamRadius),
-                        LeashRadius = Math.Max(Math.Max(2f, DefaultFreeRoamRadius) + 1f, DefaultFreeRoamLeashRadius),
-                        CapsuleRadius = capsuleRadius,
-                        CapsuleHeight = capsuleHeight,
-                    };
-
-                    pop.CurrentNodeId = movementBehavior == SharedAiMovementMode.Route
-                        ? (anchor.routeNodeId > 0 && graph.Nodes.ContainsKey(anchor.routeNodeId)
-                            ? anchor.routeNodeId
-                            : FindNearestNode(graph, spawnPose.ToWorldPosition()))
-                        : 0;
-
-                    _population.Add(actor.Handle.actorId, pop);
-                    _populationSchedule.Add(pop);
-
-                    if (anchor.portalId > 0 &&
-                        graph.Portals.TryGetValue(anchor.portalId, out ServerPopulationPortal initialPortal) &&
-                        initialPortal.mode != PopulationPortalMode.DespawnOnly &&
-                        PortalAllows(initialPortal, pop.NpcType))
-                    {
-                        pop.LastPortalId = initialPortal.stableId;
-                        pop.AiState = PopulationAiState.PortalDormant;
-                        pop.SimulationLod = PopulationSimulationLod.Dormant;
-                        if (pop.MovementBehavior == SharedAiMovementMode.Route)
-                            pop.CurrentNodeId = initialPortal.routeNodeId > 0 ? initialPortal.routeNodeId : pop.CurrentNodeId;
-                        pop.Actor.Position = initialPortal.interiorSpawn.ToWorldPosition();
-                        pop.Actor.LastSafePosition = pop.Actor.Position;
-                        pop.MotorState = new CharacterMotorState(pop.Actor.Position);
-                        pop.DormantUntil = 0d;
-                        ParkForPlayerActivation(pop, initialPortal.exterior.ToWorldPosition(), 0d);
-                    }
-                    else
-                    {
-                        if (pop.MovementBehavior == SharedAiMovementMode.Route)
-                            OrganicStartupDistribution(graph, pop, false);
-                        EnterAoiHibernate(pop, 0d);
-                    }
-
-                    Added?.Invoke(pop);
-                }
+                    TrySpawnFromAnchor(graph, anchors[i], 0d, distributeStartup: true, out _);
             }
+        }
+
+        private bool TrySpawnFromAnchor(
+            MapGraph graph,
+            ServerSpawnAnchor anchor,
+            double now,
+            bool distributeStartup,
+            out PopulationActorRuntime pop)
+        {
+            pop = null;
+            if (graph == null || anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
+                return false;
+            if (!TryResolveSpawn(graph, anchor, out ServerPose spawnPose))
+                return false;
+
+            SharedAiMovementMode movementBehavior = ResolveMovementBehavior(graph, anchor);
+            PopulationNpcType npcType = InferNpcType(anchor.archetypeId);
+            PopulationBehaviorProfileData profile = DefaultProfile(npcType, anchor.kind);
+            string displayName = string.IsNullOrWhiteSpace(anchor.label)
+                ? $"{anchor.kind} {anchor.stableId}"
+                : anchor.label;
+
+            // Reuse the existing canonical lightweight non-player actor family. A respawn is
+            // a fresh registry Create, so stale target handles cannot bind to the replacement.
+            AuthoritativeActorRuntime actor = _actors.Create(
+                AuthoritativeActorKind.Population,
+                anchor.archetypeId,
+                displayName,
+                profile.faction,
+                graph.Map.mapId,
+                graph.Map.instanceId,
+                spawnPose.ToWorldPosition(),
+                spawnPose.yaw,
+                100,
+                profile.weightClass);
+
+            float capsuleRadius = Math.Max(0.2f, anchor.capsuleRadius);
+            float capsuleHeight = Math.Max(anchor.capsuleHeight, capsuleRadius * 2f);
+            var motorSettings = new CharacterMotorSettings
+            {
+                Radius = capsuleRadius,
+                Height = capsuleHeight,
+                WalkSpeed = profile.walkSpeed,
+                SprintSpeed = profile.runSpeed,
+            };
+            pop = new PopulationActorRuntime
+            {
+                Actor = actor,
+                NpcType = npcType,
+                SpawnKind = anchor.kind,
+                MovementBehavior = movementBehavior,
+                SimulationLod = PopulationSimulationLod.CoarseRoute,
+                AiState = movementBehavior == SharedAiMovementMode.Route
+                    ? PopulationAiState.FollowingRoute
+                    : PopulationAiState.Idle,
+                RouteReason = PopulationRouteReason.Wander,
+                WalkSpeed = profile.walkSpeed * DeterministicVariation(anchor.stableId, 0.88f, 1.12f),
+                RunSpeed = profile.runSpeed,
+                Aggression = Math.Clamp(profile.aggression, 0f, 1f),
+                Courage = Math.Clamp(profile.courage, 0f, 1f),
+                CombatSkill = Math.Clamp(profile.combatSkill, 0f, 1f),
+                SpawnAnchorId = anchor.stableId,
+                DeathLootTableId = anchor.deathLootTableId ?? string.Empty,
+                Motor = new ServerCharacterMotor(motorSettings),
+                MotorState = new CharacterMotorState(spawnPose.ToWorldPosition()),
+                Random = new Random(unchecked((int)(anchor.stableId ^ (anchor.stableId >> 32) ^ 0x51F15EED))),
+                LastProgressAt = now,
+                LastProgressPosition = spawnPose.ToWorldPosition(),
+                HomePosition = spawnPose.ToWorldPosition(),
+                RoamRadius = Math.Max(2f, DefaultFreeRoamRadius),
+                LeashRadius = Math.Max(Math.Max(2f, DefaultFreeRoamRadius) + 1f, DefaultFreeRoamLeashRadius),
+                CapsuleRadius = capsuleRadius,
+                CapsuleHeight = capsuleHeight,
+            };
+
+            pop.CurrentNodeId = movementBehavior == SharedAiMovementMode.Route
+                ? (anchor.routeNodeId > 0 && graph.Nodes.ContainsKey(anchor.routeNodeId)
+                    ? anchor.routeNodeId
+                    : FindNearestNode(graph, spawnPose.ToWorldPosition()))
+                : 0;
+
+            _population.Add(actor.Handle.actorId, pop);
+            _populationSchedule.Add(pop);
+
+            if (anchor.portalId > 0 &&
+                graph.Portals.TryGetValue(anchor.portalId, out ServerPopulationPortal initialPortal) &&
+                initialPortal.mode != PopulationPortalMode.DespawnOnly &&
+                PortalAllows(initialPortal, pop.NpcType))
+            {
+                pop.LastPortalId = initialPortal.stableId;
+                pop.AiState = PopulationAiState.PortalDormant;
+                pop.SimulationLod = PopulationSimulationLod.Dormant;
+                if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                    pop.CurrentNodeId = initialPortal.routeNodeId > 0 ? initialPortal.routeNodeId : pop.CurrentNodeId;
+                pop.Actor.Position = initialPortal.interiorSpawn.ToWorldPosition();
+                pop.Actor.LastSafePosition = pop.Actor.Position;
+                pop.MotorState = new CharacterMotorState(pop.Actor.Position);
+                pop.DormantUntil = 0d;
+                ParkForPlayerActivation(pop, initialPortal.exterior.ToWorldPosition(), now);
+            }
+            else
+            {
+                // Organic route distribution remains startup-only. A killed actor returns at its
+                // actual authored spawner after the post-corpse respawn delay.
+                if (distributeStartup && pop.MovementBehavior == SharedAiMovementMode.Route)
+                    OrganicStartupDistribution(graph, pop, false);
+                EnterAoiHibernate(pop, now);
+            }
+
+            Added?.Invoke(pop);
+            return true;
         }
 
         private static bool IsSharedAiSpawnKind(ServerSpawnKind kind) =>
@@ -1197,8 +1305,7 @@ namespace Game.Server.Application.Population
                 pop.Actor.YawDegrees = yaw;
                 pop.Actor.MovementMode = ActorMovementMode.Grounded;
                 pop.Actor.VelocityX = 0f;
-                pop.Actor.VelocityY = 0f;
-                pop.Actor.VelocityZ = 0f;
+                pop.Actor.VelocityY = 0f;                pop.Actor.VelocityZ = 0f;
                 _actors.PublishChanged(pop.Actor);
                 Changed?.Invoke(pop);
             }
@@ -1497,8 +1604,7 @@ namespace Game.Server.Application.Population
         }
 
         private bool PortalSpawnClear(MapGraph graph, ServerPopulationPortal portal, PopulationActorRuntime pop, IReadOnlyList<PopulationPlayerView> players)
-        {
-            WorldPosition exterior = portal.exterior.ToWorldPosition();
+        {            WorldPosition exterior = portal.exterior.ToWorldPosition();
             float radius = Math.Max(0.2f, portal.exitClearanceRadius);
             if (graph.Collision != null)
             {
@@ -1797,8 +1903,7 @@ namespace Game.Server.Application.Population
             float activationSq = activation * activation;
 
             foreach (KeyValuePair<string, PlayerSpatialPartition> partitionPair in _playersByPartition)
-            {
-                PlayerSpatialPartition partition = partitionPair.Value;
+            {                PlayerSpatialPartition partition = partitionPair.Value;
                 if (partition == null || partition.Players.Count == 0 ||
                     !_hibernatedByPartition.TryGetValue(partitionPair.Key, out Dictionary<long, List<PopulationActorRuntime>> cells))
                 {
@@ -2097,8 +2202,7 @@ namespace Game.Server.Application.Population
                 return false;
             float t = Math.Clamp(progress, 0f, 1f);
             float dx = to.pose.x - from.pose.x;
-            float dz = to.pose.z - from.pose.z;
-            float length = MathF.Sqrt(dx * dx + dz * dz);
+            float dz = to.pose.z - from.pose.z;            float length = MathF.Sqrt(dx * dx + dz * dz);
             float sideX = length > 0.001f ? -dz / length : 0f;
             float sideZ = length > 0.001f ? dx / length : 0f;
             position = new WorldPosition(
