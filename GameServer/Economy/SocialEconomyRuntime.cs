@@ -450,6 +450,18 @@ namespace Game.GameServer.Economy
         {
             if (!TryIdentity(actor, out long characterId, out _))
                 return null;
+
+            // Storage is hydrated lazily after an authoritative OpenStorage interaction.
+            // Once present, the GameServer copy remains the live session source of truth:
+            // successful transfers replace it with the authoritative returned revision,
+            // and stale-transfer handling performs its existing explicit reconciliation load.
+            // Ordinary snapshot/reopen paths must not keep hitting Gateway/database.
+            lock (_gate)
+            {
+                if (_storage.TryGetValue(characterId, out BackendStorageSnapshotDto cached))
+                    return cached;
+            }
+
             BackendStorageLoadResponse response = await _repository.LoadStorageAsync(actor, cancellationToken).ConfigureAwait(false);
             if (response == null || !response.success || response.storage == null)
                 return null;
@@ -469,6 +481,8 @@ namespace Game.GameServer.Economy
             bool deposit,
             int sourceSlot,
             int quantity,
+            long expectedItemInstanceId,
+            long knownStorageRevision,
             CancellationToken cancellationToken)
         {
             if (!TryIdentity(actor, out long characterId, out _))
@@ -486,6 +500,21 @@ namespace Game.GameServer.Economy
                     return SocialEconomyResult.Fail("Storage is unavailable.");
             }
 
+            // The client sends the Storage revision it rendered. This is not trusted as
+            // authority; it is an admission hint that prevents a known-stale client action
+            // from reaching persistence. Zero remains compatible with a revision-zero store.
+            if (knownStorageRevision != 0 && knownStorageRevision != storage.revision)
+            {
+                Publish(SocialEconomyStateKind.Storage, characterId);
+                return SocialEconomyResult.Fail("Storage state changed; try again.");
+            }
+
+            if (expectedItemInstanceId <= 0)
+            {
+                Publish(SocialEconomyStateKind.Storage, characterId);
+                return SocialEconomyResult.Fail("Storage item identity is invalid.");
+            }
+
             SocialEconomyResult result = await _items.RunExternalSerializedAsync(
                 actor,
                 async token =>
@@ -500,6 +529,8 @@ namespace Game.GameServer.Economy
                         PlayerItemView item = FindInventoryItem(_items.GetSnapshot(actor), sourceSlot);
                         if (item == null || item.quantity < quantity)
                             return SocialEconomyResult.Fail("Inventory item is unavailable.");
+                        if (item.itemInstanceId != expectedItemInstanceId)
+                            return SocialEconomyResult.Fail("Inventory item changed before storage transfer.");
                         instanceId = item.itemInstanceId;
                     }
                     else
@@ -508,6 +539,8 @@ namespace Game.GameServer.Economy
                             .FirstOrDefault(x => x != null && x.inventorySlot == sourceSlot);
                         if (item == null || item.quantity < quantity)
                             return SocialEconomyResult.Fail("Storage item is unavailable.");
+                        if (item.itemInstanceId != expectedItemInstanceId)
+                            return SocialEconomyResult.Fail("Storage item changed before transfer.");
                         instanceId = item.itemInstanceId;
                     }
 
@@ -691,7 +724,7 @@ namespace Game.GameServer.Economy
                          ReferenceEquals(current, session))
                 {
                     session.Phase = TradePhaseActive;
-                    ResetAllLocksAndConfirmations(session);
+                    ResetConfirmations(session);
                 }
             }
             Publish(SocialEconomyStateKind.Trade, session.LeftCharacterId, session.RightCharacterId);

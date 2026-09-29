@@ -388,7 +388,13 @@ internal sealed partial class GameServerHost
         try
         {
             result = await _socialEconomy.TransferStorageAsync(
-                runtime, deposit, request.sourceSlot, request.quantity, CancellationToken.None).ConfigureAwait(false);
+                runtime,
+                deposit,
+                request.sourceSlot,
+                request.quantity,
+                request.expectedItemInstanceId,
+                request.knownStorageRevision,
+                CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

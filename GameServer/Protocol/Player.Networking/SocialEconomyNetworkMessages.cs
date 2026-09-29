@@ -84,8 +84,34 @@ namespace Player.Networking
         public byte action;
         public int sourceSlot;
         public int quantity;
-        public void Serialize(NetDataWriter writer) { writer.Put(action); writer.Put(sourceSlot); writer.Put(quantity); }
-        public void Deserialize(NetDataReader reader) { action = reader.GetByte(); sourceSlot = reader.GetInt(); quantity = reader.GetInt(); }
+
+        // Piggyback the client's cached source identity and Storage revision on the
+        // existing transfer request. These are validation hints only; the GameServer
+        // still resolves and verifies the authoritative live state independently.
+        public long expectedItemInstanceId;
+        public long knownStorageRevision;
+
+        public void Serialize(NetDataWriter writer)
+        {
+            writer.Put(action);
+            writer.Put(sourceSlot);
+            writer.Put(quantity);
+            writer.Put(expectedItemInstanceId);
+            writer.Put(knownStorageRevision);
+        }
+
+        public void Deserialize(NetDataReader reader)
+        {
+            action = reader.GetByte();
+            sourceSlot = reader.GetInt();
+            quantity = reader.GetInt();
+            expectedItemInstanceId = reader != null && reader.AvailableBytes >= sizeof(long)
+                ? reader.GetLong()
+                : 0L;
+            knownStorageRevision = reader != null && reader.AvailableBytes >= sizeof(long)
+                ? reader.GetLong()
+                : 0L;
+        }
     }
 
     public struct SocialEconomyMutationResponseMessage : INetSerializable
