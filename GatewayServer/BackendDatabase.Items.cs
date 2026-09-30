@@ -629,7 +629,7 @@ internal sealed partial class BackendDatabase
         source = null;
         if (next.inventoryCapacity != storedState.inventoryCapacity || storedState.inventoryRevision == long.MaxValue || next.inventoryRevision != storedState.inventoryRevision + 1 || next.equipmentRevision != storedState.equipmentRevision)
             return FailMutation("drop must advance only the inventory revision", out error);
-        List<CharacterItemRow> rows = conn.Query<CharacterItemRow>("SELECT * FROM character_items WHERE characterId=? ORDER BY itemInstanceId ASC", characterId);
+        List<CharacterItemRow> rows = LoadInventoryEquipmentRows(conn, characterId);
         var storedById = new Dictionary<long, CharacterItemRow>();
         for (int i = 0; i < rows.Count; ++i) { storedById[rows[i].itemInstanceId] = rows[i]; if (rows[i].itemInstanceId == sourceId) source = rows[i]; }
         if (source == null || source.containerKind != InventoryContainer || quantity > source.quantity) return FailMutation("drop source or quantity is invalid", out error);
@@ -676,9 +676,7 @@ internal sealed partial class BackendDatabase
         if (expectedWorldItemRevision == long.MaxValue)
             return FailMutation("world item revision is exhausted", out error);
 
-        List<CharacterItemRow> rows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=? ORDER BY itemInstanceId ASC",
-            characterId);
+        List<CharacterItemRow> rows = LoadInventoryEquipmentRows(conn, characterId);
         var storedById = new Dictionary<long, CharacterItemRow>();
         for (int i = 0; i < rows.Count; ++i)
             storedById[rows[i].itemInstanceId] = rows[i];
@@ -820,9 +818,7 @@ internal sealed partial class BackendDatabase
         long worldItemInstanceId,
         BackendPlayerSystemsSnapshotDto next)
     {
-        List<CharacterItemRow> storedRows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=?",
-            characterId);
+        List<CharacterItemRow> storedRows = LoadInventoryEquipmentRows(conn, characterId);
         var storedIds = new HashSet<long>();
         for (int i = 0; i < storedRows.Count; ++i)
             storedIds.Add(storedRows[i].itemInstanceId);
@@ -874,8 +870,10 @@ internal sealed partial class BackendDatabase
         ItemDefinition worldDefinition = FindItemDefinition(content, world.definitionId);
         if (worldDefinition == null || world.quantity < 1 || world.quantity > worldDefinition.maxStack) return FailMutation("world item definition or stack is invalid", out error);
         if (world.revision == long.MaxValue) return FailMutation("world item revision is exhausted", out error);
+        if (conn.Find<CharacterItemRow>(world.itemInstanceId) != null)
+            return FailMutation("world item id is already owned by character", out error);
 
-        List<CharacterItemRow> rows = conn.Query<CharacterItemRow>("SELECT * FROM character_items WHERE characterId=? ORDER BY itemInstanceId ASC", characterId);
+        List<CharacterItemRow> rows = LoadInventoryEquipmentRows(conn, characterId);
         var storedById = new Dictionary<long, CharacterItemRow>();
         for (int i = 0; i < rows.Count; ++i) storedById[rows[i].itemInstanceId] = rows[i];
         if (storedById.ContainsKey(world.itemInstanceId)) return FailMutation("world item id is already owned by character", out error);
@@ -1043,9 +1041,7 @@ internal sealed partial class BackendDatabase
             return FailMutation("consume must advance only the inventory revision", out error);
         }
 
-        List<CharacterItemRow> storedRows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=? ORDER BY itemInstanceId ASC",
-            characterId);
+        List<CharacterItemRow> storedRows = LoadInventoryEquipmentRows(conn, characterId);
         CharacterItemRow source = null;
         var storedById = new Dictionary<long, CharacterItemRow>();
         for (int i = 0; i < storedRows.Count; ++i)
@@ -1195,15 +1191,24 @@ internal sealed partial class BackendDatabase
         }
     }
 
+    // Inventory/equipment snapshots intentionally exclude other durable character-owned
+    // containers such as Storage. Storage is hydrated and mutated only through its own
+    // authoritative economy transaction path.
+    private static List<CharacterItemRow> LoadInventoryEquipmentRows(SQLiteConnection conn, long characterId) =>
+        conn.Query<CharacterItemRow>(
+            "SELECT * FROM character_items WHERE characterId=? AND (containerKind=? OR containerKind=?) " +
+            "ORDER BY containerKind ASC, inventorySlot ASC, equipmentSlotId ASC, itemInstanceId ASC",
+            characterId,
+            InventoryContainer,
+            EquipmentContainer);
+
     private static BackendPlayerSystemsSnapshotDto ReadPlayerSystems(SQLiteConnection conn, long characterId)
     {
         CharacterPlayerSystemsRow state = conn.Find<CharacterPlayerSystemsRow>(characterId);
         if (state == null)
             return null;
 
-        List<CharacterItemRow> rows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=? ORDER BY containerKind ASC, inventorySlot ASC, equipmentSlotId ASC, itemInstanceId ASC",
-            characterId);
+        List<CharacterItemRow> rows = LoadInventoryEquipmentRows(conn, characterId);
         var inventory = new List<BackendPersistedItemDto>();
         var equipment = new List<BackendPersistedItemDto>();
         for (int i = 0; i < rows.Count; ++i)
@@ -1247,9 +1252,7 @@ internal sealed partial class BackendDatabase
         if (incomingInventory.Length > storedState.inventoryCapacity || incomingEquipment.Length > 128)
             return FailMutation("item collection is too large", out error);
 
-        List<CharacterItemRow> storedRows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=? ORDER BY itemInstanceId ASC",
-            characterId);
+        List<CharacterItemRow> storedRows = LoadInventoryEquipmentRows(conn, characterId);
         var storedById = new Dictionary<long, CharacterItemRow>();
         var storedTotals = new Dictionary<string, long>(StringComparer.Ordinal);
         for (int i = 0; i < storedRows.Count; ++i)
@@ -1427,9 +1430,7 @@ internal sealed partial class BackendDatabase
         for (int i = 0; i < equipment.Length; ++i)
             retainedIds.Add(equipment[i].itemInstanceId);
 
-        List<CharacterItemRow> storedRows = conn.Query<CharacterItemRow>(
-            "SELECT * FROM character_items WHERE characterId=?",
-            characterId);
+        List<CharacterItemRow> storedRows = LoadInventoryEquipmentRows(conn, characterId);
         var storedById = new Dictionary<long, CharacterItemRow>(storedRows.Count);
         for (int i = 0; i < storedRows.Count; ++i)
             storedById[storedRows[i].itemInstanceId] = storedRows[i];
@@ -1472,8 +1473,11 @@ internal sealed partial class BackendDatabase
             // containerKind=0 participates in neither partial UNIQUE slot index. One
             // staging statement makes arbitrary swaps/reorders safe without changing IDs.
             int staged = conn.Execute(
-                "UPDATE character_items SET containerKind=0, inventorySlot=-1, equipmentSlotId='' WHERE characterId=?",
-                characterId);
+                "UPDATE character_items SET containerKind=0, inventorySlot=-1, equipmentSlotId='' " +
+                "WHERE characterId=? AND (containerKind=? OR containerKind=?)",
+                characterId,
+                InventoryContainer,
+                EquipmentContainer);
             if (staged != retainedIds.Count)
                 throw new InvalidOperationException("Failed to stage stable item instances during transaction.");
 
