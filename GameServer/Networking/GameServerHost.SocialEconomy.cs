@@ -28,6 +28,9 @@ internal sealed partial class GameServerHost
 
     private readonly Dictionary<long, StorageAccess> _storageAccessByCharacter = new();
     private readonly Dictionary<long, OwnerLiveInterestKind> _ownerLiveInterestsByCharacter = new();
+    // Outbound transport baselines only. Authoritative state remains in SocialEconomyRuntime.
+    private readonly Dictionary<long, StorageStateMessage> _lastSentStorageStateByCharacter = new();
+    private readonly Dictionary<long, TradeStateMessage> _lastSentTradeStateByCharacter = new();
     private SocialEconomyRuntime _socialEconomy;
 
     private void RegisterSocialEconomyRequests(
@@ -87,7 +90,7 @@ internal sealed partial class GameServerHost
             SendClientMessage(
                 session,
                 SocialEconomyMessageTypes.FriendsState,
-                BuildFriendsState(_socialEconomy.GetFriendView(characterId)),
+                BuildFriendPresenceState(_socialEconomy.GetFriendView(characterId)),
                 DeliveryMethod.ReliableOrdered);
         }
     }
@@ -134,7 +137,18 @@ internal sealed partial class GameServerHost
             SendClientMessage(
                 owner,
                 SocialEconomyMessageTypes.FriendsState,
-                BuildFriendsState(view),
+                new FriendsStateMessage
+                {
+                    updateKind = FriendsStateUpdateKind.PresenceDelta,
+                    presence = new[]
+                    {
+                        new FriendPresenceWire
+                        {
+                            characterId = changedCharacterId,
+                            online = FindReadySessionByCharacterId(changedCharacterId) != null,
+                        },
+                    },
+                },
                 DeliveryMethod.ReliableOrdered);
         }
     }
@@ -143,13 +157,51 @@ internal sealed partial class GameServerHost
     {
         var request = new EmptySocialRequestMessage();
         request.Deserialize(reader);
-        if (!TryGetInWorldRuntime(session, out PlayerRuntime runtime))
+
+        if (TryGetInWorldRuntime(session, out PlayerRuntime runtime))
         {
-            SendResponse(session, requestId, new FriendsStateMessage());
+            RunFriendsSnapshotAsync(session, requestId, runtime).Forget();
             return;
         }
 
-        RunFriendsSnapshotAsync(session, requestId, runtime).Forget();
+        // Existing request 700 doubles as the pre-Ready membership-fingerprint probe.
+        // It never grants authority: the GameServer hydrates durable membership first,
+        // then records the proof only on an exact match.
+        if (request.knownRevision != 0 &&
+            TryGetAuthoritativeSession(session, out var authoritative) &&
+            authoritative.State == Game.Shared.Sessions.PlayerSessionState.AwaitingWorldEntry &&
+            authoritative.Runtime != null)
+        {
+            RunFriendsCacheProbeAsync(session, requestId, authoritative.Runtime, request.knownRevision).Forget();
+            return;
+        }
+
+        SendResponse(session, requestId, new FriendsStateMessage { updateKind = FriendsStateUpdateKind.Full });
+    }
+
+    private async Task RunFriendsCacheProbeAsync(ClientSession session, uint requestId, PlayerRuntime runtime, long knownRevision)
+    {
+        FriendView view = null;
+        try
+        {
+            view = await _socialEconomy.LoadFriendsAsync(runtime, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch { }
+
+        FriendsStateMessage state = BuildFriendsState(view);
+        long authoritativeRevision = FriendsStateRevision.Compute(state.friends);
+        _mainThreadCompletions.Enqueue(() =>
+        {
+            if (!IsCurrent(session)) return;
+            session.FriendsKnownRevision = knownRevision == authoritativeRevision ? authoritativeRevision : 0L;
+            // Probe response is intentionally tiny; a mismatch falls through to the normal
+            // authoritative Ready baseline.
+            SendResponse(session, requestId, new FriendsStateMessage
+            {
+                updateKind = FriendsStateUpdateKind.PresenceDelta,
+                presence = Array.Empty<FriendPresenceWire>(),
+            });
+        });
     }
 
     private async Task RunFriendsSnapshotAsync(ClientSession session, uint requestId, PlayerRuntime runtime)
@@ -234,7 +286,9 @@ internal sealed partial class GameServerHost
             SendResponse(session, requestId, new TradeStateMessage { detail = "character is not in world" });
             return;
         }
-        SendResponse(session, requestId, BuildTradeState(_socialEconomy.GetTradeView(runtime.CharacterId.Value)));
+        TradeStateMessage state = BuildTradeState(_socialEconomy.GetTradeView(runtime.CharacterId.Value));
+        _lastSentTradeStateByCharacter[runtime.CharacterId.Value] = state;
+        SendResponse(session, requestId, state);
     }
 
     private void HandleTradeAction(ClientSession session, uint requestId, NetDataReader reader)
@@ -306,7 +360,9 @@ internal sealed partial class GameServerHost
         }
         if (!TryValidateStorageAccess(runtime, out string reason))
         {
-            SendResponse(session, requestId, new StorageStateMessage { detail = reason });
+            _lastSentStorageStateByCharacter.Remove(runtime.CharacterId.Value);
+            SendResponse(session, requestId,
+                new StorageStateMessage { updateKind = StorageStateUpdateKind.Full, detail = reason });
             return;
         }
 
@@ -326,8 +382,12 @@ internal sealed partial class GameServerHost
         {
             // Reuse StorageState as the closure/invalidation signal. No extra bank-session
             // message is needed just to clear a cache the server already knows is stale.
+            // The outbound diff baseline is presentation-only transport state and must die
+            // with the authoritative storage-access grant.
+            _lastSentStorageStateByCharacter.Remove(runtime.CharacterId.Value);
             SendClientMessage(session, SocialEconomyMessageTypes.StorageState,
-                new StorageStateMessage { detail = reason }, DeliveryMethod.ReliableOrdered);
+                new StorageStateMessage { updateKind = StorageStateUpdateKind.Full, detail = reason },
+                DeliveryMethod.ReliableOrdered);
             SendResponse(session, requestId, SocialEconomyMutationResponseMessage.Failed(3, reason));
             return;
         }
@@ -370,6 +430,8 @@ internal sealed partial class GameServerHost
         {
             if (!IsCurrent(session)) return;
             StorageStateMessage state = BuildStorageState(storage, error);
+            if (state.capacity > 0)
+                _lastSentStorageStateByCharacter[runtime.CharacterId.Value] = state;
             if (pushOnly)
                 SendClientMessage(session, SocialEconomyMessageTypes.StorageState, state, DeliveryMethod.ReliableOrdered);
             else
@@ -421,18 +483,26 @@ internal sealed partial class GameServerHost
             if ((kind & SocialEconomyStateKind.Friends) != 0)
             {
                 FriendsStateMessage state = BuildFriendsState(_socialEconomy.GetFriendView(characterId));
+                session.FriendsKnownRevision = FriendsStateRevision.Compute(state.friends);
                 SendClientMessage(session, SocialEconomyMessageTypes.FriendsState, state, DeliveryMethod.ReliableOrdered);
             }
             if ((kind & SocialEconomyStateKind.Trade) != 0)
             {
-                TradeStateMessage state = BuildTradeState(_socialEconomy.GetTradeView(characterId));
-                SendClientMessage(session, SocialEconomyMessageTypes.TradeState, state, DeliveryMethod.ReliableOrdered);
+                TradeStateMessage current = BuildTradeState(_socialEconomy.GetTradeView(characterId));
+                TradeStateMessage outbound = BuildTradeDelta(characterId, current);
+                _lastSentTradeStateByCharacter[characterId] = current;
+                SendClientMessage(session, SocialEconomyMessageTypes.TradeState, outbound, DeliveryMethod.ReliableOrdered);
             }
             if ((kind & SocialEconomyStateKind.Storage) != 0)
             {
                 BackendStorageSnapshotDto storage = _socialEconomy.GetStorage(characterId);
                 if (storage != null)
-                    SendClientMessage(session, SocialEconomyMessageTypes.StorageState, BuildStorageState(storage), DeliveryMethod.ReliableOrdered);
+                {
+                    StorageStateMessage current = BuildStorageState(storage);
+                    StorageStateMessage outbound = BuildStorageDelta(characterId, current);
+                    _lastSentStorageStateByCharacter[characterId] = current;
+                    SendClientMessage(session, SocialEconomyMessageTypes.StorageState, outbound, DeliveryMethod.ReliableOrdered);
+                }
             }
         });
     }
@@ -454,6 +524,7 @@ internal sealed partial class GameServerHost
         }
         return new FriendsStateMessage
         {
+            updateKind = FriendsStateUpdateKind.Full,
             friends = friends,
             pendingInviterCharacterId = view?.PendingInviterCharacterId ?? 0,
             pendingInviterName = view?.PendingInviterName ?? string.Empty,
@@ -465,6 +536,7 @@ internal sealed partial class GameServerHost
         view ??= new TradeView();
         return new TradeStateMessage
         {
+            changeMask = TradeStateChangeMask.Full,
             sessionId = view.SessionId,
             partnerCharacterId = view.PartnerCharacterId,
             partnerName = view.PartnerName,
@@ -507,6 +579,7 @@ internal sealed partial class GameServerHost
             items[i] = BuildStorageItemWire(source[i]);
         return new StorageStateMessage
         {
+            updateKind = StorageStateUpdateKind.Full,
             capacity = storage.capacity,
             revision = storage.revision,
             items = items,
@@ -537,6 +610,130 @@ internal sealed partial class GameServerHost
             allowedEquipmentSlots = definition?.allowedEquipmentSlots ?? Array.Empty<string>(),
         };
     }
+
+    private FriendsStateMessage BuildFriendPresenceState(FriendView view)
+    {
+        BackendFriendEntryDto[] source = view?.Friends ?? Array.Empty<BackendFriendEntryDto>();
+        var presence = new FriendPresenceWire[source.Length];
+        for (int i = 0; i < source.Length; ++i)
+        {
+            long id = source[i]?.characterId ?? 0;
+            presence[i] = new FriendPresenceWire
+            {
+                characterId = id,
+                online = id > 0 && FindReadySessionByCharacterId(id) != null,
+            };
+        }
+        return new FriendsStateMessage
+        {
+            updateKind = FriendsStateUpdateKind.PresenceDelta,
+            presence = presence,
+        };
+    }
+
+    private TradeStateMessage BuildTradeDelta(long characterId, TradeStateMessage current)
+    {
+        if (!_lastSentTradeStateByCharacter.TryGetValue(characterId, out TradeStateMessage previous) ||
+            previous.sessionId != current.sessionId || current.sessionId == 0)
+            return current;
+
+        TradeStateChangeMask mask = TradeStateChangeMask.Full;
+        bool metadataChanged =
+            previous.partnerCharacterId != current.partnerCharacterId ||
+            !string.Equals(previous.partnerName, current.partnerName, StringComparison.Ordinal) ||
+            previous.phase != current.phase || previous.ownLocked != current.ownLocked ||
+            previous.partnerLocked != current.partnerLocked || previous.ownConfirmed != current.ownConfirmed ||
+            previous.partnerConfirmed != current.partnerConfirmed;
+        bool ownChanged = !SameTradeOffers(previous.ownOffers, current.ownOffers);
+        bool partnerChanged = !SameTradeOffers(previous.partnerOffers, current.partnerOffers);
+        bool detailChanged = !string.Equals(previous.detail, current.detail, StringComparison.Ordinal);
+
+        if (metadataChanged) mask |= TradeStateChangeMask.Metadata;
+        if (ownChanged) mask |= TradeStateChangeMask.OwnOffers;
+        if (partnerChanged) mask |= TradeStateChangeMask.PartnerOffers;
+        if (detailChanged) mask |= TradeStateChangeMask.Detail;
+
+        // Full is encoded as zero, so a zero-difference notification is represented by
+        // Metadata with the current compact flags rather than accidentally serializing full.
+        if (mask == TradeStateChangeMask.Full)
+            mask = TradeStateChangeMask.Metadata;
+
+        return new TradeStateMessage
+        {
+            changeMask = mask,
+            sessionId = current.sessionId,
+            partnerCharacterId = current.partnerCharacterId,
+            partnerName = current.partnerName,
+            phase = current.phase,
+            ownLocked = current.ownLocked,
+            partnerLocked = current.partnerLocked,
+            ownConfirmed = current.ownConfirmed,
+            partnerConfirmed = current.partnerConfirmed,
+            ownOffers = ownChanged ? current.ownOffers : null,
+            partnerOffers = partnerChanged ? current.partnerOffers : null,
+            detail = detailChanged ? current.detail : null,
+        };
+    }
+
+    private static bool SameTradeOffers(TradeOfferWire[] left, TradeOfferWire[] right)
+    {
+        left ??= Array.Empty<TradeOfferWire>();
+        right ??= Array.Empty<TradeOfferWire>();
+        if (left.Length != right.Length) return false;
+        for (int i = 0; i < left.Length; ++i)
+        {
+            if (left[i].sourceSlot != right[i].sourceSlot || left[i].quantity != right[i].quantity ||
+                left[i].item.itemInstanceId != right[i].item.itemInstanceId ||
+                left[i].item.quantity != right[i].item.quantity || left[i].item.durability != right[i].item.durability)
+                return false;
+        }
+        return true;
+    }
+
+    private StorageStateMessage BuildStorageDelta(long characterId, StorageStateMessage current)
+    {
+        if (!_lastSentStorageStateByCharacter.TryGetValue(characterId, out StorageStateMessage previous) ||
+            previous.capacity <= 0 || previous.capacity != current.capacity ||
+            current.revision != previous.revision + 1)
+            return current;
+
+        var before = new Dictionary<long, PlayerItemWire>();
+        PlayerItemWire[] previousItems = previous.items ?? Array.Empty<PlayerItemWire>();
+        for (int i = 0; i < previousItems.Length; ++i)
+            if (previousItems[i].itemInstanceId > 0) before[previousItems[i].itemInstanceId] = previousItems[i];
+
+        var after = new Dictionary<long, PlayerItemWire>();
+        PlayerItemWire[] currentItems = current.items ?? Array.Empty<PlayerItemWire>();
+        for (int i = 0; i < currentItems.Length; ++i)
+            if (currentItems[i].itemInstanceId > 0) after[currentItems[i].itemInstanceId] = currentItems[i];
+
+        var changed = new List<PlayerItemWire>();
+        foreach (KeyValuePair<long, PlayerItemWire> pair in after)
+        {
+            if (!before.TryGetValue(pair.Key, out PlayerItemWire oldItem) || !SameStorageItem(oldItem, pair.Value))
+                changed.Add(pair.Value);
+        }
+
+        var removed = new List<long>();
+        foreach (long id in before.Keys)
+            if (!after.ContainsKey(id)) removed.Add(id);
+
+        return new StorageStateMessage
+        {
+            updateKind = StorageStateUpdateKind.Delta,
+            capacity = current.capacity,
+            revision = current.revision,
+            baseRevision = previous.revision,
+            items = changed.ToArray(),
+            removedItemInstanceIds = removed.ToArray(),
+            detail = current.detail ?? string.Empty,
+        };
+    }
+
+    private static bool SameStorageItem(PlayerItemWire a, PlayerItemWire b) =>
+        a.inventorySlot == b.inventorySlot &&
+        a.itemInstanceId == b.itemInstanceId && a.itemDataId == b.itemDataId &&
+        a.quantity == b.quantity && a.durability == b.durability;
 
     private bool TryValidateActiveTradePair(PlayerRuntime runtime, out string reason)
     {
@@ -648,6 +845,8 @@ internal sealed partial class GameServerHost
     {
         _ownerLiveInterestsByCharacter.Remove(characterId);
         _storageAccessByCharacter.Remove(characterId);
+        _lastSentStorageStateByCharacter.Remove(characterId);
+        _lastSentTradeStateByCharacter.Remove(characterId);
         _socialEconomy?.CancelForCharacter(characterId);
         // GuildService owns only a reloadable runtime cache/invite state here; durable guild
         // membership remains repository-owned. Releasing on the existing disconnect lifecycle

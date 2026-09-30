@@ -20,15 +20,10 @@ internal sealed partial class GameServerHost
         RunCacheAwareFriendsReadyAsync(session, runtime).Forget();
     }
 
-    private async Task RunCacheAwareFriendsReadyAsync(
-        ClientSession session,
-        PlayerRuntime runtime)
+    private async Task RunCacheAwareFriendsReadyAsync(ClientSession session, PlayerRuntime runtime)
     {
         try
         {
-            // The current durable Friends schema has no revision, so authoritative Backend
-            // hydration remains the session source of truth. The client fingerprint only
-            // suppresses retransmitting an identical membership list.
             FriendView view = await _socialEconomy
                 .LoadFriendsAsync(runtime, CancellationToken.None)
                 .ConfigureAwait(false);
@@ -40,10 +35,10 @@ internal sealed partial class GameServerHost
                 if (!IsCurrent(session) || !session.Ready)
                     return;
 
-                if (session.FriendsKnownRevision != 0 &&
-                    session.FriendsKnownRevision == durableRevision)
+                if (session.FriendsKnownRevision == durableRevision)
                     return;
 
+                session.FriendsKnownRevision = durableRevision;
                 SendClientMessage(
                     session,
                     SocialEconomyMessageTypes.FriendsState,
@@ -53,8 +48,7 @@ internal sealed partial class GameServerHost
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"Friend ready snapshot failed for peer {session?.Peer?.Id}: {ex.Message}");
+            Console.Error.WriteLine($"Friend ready snapshot failed for peer {session?.Peer?.Id}: {ex.Message}");
         }
     }
 }

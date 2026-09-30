@@ -37,10 +37,21 @@ namespace Player.Networking
     public enum FriendActionKind : byte { Accept = 1, Decline = 2, Remove = 3 }
     public enum TradeActionKind : byte { Accept = 1, Decline = 2, Offer = 3, RemoveOffer = 4, Lock = 5, Unlock = 6, Confirm = 7, Cancel = 8 }
     public enum StorageTransferKind : byte { Deposit = 1, Withdraw = 2 }
+    public enum FriendsStateUpdateKind : byte { Full = 0, PresenceDelta = 1 }
+    public enum StorageStateUpdateKind : byte { Full = 0, Delta = 1 }
+
+    [Flags]
+    public enum TradeStateChangeMask : byte
+    {
+        Full = 0,
+        Metadata = 1 << 0,
+        OwnOffers = 1 << 1,
+        PartnerOffers = 1 << 2,
+        Detail = 1 << 3,
+    }
 
     public struct EmptySocialRequestMessage : INetSerializable
     {
-        // Optional reconnect/cache hint. Zero preserves the legacy empty request.
         public long knownRevision;
         public void Serialize(NetDataWriter writer)
         {
@@ -84,10 +95,6 @@ namespace Player.Networking
         public byte action;
         public int sourceSlot;
         public int quantity;
-
-        // Piggyback the client's cached source identity and Storage revision on the
-        // existing transfer request. These are validation hints only; the GameServer
-        // still resolves and verifies the authoritative live state independently.
         public long expectedItemInstanceId;
         public long knownStorageRevision;
 
@@ -105,12 +112,8 @@ namespace Player.Networking
             action = reader.GetByte();
             sourceSlot = reader.GetInt();
             quantity = reader.GetInt();
-            expectedItemInstanceId = reader != null && reader.AvailableBytes >= sizeof(long)
-                ? reader.GetLong()
-                : 0L;
-            knownStorageRevision = reader != null && reader.AvailableBytes >= sizeof(long)
-                ? reader.GetLong()
-                : 0L;
+            expectedItemInstanceId = reader != null && reader.AvailableBytes >= sizeof(long) ? reader.GetLong() : 0L;
+            knownStorageRevision = reader != null && reader.AvailableBytes >= sizeof(long) ? reader.GetLong() : 0L;
         }
     }
 
@@ -134,11 +137,16 @@ namespace Player.Networking
         public void Deserialize(NetDataReader reader) { characterId = reader.GetLong(); name = reader.GetString(); online = reader.GetBool(); }
     }
 
+    public struct FriendPresenceWire : INetSerializable
+    {
+        public long characterId;
+        public bool online;
+        public void Serialize(NetDataWriter writer) { writer.Put(characterId); writer.Put(online); }
+        public void Deserialize(NetDataReader reader) { characterId = reader.GetLong(); online = reader.GetBool(); }
+    }
 
     public static class FriendsStateRevision
     {
-        // Stable order-independent fingerprint of durable membership only. Presence and
-        // pending invites are live/session state and deliberately do not affect the cache key.
         public static long Compute(FriendEntryWire[] friends)
         {
             FriendEntryWire[] values = friends ?? Array.Empty<FriendEntryWire>();
@@ -182,21 +190,62 @@ namespace Player.Networking
 
     public struct FriendsStateMessage : INetSerializable
     {
+        public FriendsStateUpdateKind updateKind;
         public FriendEntryWire[] friends;
+        public FriendPresenceWire[] presence;
         public long pendingInviterCharacterId;
         public string pendingInviterName;
+
         public void Serialize(NetDataWriter writer)
         {
-            FriendEntryWire[] values = friends ?? Array.Empty<FriendEntryWire>();
-            writer.Put((ushort)Math.Min(values.Length, ushort.MaxValue));
-            for (int i = 0; i < values.Length && i < ushort.MaxValue; ++i) values[i].Serialize(writer);
-            writer.Put(pendingInviterCharacterId); writer.Put(pendingInviterName ?? string.Empty);
+            writer.Put((byte)updateKind);
+            if (updateKind == FriendsStateUpdateKind.PresenceDelta)
+            {
+                FriendPresenceWire[] values = presence ?? Array.Empty<FriendPresenceWire>();
+                int count = Math.Min(values.Length, ushort.MaxValue);
+                writer.Put((ushort)count);
+                for (int i = 0; i < count; ++i) values[i].Serialize(writer);
+                return;
+            }
+
+            FriendEntryWire[] entries = friends ?? Array.Empty<FriendEntryWire>();
+            int entryCount = Math.Min(entries.Length, ushort.MaxValue);
+            writer.Put((ushort)entryCount);
+            for (int i = 0; i < entryCount; ++i) entries[i].Serialize(writer);
+            writer.Put(pendingInviterCharacterId);
+            writer.Put(pendingInviterName ?? string.Empty);
         }
+
         public void Deserialize(NetDataReader reader)
         {
-            int count = reader.GetUShort(); friends = new FriendEntryWire[count];
-            for (int i = 0; i < count; ++i) { FriendEntryWire value = default; value.Deserialize(reader); friends[i] = value; }
-            pendingInviterCharacterId = reader.GetLong(); pendingInviterName = reader.GetString();
+            updateKind = (FriendsStateUpdateKind)reader.GetByte();
+            if (updateKind == FriendsStateUpdateKind.PresenceDelta)
+            {
+                int count = reader.GetUShort();
+                presence = new FriendPresenceWire[count];
+                friends = Array.Empty<FriendEntryWire>();
+                for (int i = 0; i < count; ++i)
+                {
+                    FriendPresenceWire value = default;
+                    value.Deserialize(reader);
+                    presence[i] = value;
+                }
+                pendingInviterCharacterId = 0;
+                pendingInviterName = string.Empty;
+                return;
+            }
+
+            int fullCount = reader.GetUShort();
+            friends = new FriendEntryWire[fullCount];
+            presence = Array.Empty<FriendPresenceWire>();
+            for (int i = 0; i < fullCount; ++i)
+            {
+                FriendEntryWire value = default;
+                value.Deserialize(reader);
+                friends[i] = value;
+            }
+            pendingInviterCharacterId = reader.GetLong();
+            pendingInviterName = reader.GetString();
         }
     }
 
@@ -211,6 +260,7 @@ namespace Player.Networking
 
     public struct TradeStateMessage : INetSerializable
     {
+        public TradeStateChangeMask changeMask;
         public ulong sessionId;
         public long partnerCharacterId;
         public string partnerName;
@@ -223,48 +273,135 @@ namespace Player.Networking
         public TradeOfferWire[] partnerOffers;
         public string detail;
 
+        public bool IsFull => changeMask == TradeStateChangeMask.Full;
+
         public void Serialize(NetDataWriter writer)
         {
-            writer.Put(sessionId); writer.Put(partnerCharacterId); writer.Put(partnerName ?? string.Empty); writer.Put(phase);
-            writer.Put(ownLocked); writer.Put(partnerLocked); writer.Put(ownConfirmed); writer.Put(partnerConfirmed);
-            WriteOffers(writer, ownOffers); WriteOffers(writer, partnerOffers); writer.Put(detail ?? string.Empty);
+            writer.Put((byte)changeMask);
+            writer.Put(sessionId);
+            bool full = IsFull;
+            if (full || (changeMask & TradeStateChangeMask.Metadata) != 0)
+            {
+                writer.Put(partnerCharacterId);
+                writer.Put(partnerName ?? string.Empty);
+                writer.Put(phase);
+                writer.Put(ownLocked);
+                writer.Put(partnerLocked);
+                writer.Put(ownConfirmed);
+                writer.Put(partnerConfirmed);
+            }
+            if (full || (changeMask & TradeStateChangeMask.OwnOffers) != 0) WriteOffers(writer, ownOffers);
+            if (full || (changeMask & TradeStateChangeMask.PartnerOffers) != 0) WriteOffers(writer, partnerOffers);
+            if (full || (changeMask & TradeStateChangeMask.Detail) != 0) writer.Put(detail ?? string.Empty);
         }
+
         public void Deserialize(NetDataReader reader)
         {
-            sessionId = reader.GetULong(); partnerCharacterId = reader.GetLong(); partnerName = reader.GetString(); phase = reader.GetByte();
-            ownLocked = reader.GetBool(); partnerLocked = reader.GetBool(); ownConfirmed = reader.GetBool(); partnerConfirmed = reader.GetBool();
-            ownOffers = ReadOffers(reader); partnerOffers = ReadOffers(reader); detail = reader.GetString();
+            changeMask = (TradeStateChangeMask)reader.GetByte();
+            sessionId = reader.GetULong();
+            bool full = IsFull;
+            if (full || (changeMask & TradeStateChangeMask.Metadata) != 0)
+            {
+                partnerCharacterId = reader.GetLong();
+                partnerName = reader.GetString();
+                phase = reader.GetByte();
+                ownLocked = reader.GetBool();
+                partnerLocked = reader.GetBool();
+                ownConfirmed = reader.GetBool();
+                partnerConfirmed = reader.GetBool();
+            }
+            else
+            {
+                partnerName = string.Empty;
+            }
+            ownOffers = full || (changeMask & TradeStateChangeMask.OwnOffers) != 0 ? ReadOffers(reader) : null;
+            partnerOffers = full || (changeMask & TradeStateChangeMask.PartnerOffers) != 0 ? ReadOffers(reader) : null;
+            detail = full || (changeMask & TradeStateChangeMask.Detail) != 0 ? reader.GetString() : null;
         }
+
         private static void WriteOffers(NetDataWriter writer, TradeOfferWire[] offers)
         {
-            TradeOfferWire[] values = offers ?? Array.Empty<TradeOfferWire>(); int count = Math.Min(values.Length, 64); writer.Put((byte)count);
+            TradeOfferWire[] values = offers ?? Array.Empty<TradeOfferWire>();
+            int count = Math.Min(values.Length, 64);
+            writer.Put((byte)count);
             for (int i = 0; i < count; ++i) values[i].Serialize(writer);
         }
+
         private static TradeOfferWire[] ReadOffers(NetDataReader reader)
         {
-            int count = reader.GetByte(); var values = new TradeOfferWire[count];
-            for (int i = 0; i < count; ++i) { TradeOfferWire value = default; value.Deserialize(reader); values[i] = value; }
+            int count = reader.GetByte();
+            var values = new TradeOfferWire[count];
+            for (int i = 0; i < count; ++i)
+            {
+                TradeOfferWire value = default;
+                value.Deserialize(reader);
+                values[i] = value;
+            }
             return values;
         }
     }
 
     public struct StorageStateMessage : INetSerializable
     {
+        public StorageStateUpdateKind updateKind;
         public int capacity;
         public long revision;
+        public long baseRevision;
         public PlayerItemWire[] items;
+        public long[] removedItemInstanceIds;
         public string detail;
+
         public void Serialize(NetDataWriter writer)
         {
-            writer.Put(capacity); writer.Put(revision); PlayerItemWire[] values = items ?? Array.Empty<PlayerItemWire>();
-            writer.Put((ushort)Math.Min(values.Length, ushort.MaxValue));
-            for (int i = 0; i < values.Length && i < ushort.MaxValue; ++i) values[i].Serialize(writer);
+            writer.Put((byte)updateKind);
+            writer.Put(capacity);
+            writer.Put(revision);
+            if (updateKind == StorageStateUpdateKind.Delta)
+                writer.Put(baseRevision);
+
+            PlayerItemWire[] values = items ?? Array.Empty<PlayerItemWire>();
+            int count = Math.Min(values.Length, ushort.MaxValue);
+            writer.Put((ushort)count);
+            for (int i = 0; i < count; ++i) values[i].Serialize(writer);
+
+            if (updateKind == StorageStateUpdateKind.Delta)
+            {
+                long[] removed = removedItemInstanceIds ?? Array.Empty<long>();
+                int removedCount = Math.Min(removed.Length, ushort.MaxValue);
+                writer.Put((ushort)removedCount);
+                for (int i = 0; i < removedCount; ++i) writer.Put(removed[i]);
+            }
+
             writer.Put(detail ?? string.Empty);
         }
+
         public void Deserialize(NetDataReader reader)
         {
-            capacity = reader.GetInt(); revision = reader.GetLong(); int count = reader.GetUShort(); items = new PlayerItemWire[count];
-            for (int i = 0; i < count; ++i) { PlayerItemWire value = default; value.Deserialize(reader); items[i] = value; }
+            updateKind = (StorageStateUpdateKind)reader.GetByte();
+            capacity = reader.GetInt();
+            revision = reader.GetLong();
+            baseRevision = updateKind == StorageStateUpdateKind.Delta ? reader.GetLong() : 0L;
+
+            int count = reader.GetUShort();
+            items = new PlayerItemWire[count];
+            for (int i = 0; i < count; ++i)
+            {
+                PlayerItemWire value = default;
+                value.Deserialize(reader);
+                items[i] = value;
+            }
+
+            if (updateKind == StorageStateUpdateKind.Delta)
+            {
+                int removedCount = reader.GetUShort();
+                removedItemInstanceIds = new long[removedCount];
+                for (int i = 0; i < removedCount; ++i) removedItemInstanceIds[i] = reader.GetLong();
+            }
+            else
+            {
+                removedItemInstanceIds = Array.Empty<long>();
+            }
+
             detail = reader.GetString();
         }
     }

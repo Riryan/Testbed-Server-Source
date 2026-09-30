@@ -4,8 +4,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Game.GameServer.Runtime;
 using Game.Server.Application.Interactions;
+using Game.Server.Application.Sessions;
 using Game.Server.Application.Social;
 using Game.Server.Domain.Players;
+using Game.Shared.Sessions;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using Player.Networking;
@@ -16,12 +18,10 @@ internal sealed partial class GameServerHost
 {
     private bool _guildStateBridgeSubscribed;
 
-    private void RegisterGuildRequests(
-        Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
+    private void RegisterGuildRequests(Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
     {
         EnsureCanonicalPlayerSocialInteractionHandlers();
-        RegisterRequest(handlers, GuildRequestTypes.Snapshot,
-            (session, requestId, _) => HandleGuildSnapshot(session, requestId));
+        RegisterRequest(handlers, GuildRequestTypes.Snapshot, HandleGuildSnapshot);
         RegisterRequest(handlers, GuildRequestTypes.Action, HandleGuildAction);
     }
 
@@ -31,44 +31,48 @@ internal sealed partial class GameServerHost
             return;
 
         EnsureGuildStateBridge();
-        RunGuildStateAsync(session, 0, runtime, pushOnly: true).Forget();
+        RunGuildStateAsync(session, 0, runtime, pushOnly: true, session.GuildKnownRevision).Forget();
     }
 
     private void EnsureGuildStateBridge()
     {
-        if (_guildStateBridgeSubscribed)
-            return;
-
+        if (_guildStateBridgeSubscribed) return;
         GuildSocial.StateChanged += OnGuildStateChanged;
         _guildStateBridgeSubscribed = true;
     }
 
     private void OnGuildStateChanged(long characterId)
     {
-        if (characterId <= 0)
-            return;
-
+        if (characterId <= 0) return;
         QueueMainThreadCompletion(() =>
         {
             ClientSession session = FindReadySessionByCharacterId(characterId);
             PlayerRuntime runtime = session?.Entity?.Runtime;
-            if (runtime == null || !IsCurrent(session) || !session.Ready)
-                return;
-
-            RunGuildStateAsync(session, 0, runtime, pushOnly: true).Forget();
+            if (runtime == null || !IsCurrent(session) || !session.Ready) return;
+            RunGuildStateAsync(session, 0, runtime, pushOnly: true, session.GuildKnownRevision).Forget();
         });
     }
 
-    private void HandleGuildSnapshot(ClientSession session, uint requestId)
+    private void HandleGuildSnapshot(ClientSession session, uint requestId, NetDataReader reader)
     {
-        if (!TryGetInWorldRuntime(session, out PlayerRuntime runtime))
+        var request = new EmptySocialRequestMessage();
+        request.Deserialize(reader);
+
+        PlayerRuntime runtime = null;
+        if (!TryGetInWorldRuntime(session, out runtime))
         {
-            SendResponse(session, requestId, new GuildStateMessage());
-            return;
+            if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative) ||
+                authoritative.State != PlayerSessionState.AwaitingWorldEntry ||
+                authoritative.Runtime == null)
+            {
+                SendResponse(session, requestId, new GuildStateMessage { updateKind = GuildStateUpdateKind.Full });
+                return;
+            }
+            runtime = authoritative.Runtime;
         }
 
         EnsureGuildStateBridge();
-        RunGuildStateAsync(session, requestId, runtime, pushOnly: false).Forget();
+        RunGuildStateAsync(session, requestId, runtime, pushOnly: false, request.knownRevision).Forget();
     }
 
     private void HandleGuildAction(ClientSession session, uint requestId, NetDataReader reader)
@@ -78,16 +82,14 @@ internal sealed partial class GameServerHost
 
         if (!TryGetInWorldRuntime(session, out PlayerRuntime runtime))
         {
-            SendResponse(session, requestId,
-                GuildMutationResponseMessage.Failed(1, "character is not in world"));
+            SendResponse(session, requestId, GuildMutationResponseMessage.Failed(1, "character is not in world"));
             return;
         }
 
         GuildActionKind action = request.Action;
         if (action != GuildActionKind.Decline && !IsBackendPersistenceMutationAvailable)
         {
-            SendResponse(session, requestId,
-                GuildMutationResponseMessage.Failed(2, BackendPersistenceUnavailableMessage));
+            SendResponse(session, requestId, GuildMutationResponseMessage.Failed(2, BackendPersistenceUnavailableMessage));
             return;
         }
 
@@ -95,11 +97,7 @@ internal sealed partial class GameServerHost
         RunGuildActionAsync(session, requestId, runtime, request).Forget();
     }
 
-    private async Task RunGuildActionAsync(
-        ClientSession session,
-        uint requestId,
-        PlayerRuntime runtime,
-        GuildActionRequestMessage request)
+    private async Task RunGuildActionAsync(ClientSession session, uint requestId, PlayerRuntime runtime, GuildActionRequestMessage request)
     {
         GuildOperationResult result;
         try
@@ -107,34 +105,23 @@ internal sealed partial class GameServerHost
             switch (request.Action)
             {
                 case GuildActionKind.Create:
-                    result = await GuildSocial.CreateAsync(
-                        runtime, request.name, CancellationToken.None).ConfigureAwait(false);
+                    result = await GuildSocial.CreateAsync(runtime, request.name, CancellationToken.None).ConfigureAwait(false);
                     break;
-
                 case GuildActionKind.Accept:
-                    result = await GuildSocial.AcceptAsync(
-                        runtime, CancellationToken.None).ConfigureAwait(false);
+                    result = await GuildSocial.AcceptAsync(runtime, CancellationToken.None).ConfigureAwait(false);
                     break;
-
                 case GuildActionKind.Decline:
                     result = GuildSocial.Decline(runtime);
                     break;
-
                 case GuildActionKind.Leave:
-                    result = await GuildSocial.LeaveAsync(
-                        runtime, CancellationToken.None).ConfigureAwait(false);
+                    result = await GuildSocial.LeaveAsync(runtime, CancellationToken.None).ConfigureAwait(false);
                     break;
-
                 case GuildActionKind.Kick:
-                    result = await GuildSocial.KickAsync(
-                        runtime, request.targetCharacterId, CancellationToken.None).ConfigureAwait(false);
+                    result = await GuildSocial.KickAsync(runtime, request.targetCharacterId, CancellationToken.None).ConfigureAwait(false);
                     break;
-
                 case GuildActionKind.Disband:
-                    result = await GuildSocial.DisbandAsync(
-                        runtime, CancellationToken.None).ConfigureAwait(false);
+                    result = await GuildSocial.DisbandAsync(runtime, CancellationToken.None).ConfigureAwait(false);
                     break;
-
                 default:
                     result = GuildOperationResult.Fail("guild action is invalid");
                     break;
@@ -142,25 +129,17 @@ internal sealed partial class GameServerHost
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"Guild action failed for character {runtime?.CharacterId.Value ?? 0}: {ex.Message}");
+            Console.Error.WriteLine($"Guild action failed for character {runtime?.CharacterId.Value ?? 0}: {ex.Message}");
             result = GuildOperationResult.Fail("guild service is temporarily unavailable");
         }
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
-            SendResponse(
-                session,
-                requestId,
-                result.Success
-                    ? GuildMutationResponseMessage.Ok(result.Message)
-                    : GuildMutationResponseMessage.Failed(3, result.Message));
-
+            if (!IsCurrent(session)) return;
+            SendResponse(session, requestId,
+                result.Success ? GuildMutationResponseMessage.Ok(result.Message) : GuildMutationResponseMessage.Failed(3, result.Message));
             if (!result.Success && session.Ready && session.Entity?.Runtime != null)
-                RunGuildStateAsync(session, 0, session.Entity.Runtime, pushOnly: true).Forget();
+                RunGuildStateAsync(session, 0, session.Entity.Runtime, pushOnly: true, session.GuildKnownRevision).Forget();
         });
     }
 
@@ -168,32 +147,52 @@ internal sealed partial class GameServerHost
         ClientSession session,
         uint requestId,
         PlayerRuntime runtime,
-        bool pushOnly)
+        bool pushOnly,
+        long knownRevision)
     {
         GuildSnapshot guild = null;
         try
         {
-            guild = await GuildSocial.GetGuildAsync(
-                runtime.CharacterId.Value, CancellationToken.None).ConfigureAwait(false);
+            guild = await GuildSocial.GetGuildAsync(runtime.CharacterId.Value, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"Guild state load failed for character {runtime.CharacterId.Value}: {ex.Message}");
+            Console.Error.WriteLine($"Guild state load failed for character {runtime.CharacterId.Value}: {ex.Message}");
         }
 
-        GuildStateMessage state = BuildGuildState(runtime.CharacterId.Value, guild);
+        GuildStateMessage full = BuildGuildState(runtime.CharacterId.Value, guild);
+        long authoritativeRevision = GuildStateRevision.Compute(full);
+        GuildStateMessage outbound = knownRevision != 0 && knownRevision == authoritativeRevision
+            ? BuildGuildNotModified(full)
+            : full;
+
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
+            if (!IsCurrent(session)) return;
+            session.GuildKnownRevision = authoritativeRevision;
             if (pushOnly)
-                SendClientMessage(session, GuildMessageTypes.State, state, DeliveryMethod.ReliableOrdered);
+            {
+                if (!session.Ready) return;
+                SendClientMessage(session, GuildMessageTypes.State, outbound, DeliveryMethod.ReliableOrdered);
+            }
             else
-                SendResponse(session, requestId, state);
+            {
+                SendResponse(session, requestId, outbound);
+            }
         });
     }
+
+    private static GuildStateMessage BuildGuildNotModified(GuildStateMessage full) =>
+        new GuildStateMessage
+        {
+            updateKind = GuildStateUpdateKind.NotModified,
+            ownerCharacterId = full.ownerCharacterId,
+            pendingInviterCharacterId = full.pendingInviterCharacterId,
+            pendingInviterName = full.pendingInviterName,
+            pendingGuildId = full.pendingGuildId,
+            pendingGuildName = full.pendingGuildName,
+            pendingInviteSecondsRemaining = full.pendingInviteSecondsRemaining,
+        };
 
     private GuildStateMessage BuildGuildState(long ownerCharacterId, GuildSnapshot guild)
     {
@@ -223,12 +222,12 @@ internal sealed partial class GameServerHost
             pendingGuildId = invite.GuildId;
             pendingGuildName = invite.GuildName;
             double remaining = Math.Ceiling((invite.ExpiresUtc - DateTime.UtcNow).TotalSeconds);
-            pendingSeconds = (byte)Math.Clamp(
-                (int)remaining, 1, (int)GuildService.InviteLifetime.TotalSeconds);
+            pendingSeconds = (byte)Math.Clamp((int)remaining, 1, (int)GuildService.InviteLifetime.TotalSeconds);
         }
 
         return new GuildStateMessage
         {
+            updateKind = GuildStateUpdateKind.Full,
             ownerCharacterId = ownerCharacterId,
             guildId = guild?.GuildId ?? 0,
             revision = guild?.Revision ?? 0,

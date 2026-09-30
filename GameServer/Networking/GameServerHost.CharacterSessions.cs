@@ -35,8 +35,6 @@ namespace Game.GameServer.Networking;
 
 internal sealed partial class GameServerHost
 {
-    // Character-session transport integration. Authoritative session/character transitions remain
-    // owned by PlayerSessionService/CharacterService; this partial only adapts wire requests/results.
     private void RegisterCoreAndCharacterRequests(
         Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
     {
@@ -55,20 +53,16 @@ internal sealed partial class GameServerHost
     {
         uint packetVersion = reader.GetPackedUInt();
         ushort playerProtocol = reader.GetUShort();
-        bool compatible = packetVersion == PacketVersion &&
-                          playerProtocol == PlayerEntityProtocol.Version;
+        bool compatible = packetVersion == PacketVersion && playerProtocol == PlayerEntityProtocol.Version;
 
         _writer.Reset();
         _writer.PutPackedUShort(ResponseMessageType);
         _writer.PutPackedUInt(requestId);
         _writer.Put(compatible ? AckSuccess : AckError);
-
-        // LiteNetLibManager EnterGameResponseMessage
         _writer.PutPackedLong(session.Peer.Id);
-        _writer.Put(false); // ServerSceneInfo.HasValue
+        _writer.Put(false);
         _writer.Put(string.Empty);
         _writer.Put(string.Empty);
-        // PlayerEntityGameManager extra response payload.
         _writer.Put(PlayerEntityProtocol.Version);
         _writer.Put(_options.TickRate);
         Send(session, _writer, DeliveryMethod.ReliableUnordered);
@@ -89,8 +83,7 @@ internal sealed partial class GameServerHost
         if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative))
         {
             SendResponse(session, requestId, AdmissionAuthenticationResponseMessage.Failed(
-                (byte)PlayerSessionState.Closed,
-                "session is unavailable"));
+                (byte)PlayerSessionState.Closed, "session is unavailable"));
             return;
         }
 
@@ -98,13 +91,7 @@ internal sealed partial class GameServerHost
             authoritative.State != PlayerSessionState.Disconnecting &&
             authoritative.State != PlayerSessionState.Closed)
         {
-            SendResponse(session, requestId, new AdmissionAuthenticationResponseMessage
-            {
-                success = true,
-                accountId = authoritative.AccountId.Value,
-                sessionState = (byte)authoritative.State,
-                error = string.Empty,
-            });
+            SendAuthenticationSuccessWithRosterAsync(session, requestId, authoritative).Forget();
             return;
         }
 
@@ -113,8 +100,7 @@ internal sealed partial class GameServerHost
             !_runtime.SessionService.BeginAuthentication(session.SessionHandle))
         {
             SendResponse(session, requestId, AdmissionAuthenticationResponseMessage.Failed(
-                (byte)authoritative.State,
-                "session is not ready for authentication"));
+                (byte)authoritative.State, "session is not ready for authentication"));
             return;
         }
 
@@ -122,8 +108,7 @@ internal sealed partial class GameServerHost
         {
             _runtime.SessionService.CancelAuthentication(session.SessionHandle);
             SendResponse(session, requestId, AdmissionAuthenticationResponseMessage.Failed(
-                (byte)PlayerSessionState.Connected,
-                "authentication unavailable"));
+                (byte)PlayerSessionState.Connected, "authentication unavailable"));
             session.Peer.Disconnect();
             return;
         }
@@ -149,8 +134,7 @@ internal sealed partial class GameServerHost
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
+            if (!IsCurrent(session)) return;
 
             session.AuthenticationInFlight = false;
             AccountPolicySnapshot policy = admission?.policy;
@@ -158,38 +142,29 @@ internal sealed partial class GameServerHost
                 ? new AccountId(admission.accountId)
                 : default;
             long nowUtcTicks = DateTime.UtcNow.Ticks;
-            if (failure != null ||
-                !accountId.IsValid ||
-                policy == null ||
-                policy.accountId != accountId.Value ||
-                !policy.IsAccessAllowedAt(nowUtcTicks))
+            if (failure != null || !accountId.IsValid || policy == null ||
+                policy.accountId != accountId.Value || !policy.IsAccessAllowedAt(nowUtcTicks))
             {
                 _runtime.SessionService.CancelAuthentication(session.SessionHandle);
                 TryGetAuthoritativeSession(session, out PlayerSession failedSession);
                 SendResponse(session, requestId, AdmissionAuthenticationResponseMessage.Failed(
-                    (byte)(failedSession?.State ?? PlayerSessionState.Closed),
-                    "authentication unavailable"));
+                    (byte)(failedSession?.State ?? PlayerSessionState.Closed), "authentication unavailable"));
                 if (failure != null)
                     Console.Error.WriteLine($"Admission backend failure for peer {session.Peer.Id}: {failure.Message}");
                 return;
             }
 
             if (!_runtime.SessionService.CompleteAuthentication(session.SessionHandle, accountId) ||
-                !TryGetAuthoritativeSession(session, out PlayerSession authoritative))
+                !TryGetAuthoritativeSession(session, out PlayerSession authenticated))
             {
                 _runtime.SessionService.CancelAuthentication(session.SessionHandle);
                 SendResponse(session, requestId, AdmissionAuthenticationResponseMessage.Failed(
-                    (byte)PlayerSessionState.Connected,
-                    "account session already active"));
+                    (byte)PlayerSessionState.Connected, "account session already active"));
                 return;
             }
 
             session.AuthenticatedAccountId = accountId.Value;
             session.AccountPolicy = policy;
-
-            // Persistent Backend account policy is authoritative for staff access. The legacy
-            // JSON authorization file may still bootstrap emergency/test entries at startup,
-            // but every authenticated account replaces that entry with its current policy.
             _runtime.GameMasters.SetAuthorization(new StaffAuthorizationSnapshot
             {
                 accountId = accountId.Value,
@@ -198,12 +173,59 @@ internal sealed partial class GameServerHost
             });
             _runtime.GameMasters.OpenSession(accountId.Value);
 
+            SendAuthenticationSuccessWithRosterAsync(session, requestId, authenticated).Forget();
+        });
+    }
+
+    private async Task SendAuthenticationSuccessWithRosterAsync(
+        ClientSession session,
+        uint requestId,
+        PlayerSession expectedSession)
+    {
+        long rosterRevision = 0L;
+        try
+        {
+            CharacterListResult list = await _runtime.SessionService
+                .GetCharacterListAsync(session.SessionHandle, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (list != null && list.Success)
+            {
+                CharacterSummary[] source = list.Characters ?? Array.Empty<CharacterSummary>();
+                int count = Math.Min(source.Length, CharacterListResponseMessage.MaxCharacters);
+                var characters = new CharacterSessionCharacterSummary[count];
+                for (int i = 0; i < count; ++i)
+                {
+                    CharacterSummary summary = source[i];
+                    characters[i] = new CharacterSessionCharacterSummary(
+                        summary.CharacterId.Value,
+                        summary.Name,
+                        summary.MapId);
+                }
+                rosterRevision = CharacterRosterStateRevision.Compute(characters);
+            }
+        }
+        catch
+        {
+            // Cache reconciliation is optional. Zero makes the client recover with one
+            // authoritative CharacterList request rather than trusting stale local data.
+            rosterRevision = 0L;
+        }
+
+        QueueMainThreadCompletion(() =>
+        {
+            if (!IsCurrent(session) ||
+                !TryGetAuthoritativeSession(session, out PlayerSession authoritative) ||
+                !authoritative.HasAccount ||
+                authoritative.AccountId != expectedSession.AccountId)
+                return;
+
             SendResponse(session, requestId, new AdmissionAuthenticationResponseMessage
             {
                 success = true,
                 accountId = authoritative.AccountId.Value,
                 sessionState = (byte)authoritative.State,
                 error = string.Empty,
+                rosterRevision = rosterRevision,
             });
         });
     }
@@ -218,7 +240,6 @@ internal sealed partial class GameServerHost
                 "session is not in character lobby"));
             return;
         }
-
         LoadCharacterListAsync(session, requestId).Forget();
     }
 
@@ -228,20 +249,14 @@ internal sealed partial class GameServerHost
         Exception failure = null;
         try
         {
-            result = await _runtime.SessionService
-                .GetCharacterListAsync(session.SessionHandle, CancellationToken.None)
+            result = await _runtime.SessionService.GetCharacterListAsync(session.SessionHandle, CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex)
-        {
-            failure = ex;
-        }
+        catch (Exception ex) { failure = ex; }
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
+            if (!IsCurrent(session)) return;
             TryGetAuthoritativeSession(session, out PlayerSession authoritative);
             if (failure != null || result == null || !result.Success)
             {
@@ -259,10 +274,7 @@ internal sealed partial class GameServerHost
             for (int i = 0; i < count; ++i)
             {
                 CharacterSummary summary = source[i];
-                characters[i] = new CharacterSessionCharacterSummary(
-                    summary.CharacterId.Value,
-                    summary.Name,
-                    summary.MapId);
+                characters[i] = new CharacterSessionCharacterSummary(summary.CharacterId.Value, summary.Name, summary.MapId);
             }
 
             SendResponse(session, requestId, new CharacterListResponseMessage
@@ -279,31 +291,22 @@ internal sealed partial class GameServerHost
     {
         var request = new CreateCharacterRequestMessage();
         request.Deserialize(reader);
-
         if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative))
         {
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)PlayerSessionState.Closed,
-                (byte)CharacterCreateFailure.SessionNotFound,
-                "character session not found"));
+                (byte)PlayerSessionState.Closed, (byte)CharacterCreateFailure.SessionNotFound, "character session not found"));
             return;
         }
-
         if (authoritative.State != PlayerSessionState.CharacterLobby)
         {
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)authoritative.State,
-                (byte)CharacterCreateFailure.InvalidSessionState,
-                "session is not in character lobby"));
+                (byte)authoritative.State, (byte)CharacterCreateFailure.InvalidSessionState, "session is not in character lobby"));
             return;
         }
-
         if (session.CharacterCreateInFlight)
         {
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)authoritative.State,
-                (byte)CharacterCreateFailure.InvalidSessionState,
-                "character creation is already in progress"));
+                (byte)authoritative.State, (byte)CharacterCreateFailure.InvalidSessionState, "character creation is already in progress"));
             return;
         }
 
@@ -312,9 +315,7 @@ internal sealed partial class GameServerHost
         if (spawn == null)
         {
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)authoritative.State,
-                (byte)CharacterCreateFailure.PersistenceFailed,
-                "character creation spawn is not configured"));
+                (byte)authoritative.State, (byte)CharacterCreateFailure.PersistenceFailed, "character creation spawn is not configured"));
             return;
         }
 
@@ -322,26 +323,21 @@ internal sealed partial class GameServerHost
         try
         {
             initialLocation = new CharacterLocationState(
-                spawn.mapId,
-                spawn.instanceId ?? string.Empty,
-                new WorldPosition(spawn.positionX, spawn.positionY, spawn.positionZ),
-                spawn.yawDegrees);
+                spawn.mapId, spawn.instanceId ?? string.Empty,
+                new WorldPosition(spawn.positionX, spawn.positionY, spawn.positionZ), spawn.yawDegrees);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Character-creation spawn configuration is invalid: {ex.Message}");
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)authoritative.State,
-                (byte)CharacterCreateFailure.PersistenceFailed,
-                "character creation spawn is invalid"));
+                (byte)authoritative.State, (byte)CharacterCreateFailure.PersistenceFailed, "character creation spawn is invalid"));
             return;
         }
 
         if (!_runtime.Spawns.TryResolveFirstSpawn(initialLocation, out CharacterLocationState resolvedInitialLocation, out string firstSpawnDetail))
         {
             SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                (byte)authoritative.State,
-                (byte)CharacterCreateFailure.PersistenceFailed,
+                (byte)authoritative.State, (byte)CharacterCreateFailure.PersistenceFailed,
                 string.IsNullOrWhiteSpace(firstSpawnDetail) ? "baked first-spawn location is invalid" : firstSpawnDetail));
             return;
         }
@@ -351,9 +347,7 @@ internal sealed partial class GameServerHost
     }
 
     private async Task CreateCharacterAsync(
-        ClientSession session,
-        uint requestId,
-        string requestedName,
+        ClientSession session, uint requestId, string requestedName,
         CharacterAppearanceRecipe initialAppearance,
         CharacterPresentationPreferences initialPresentation,
         CharacterLocationState initialLocation)
@@ -363,50 +357,33 @@ internal sealed partial class GameServerHost
         Exception failure = null;
         try
         {
-            result = await _runtime.SessionService
-                .CreateCharacterAsync(
-                    session.SessionHandle,
-                    requestedName,
-                    initialLocation,
-                    initialAppearance,
-                    initialPresentation,
-                    CancellationToken.None)
+            result = await _runtime.SessionService.CreateCharacterAsync(
+                    session.SessionHandle, requestedName, initialLocation, initialAppearance, initialPresentation, CancellationToken.None)
                 .ConfigureAwait(false);
             hasResult = true;
         }
-        catch (Exception ex)
-        {
-            failure = ex;
-        }
+        catch (Exception ex) { failure = ex; }
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
+            if (!IsCurrent(session)) return;
             session.CharacterCreateInFlight = false;
             TryGetAuthoritativeSession(session, out PlayerSession authoritative);
-
             if (failure != null || !hasResult)
             {
                 SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
                     (byte)(authoritative?.State ?? PlayerSessionState.Closed),
-                    (byte)CharacterCreateFailure.PersistenceFailed,
-                    "character creation failed"));
-                if (failure != null)
-                    Console.Error.WriteLine($"Character-creation failure for peer {session.Peer.Id}: {failure.Message}");
+                    (byte)CharacterCreateFailure.PersistenceFailed, "character creation failed"));
+                if (failure != null) Console.Error.WriteLine($"Character-creation failure for peer {session.Peer.Id}: {failure.Message}");
                 return;
             }
-
             if (!result.Success)
             {
                 SendResponse(session, requestId, CreateCharacterResponseMessage.Failed(
-                    (byte)(authoritative?.State ?? PlayerSessionState.Closed),
-                    (byte)result.Failure,
+                    (byte)(authoritative?.State ?? PlayerSessionState.Closed), (byte)result.Failure,
                     CharacterCreateFailureText(result.Failure)));
                 return;
             }
-
             SendResponse(session, requestId, new CreateCharacterResponseMessage
             {
                 success = true,
@@ -416,7 +393,6 @@ internal sealed partial class GameServerHost
                 failure = (byte)CharacterCreateFailure.None,
                 error = string.Empty,
             });
-
         });
     }
 
@@ -424,101 +400,68 @@ internal sealed partial class GameServerHost
     {
         var request = new DeleteCharacterRequestMessage();
         request.Deserialize(reader);
-
         if (request.characterId <= 0)
         {
             SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)PlayerSessionState.Closed,
-                (byte)CharacterDeleteFailure.InvalidCharacter,
-                "character id is invalid"));
+                request.characterId, (byte)PlayerSessionState.Closed, (byte)CharacterDeleteFailure.InvalidCharacter, "character id is invalid"));
             return;
         }
-
         if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative))
         {
             SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)PlayerSessionState.Closed,
-                (byte)CharacterDeleteFailure.SessionNotFound,
-                "character session not found"));
+                request.characterId, (byte)PlayerSessionState.Closed, (byte)CharacterDeleteFailure.SessionNotFound, "character session not found"));
             return;
         }
-
         if (authoritative.State != PlayerSessionState.CharacterLobby)
         {
             SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)authoritative.State,
-                (byte)CharacterDeleteFailure.InvalidSessionState,
-                "session is not in character lobby"));
+                request.characterId, (byte)authoritative.State, (byte)CharacterDeleteFailure.InvalidSessionState, "session is not in character lobby"));
             return;
         }
-
         if (session.CharacterDeleteInFlight || session.CharacterCreateInFlight || session.CharacterLoadInFlight)
         {
             SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)authoritative.State,
-                (byte)CharacterDeleteFailure.InvalidSessionState,
+                request.characterId, (byte)authoritative.State, (byte)CharacterDeleteFailure.InvalidSessionState,
                 "another character-lobby operation is already in progress"));
             return;
         }
-
         session.CharacterDeleteInFlight = true;
         DeleteCharacterAsync(session, requestId, new CharacterId(request.characterId)).Forget();
     }
 
-    private async Task DeleteCharacterAsync(
-        ClientSession session,
-        uint requestId,
-        CharacterId characterId)
+    private async Task DeleteCharacterAsync(ClientSession session, uint requestId, CharacterId characterId)
     {
         CharacterDeleteResult result = default;
         bool hasResult = false;
         Exception failure = null;
         try
         {
-            result = await _runtime.SessionService
-                .DeleteCharacterAsync(session.SessionHandle, characterId, CancellationToken.None)
+            result = await _runtime.SessionService.DeleteCharacterAsync(session.SessionHandle, characterId, CancellationToken.None)
                 .ConfigureAwait(false);
             hasResult = true;
         }
-        catch (Exception ex)
-        {
-            failure = ex;
-        }
+        catch (Exception ex) { failure = ex; }
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
+            if (!IsCurrent(session)) return;
             session.CharacterDeleteInFlight = false;
             TryGetAuthoritativeSession(session, out PlayerSession authoritative);
-
             if (failure != null || !hasResult)
             {
                 SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)(authoritative?.State ?? PlayerSessionState.Closed),
-                    (byte)CharacterDeleteFailure.PersistenceFailed,
-                    "character deletion failed"));
-                if (failure != null)
-                    Console.Error.WriteLine($"Character-delete failure for peer {session.Peer.Id}: {failure.Message}");
+                    characterId.Value, (byte)(authoritative?.State ?? PlayerSessionState.Closed),
+                    (byte)CharacterDeleteFailure.PersistenceFailed, "character deletion failed"));
+                if (failure != null) Console.Error.WriteLine($"Character-delete failure for peer {session.Peer.Id}: {failure.Message}");
                 return;
             }
-
             if (!result.Success)
             {
                 SendResponse(session, requestId, DeleteCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)(authoritative?.State ?? PlayerSessionState.Closed),
-                    (byte)result.Failure,
-                    CharacterDeleteFailureText(result.Failure)));
+                    characterId.Value, (byte)(authoritative?.State ?? PlayerSessionState.Closed),
+                    (byte)result.Failure, CharacterDeleteFailureText(result.Failure)));
                 return;
             }
-
             SendResponse(session, requestId, new DeleteCharacterResponseMessage
             {
                 success = true,
@@ -535,51 +478,37 @@ internal sealed partial class GameServerHost
     {
         var request = new EnterCharacterRequestMessage();
         request.Deserialize(reader);
-
         if (request.characterId <= 0)
         {
             SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)PlayerSessionState.Closed,
-                (byte)CharacterSelectFailure.InvalidSessionState,
-                "character id is invalid"));
+                request.characterId, (byte)PlayerSessionState.Closed,
+                (byte)CharacterSelectFailure.InvalidSessionState, "character id is invalid"));
             return;
         }
-
         if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative))
         {
             SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)PlayerSessionState.Closed,
-                (byte)CharacterSelectFailure.SessionNotFound,
-                "character session not found"));
+                request.characterId, (byte)PlayerSessionState.Closed,
+                (byte)CharacterSelectFailure.SessionNotFound, "character session not found"));
             return;
         }
 
         CharacterId characterId = new CharacterId(request.characterId);
-        if (authoritative.State == PlayerSessionState.InWorld &&
-            authoritative.HasSelectedCharacter &&
-            authoritative.SelectedCharacterId == characterId)
+        if (authoritative.State == PlayerSessionState.InWorld && authoritative.HasSelectedCharacter && authoritative.SelectedCharacterId == characterId)
         {
             SendResponse(session, requestId, SuccessfulEnterResponse(request.characterId, authoritative.State, true));
             return;
         }
-
-        if (authoritative.State == PlayerSessionState.AwaitingWorldEntry &&
-            authoritative.HasSelectedCharacter &&
-            authoritative.SelectedCharacterId == characterId)
+        if (authoritative.State == PlayerSessionState.AwaitingWorldEntry && authoritative.HasSelectedCharacter && authoritative.SelectedCharacterId == characterId)
         {
             SendResponse(session, requestId, SuccessfulEnterResponse(request.characterId, authoritative.State, false));
             return;
         }
-
         if (authoritative.State != PlayerSessionState.CharacterLobby || session.CharacterLoadInFlight)
         {
             SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                request.characterId,
-                (byte)authoritative.State,
-                (byte)CharacterSelectFailure.InvalidSessionState,
-                "character session is not ready to load this character"));
+                request.characterId, (byte)authoritative.State,
+                (byte)CharacterSelectFailure.InvalidSessionState, "character session is not ready to load this character"));
             return;
         }
 
@@ -593,64 +522,45 @@ internal sealed partial class GameServerHost
         Exception failure = null;
         try
         {
-            result = await _runtime.SessionService
-                .SelectCharacterAsync(session.SessionHandle, characterId, CancellationToken.None)
+            result = await _runtime.SessionService.SelectCharacterAsync(session.SessionHandle, characterId, CancellationToken.None)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex)
-        {
-            failure = ex;
-        }
+        catch (Exception ex) { failure = ex; }
 
         QueueMainThreadCompletion(() =>
         {
-            if (!IsCurrent(session))
-                return;
-
+            if (!IsCurrent(session)) return;
             session.CharacterLoadInFlight = false;
             if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative))
             {
                 SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)PlayerSessionState.Closed,
-                    (byte)CharacterSelectFailure.SessionChangedDuringLoad,
-                    "character session changed while loading"));
+                    characterId.Value, (byte)PlayerSessionState.Closed,
+                    (byte)CharacterSelectFailure.SessionChangedDuringLoad, "character session changed while loading"));
                 return;
             }
-
             if (failure != null)
             {
                 SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)authoritative.State,
-                    (byte)CharacterSelectFailure.CharacterLoadFailed,
-                    "character enter failed"));
+                    characterId.Value, (byte)authoritative.State,
+                    (byte)CharacterSelectFailure.CharacterLoadFailed, "character enter failed"));
                 Console.Error.WriteLine($"Character-load failure for peer {session.Peer.Id}: {failure.Message}");
                 return;
             }
-
             if (!result.Success)
             {
                 SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)authoritative.State,
-                    (byte)result.Failure,
+                    characterId.Value, (byte)authoritative.State, (byte)result.Failure,
                     CharacterSelectFailureText(result.Failure)));
                 return;
             }
-
-            if (!authoritative.HasSelectedCharacter ||
-                authoritative.SelectedCharacterId != characterId ||
+            if (!authoritative.HasSelectedCharacter || authoritative.SelectedCharacterId != characterId ||
                 authoritative.State != PlayerSessionState.AwaitingWorldEntry)
             {
                 SendResponse(session, requestId, EnterCharacterResponseMessage.Failed(
-                    characterId.Value,
-                    (byte)authoritative.State,
-                    (byte)CharacterSelectFailure.InvalidSessionState,
-                    "character session is not awaiting world entry"));
+                    characterId.Value, (byte)authoritative.State,
+                    (byte)CharacterSelectFailure.InvalidSessionState, "character session is not awaiting world entry"));
                 return;
             }
-
             SendResponse(session, requestId, SuccessfulEnterResponse(characterId.Value, authoritative.State, false));
         });
     }
@@ -658,10 +568,8 @@ internal sealed partial class GameServerHost
     private void HandleClientReady(ClientSession session, uint requestId)
     {
         if (!TryGetAuthoritativeSession(session, out PlayerSession authoritative) ||
-            authoritative.State != PlayerSessionState.AwaitingWorldEntry ||
-            authoritative.Runtime == null ||
-            session.Entity != null ||
-            session.Ready)
+            authoritative.State != PlayerSessionState.AwaitingWorldEntry || authoritative.Runtime == null ||
+            session.Entity != null || session.Ready)
         {
             SendBareResponse(session, requestId, AckError);
             return;
@@ -674,25 +582,15 @@ internal sealed partial class GameServerHost
             SendBareResponse(session, requestId, AckError);
             return;
         }
-        if (resolvedEntry != requestedEntry)
-        {
-            authoritative.Runtime.UpdateLocation(resolvedEntry);
-        }
+        if (resolvedEntry != requestedEntry) authoritative.Runtime.UpdateLocation(resolvedEntry);
 
         uint objectId = NextObjectId();
         ushort generation = NextGeneration();
-        var entity = new ServerPlayerEntity(
-            objectId,
-            generation,
-            session.Peer.Id,
-            authoritative.Runtime,
-            _runtime.Maps);
-
+        var entity = new ServerPlayerEntity(objectId, generation, session.Peer.Id, authoritative.Runtime, _runtime.Maps);
         session.Entity = entity;
 
         PlayerWorldLifecycleResult adopted = _runtime.WorldLifecycle.AdoptExternalEnter(
-            session.SessionHandle,
-            new PlayerWorldHandle(objectId));
+            session.SessionHandle, new PlayerWorldHandle(objectId));
         if (!adopted.Success)
         {
             session.Entity = null;
@@ -706,29 +604,12 @@ internal sealed partial class GameServerHost
         RegisterReadySessionIndexes(session);
         ActivatePlayerGameplayRuntime(session, authoritative.Runtime);
         SendCurrentBackendStatus(session);
-
-        // Preserve the canonical Ready contract: the request is only successful after
-        // authoritative session adoption is committed to InWorld.
         SendBareResponse(session, requestId, AckSuccess);
-
-        // World-item presentation must never gate canonical player admission. If loot AOI
-        // initialization fails, the player still enters normally and the fault is isolated
-        // to the optional world-item replication slice.
         TryInitializeWorldItemInterestAfterReady(session);
-
-        // Build the authoritative observer graph before sending PlayerEntity baselines.
-        // Only same-map/instance entities inside AOI are exposed to this client, and only
-        // observers inside AOI receive this new entity. Self visibility remains mandatory.
         ApplyInterestChanges(_worldInterest.Register(session));
         ReconcilePopulationObserver(session);
-
-        // Push immutable/public gameplay references before compact owner state so item,
-        // equipment, status and ability IDs can be resolved client-side without strings
-        // on every gameplay packet. Changed world-interactable state follows on the same
-        // reliable stream for doors/gates and other non-default runtime state.
         SendOwnerBaselinesAfterReady(session);
         SendChangedWorldInteractableStatesAfterReady(session);
-
     }
 
     private static string CharacterCreateFailureText(CharacterCreateFailure failure) => failure switch
@@ -746,7 +627,7 @@ internal sealed partial class GameServerHost
     private static string CharacterDeleteFailureText(CharacterDeleteFailure failure) => failure switch
     {
         CharacterDeleteFailure.SessionNotFound => "character session not found",
-        CharacterDeleteFailure.InvalidSessionState => "session is not in character lobby",
+        CharacterDeleteFailure.InvalidSessionState => "character session is not in character lobby",
         CharacterDeleteFailure.InvalidCharacter => "character id is invalid",
         CharacterDeleteFailure.CharacterNotFoundOrNotOwned => "character was not found or is not owned by this account",
         CharacterDeleteFailure.CharacterActive => "character is active or its authority lease is still recovering",
