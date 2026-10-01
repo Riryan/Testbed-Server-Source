@@ -144,6 +144,7 @@ namespace Game.Server.Application.Social
         private readonly IGuildRepository _repository;
         private readonly ICharacterPersistenceLeaseProofProvider _leaseProof;
         private readonly Dictionary<long, GuildSnapshot> _guildByCharacter = new Dictionary<long, GuildSnapshot>();
+        private readonly HashSet<long> _knownNoGuild = new HashSet<long>();
         private readonly Dictionary<long, PendingInvite> _inviteByTarget = new Dictionary<long, PendingInvite>();
 
         public event Action<long> StateChanged;
@@ -252,6 +253,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to leave guild." : result.Error);
             Invalidate(result.Guild, characterId);
+            MarkNoGuild(characterId);
             NotifyGuildState(result.Guild, characterId);
             return GuildOperationResult.Ok("Left the guild.", 0, result.Guild);
         }
@@ -270,6 +272,7 @@ namespace Game.Server.Application.Social
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to remove guild member." : result.Error);
             Invalidate(result.Guild, targetCharacterId);
             Cache(result.Guild);
+            MarkNoGuild(targetCharacterId);
             NotifyGuildState(result.Guild, targetCharacterId);
             return GuildOperationResult.Ok("Guild member removed.", targetCharacterId, result.Guild);
         }
@@ -286,6 +289,7 @@ namespace Game.Server.Application.Social
             if (!result.Success)
                 return GuildOperationResult.Fail(string.IsNullOrWhiteSpace(result.Error) ? "Unable to disband guild." : result.Error);
             Invalidate(before, 0);
+            MarkGuildMembersNoGuild(before);
             NotifyGuildState(before);
             return GuildOperationResult.Ok("Guild disbanded.", 0, before);
         }
@@ -304,10 +308,19 @@ namespace Game.Server.Application.Social
             {
                 if (_guildByCharacter.TryGetValue(characterId, out GuildSnapshot cached))
                     return cached;
+                if (_knownNoGuild.Contains(characterId))
+                    return null;
             }
 
             GuildRepositoryResult result = await _repository.LoadByCharacterAsync(characterId, cancellationToken).ConfigureAwait(false);
-            if (!result.Success || !result.Found || result.Guild == null)
+            if (!result.Success)
+                return null;
+            if (!result.Found)
+            {
+                MarkNoGuild(characterId);
+                return null;
+            }
+            if (result.Guild == null)
                 return null;
             Cache(result.Guild);
             return result.Guild;
@@ -367,8 +380,9 @@ namespace Game.Server.Application.Social
             if (characterId <= 0) return;
             lock (_gate)
             {
-                // Membership is durable in the repository; this is only a runtime cache.
+                // Membership is durable in the repository; these are only runtime caches.
                 _guildByCharacter.Remove(characterId);
+                _knownNoGuild.Remove(characterId);
                 _inviteByTarget.Remove(characterId);
 
                 DateTime now = DateTime.UtcNow;
@@ -406,7 +420,39 @@ namespace Game.Server.Application.Social
             lock (_gate)
             {
                 for (int i = 0; i < guild.Members.Length; ++i)
-                    _guildByCharacter[guild.Members[i].CharacterId] = guild;
+                {
+                    long characterId = guild.Members[i].CharacterId;
+                    _guildByCharacter[characterId] = guild;
+                    _knownNoGuild.Remove(characterId);
+                }
+            }
+        }
+
+        private void MarkNoGuild(long characterId)
+        {
+            if (characterId <= 0)
+                return;
+            lock (_gate)
+            {
+                _guildByCharacter.Remove(characterId);
+                _knownNoGuild.Add(characterId);
+            }
+        }
+
+        private void MarkGuildMembersNoGuild(GuildSnapshot guild)
+        {
+            if (guild == null)
+                return;
+            lock (_gate)
+            {
+                for (int i = 0; i < guild.Members.Length; ++i)
+                {
+                    long characterId = guild.Members[i]?.CharacterId ?? 0;
+                    if (characterId <= 0)
+                        continue;
+                    _guildByCharacter.Remove(characterId);
+                    _knownNoGuild.Add(characterId);
+                }
             }
         }
 
