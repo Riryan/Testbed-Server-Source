@@ -748,6 +748,22 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         if (!IsCurrent(targetSession) || !targetSession.Ready || targetSession.Entity == null)
             return;
 
+        // Persistent interaction presentation is authoritative state for the lifetime of the
+        // interaction, not a one-shot pulse. Overlay it once per source broadcast so ordinary
+        // movement/heartbeat snapshots cannot erase it before the explicit Stop is sent.
+        // Explicit action/death states still win, and death clears the stored presentation so
+        // it cannot reappear after respawn if a delayed interaction completion arrives later.
+        if (targetSession.Entity.IsDead)
+        {
+            _persistentInteractionPresentation.Remove(targetSession);
+        }
+        else if (actionState == (byte)PlayerEntityActionState.None &&
+                 TryGetPersistentInteractionPresentation(targetSession, out byte persistentPresentationId))
+        {
+            actionState = (byte)PlayerEntityActionState.Interacting;
+            actionId = persistentPresentationId;
+        }
+
         // Interest is reconciled from authoritative server position before any payload is
         // considered. This is the critical scalability boundary: out-of-AOI clients never
         // reach serialization or LiteNetLib Send().
