@@ -486,6 +486,48 @@ internal sealed partial class GameServerHost
         bool isHarvest =
             request.ActionId == InteractionActionId.Harvest &&
             target.Definition.kind == ServerWorldInteractableKind.HarvestNode;
+
+        // Compatibility for the current checked-in Interaction Test Dummy bake.
+        // Client authoring already defines this fixture as no-slot / instant / unlocked,
+        // but the checked-in shared-world data still contains the older timed+slot form.
+        // Validate the same authoritative state/range/facing gates, then accept it without
+        // creating a session. This keeps the existing client approach/presentation path
+        // authoritative without allowing the stale bake to teleport the player.
+        bool isLegacyNoWarpInteractionTestDummy =
+            string.Equals(
+                target.Definition.gameplayProfileId,
+                "interaction_test_dummy",
+                StringComparison.OrdinalIgnoreCase);
+
+        if (!isHarvest &&
+            isLegacyNoWarpInteractionTestDummy)
+        {
+            if (!_runtime.WorldInteractables.Evaluate(
+                    source,
+                    target,
+                    definition,
+                    out string legacyDummyReason))
+            {
+                SendResponse(client, requestId, ContextInteractionResponseMessage.Failed(
+                    request.sequence,
+                    request.target,
+                    request.CategoryId,
+                    request.ActionId,
+                    InteractionResultCode.Rejected,
+                    legacyDummyReason));
+                return;
+            }
+
+            var accepted = new InteractionResult(
+                request.sequence,
+                request.ActionId,
+                InteractionResultCode.Success,
+                new InteractionTargetHandle(InteractionTargetKind.SceneObject, stableId),
+                "interaction test accepted");
+            SendResponse(client, requestId, ToContextInteractionWire(request.target, accepted));
+            return;
+        }
+
         HarvestAttemptPlan harvestPlan = default;
         if (isHarvest &&
             !_runtime.Harvesting.TryPrepareAttempt(source, stableId, out harvestPlan, out string harvestReason))
@@ -562,10 +604,13 @@ internal sealed partial class GameServerHost
             SendHarvestStarted(client, stableId, harvestPlan);
         }
 
-        // Interactions that require authored alignment keep the existing anchor warp.
-        // Harvest already passed authoritative range/facing checks and remains at the
-        // player's validated world position instead of snapping to the node anchor.
-        if (!isHarvest && client.Entity != null)
+        // Only an actually reserved authored slot requests hard alignment. A timed/session
+        // interaction with no slot must keep the player's validated world position; falling
+        // back to the world-object pose turns a normal interaction into an unintended teleport.
+        // Harvest already follows the no-warp path.
+        if (!isHarvest &&
+            client.Entity != null &&
+            !string.IsNullOrWhiteSpace(interactionSession.SlotId))
         {
             var aligned = new CharacterLocationState(
                 interactionSession.MapId,
