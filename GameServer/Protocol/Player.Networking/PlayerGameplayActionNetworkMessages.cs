@@ -16,7 +16,7 @@ namespace Player.Networking
         public const ushort BasicAttack = 500;
         public const ushort BeginAbility = 501;
         public const ushort CancelAbility = 502;
-        public const ushort Interaction = 503;
+        // 503 retired: legacy PlayerInteraction request removed. Do not reuse.
         public const ushort Respawn = 504;
         public const ushort InteractionMenu = 505;
         public const ushort ContextInteraction = 506;
@@ -852,85 +852,6 @@ namespace Player.Networking
                 resultCode = (byte)code,
                 detail = detail ?? string.Empty,
             };
-    }
-
-    public struct PlayerInteractionRequestMessage : INetSerializable
-    {
-        public PlayerTargetReferenceWire target;
-        public ushort categoryId;
-        public ushort actionId;
-        public uint sequence;
-
-        public void Serialize(NetDataWriter writer)
-        {
-            target.Serialize(writer);
-            writer.Put(categoryId);
-            writer.Put(actionId);
-            writer.Put(sequence);
-        }
-
-        public void Deserialize(NetDataReader reader)
-        {
-            target.Deserialize(reader);
-            categoryId = reader.GetUShort();
-            actionId = reader.GetUShort();
-            sequence = reader.GetUInt();
-        }
-
-        public InteractionCategoryId CategoryId => (InteractionCategoryId)categoryId;
-        public InteractionActionId ActionId => (InteractionActionId)actionId;
-    }
-
-    public struct PlayerInteractionResponseMessage : INetSerializable
-    {
-        public bool success;
-        public uint sequence;
-        public ushort categoryId;
-        public ushort actionId;
-        public byte resultCode;
-        public long targetCharacterId;
-        public string detail;
-
-        public void Serialize(NetDataWriter writer)
-        {
-            // sequence + actionId are request-known. Keep only the authoritative result,
-            // resolved target identity, and optional user-facing detail.
-            writer.Put(resultCode);
-            writer.Put(targetCharacterId);
-            writer.Put(detail ?? string.Empty);
-        }
-
-        public void Deserialize(NetDataReader reader)
-        {
-            resultCode = reader.GetByte();
-            success = resultCode == (byte)InteractionResultCode.Success;
-            sequence = 0;
-            categoryId = 0;
-            actionId = 0;
-            targetCharacterId = reader.GetLong();
-            detail = reader.GetString(384);
-        }
-
-        public InteractionCategoryId CategoryId => (InteractionCategoryId)categoryId;
-        public InteractionActionId ActionId => (InteractionActionId)actionId;
-        public InteractionResultCode ResultCode => (InteractionResultCode)resultCode;
-
-        public static PlayerInteractionResponseMessage Failed(
-            uint sequence,
-            InteractionCategoryId categoryId,
-            InteractionActionId actionId,
-            InteractionResultCode code,
-            string detail) =>
-            new PlayerInteractionResponseMessage
-            {
-                success = false,
-                sequence = sequence,
-                categoryId = (ushort)categoryId,
-                actionId = (ushort)actionId,
-                resultCode = (byte)code,
-                detail = detail ?? string.Empty,
-            };
-
     }
 
     public struct InteractionTargetReferenceWire : INetSerializable

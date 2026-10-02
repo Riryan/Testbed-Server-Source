@@ -44,7 +44,6 @@ internal sealed class ClientSession
     public Action<CharacterResourceChange> ResourceChangedHandler { get; set; }
     public Action<StatusEffectChange> StatusEffectChangedHandler { get; set; }
 
-    public uint LastPlayerInteractionSequence { get; set; }
     public uint LastContextInteractionSequence { get; set; }
     public uint LastWorldItemInteractionSequence { get; set; }
     public double PlayerInteractionTokens { get; set; } = 6d;

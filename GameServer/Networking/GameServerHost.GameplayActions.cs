@@ -29,7 +29,6 @@ internal sealed partial class GameServerHost
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.BasicAttack, HandleBasicAttack);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.BeginAbility, HandleBeginAbility);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.CancelAbility, HandleCancelAbility);
-        RegisterRequest(handlers, PlayerGameplayActionRequestTypes.Interaction, HandleInteraction);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.Reload, HandleReload);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.CombatOwnerState, HandleCombatOwnerState);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.Respawn,
@@ -291,81 +290,6 @@ internal sealed partial class GameServerHost
         Console.WriteLine(
             $"Character respawned: peer={session.Peer.Id}, character={runtime.CharacterId.Value}, " +
             $"map={result.Location.MapId}, position=({result.Location.Position.X:0.##}, {result.Location.Position.Y:0.##}, {result.Location.Position.Z:0.##})");
-    }
-
-    private void HandleInteraction(ClientSession session, uint requestId, NetDataReader reader)
-    {
-        var request = new PlayerInteractionRequestMessage();
-        request.Deserialize(reader);
-
-        if (!TryGetGameplayRuntime(session, out PlayerRuntime source))
-        {
-            SendResponse(session, requestId, PlayerInteractionResponseMessage.Failed(
-                request.sequence,
-                request.CategoryId,
-                request.ActionId,
-                InteractionResultCode.InvalidState,
-                "source character is not in world"));
-            return;
-        }
-
-        if (!TryAdmitPlayerInteractionRequest(session, request.sequence, out InteractionResultCode admissionCode, out string admissionDetail))
-        {
-            SendResponse(session, requestId, PlayerInteractionResponseMessage.Failed(
-                request.sequence,
-                request.CategoryId,
-                request.ActionId,
-                admissionCode,
-                admissionDetail));
-            return;
-        }
-
-        if (!InteractionCategoryCatalog.IsCompatible(
-                InteractionTargetKind.PlayerEntity,
-                request.CategoryId,
-                request.ActionId))
-        {
-            SendResponse(session, requestId, PlayerInteractionResponseMessage.Failed(
-                request.sequence,
-                request.CategoryId,
-                request.ActionId,
-                InteractionResultCode.Unsupported,
-                "interaction category/action pair is not supported for player targets"));
-            return;
-        }
-
-        if (!TryResolvePlayerTarget(session, request.target, out PlayerRuntime target))
-        {
-            SendResponse(session, requestId, PlayerInteractionResponseMessage.Failed(
-                request.sequence,
-                request.CategoryId,
-                request.ActionId,
-                InteractionResultCode.InvalidTarget,
-                "target is unavailable or outside authoritative interest"));
-            return;
-        }
-
-        // Party/Guild already have canonical standalone owners. Reuse them from the
-        // existing player-interaction request instead of inventing a social wire route.
-        if (request.ActionId == InteractionActionId.PartyInvite)
-        {
-            InteractionResult partyInvite = ExecutePartyInviteInteraction(source, target, request.sequence);
-            SendResponse(session, requestId, ToGameplayWire(partyInvite));
-            return;
-        }
-        if (request.ActionId == InteractionActionId.GuildInvite)
-        {
-            RunGuildInviteInteractionAsync(session, requestId, source, target, request.sequence).Forget();
-            return;
-        }
-
-        InteractionResult result = _runtime.Interactions.ExecutePlayerAction(
-            source,
-            target,
-            request.ActionId,
-            request.sequence,
-            _scheduler.ServerTime);
-        SendResponse(session, requestId, ToGameplayWire(result));
     }
 
     /// <summary>
@@ -631,17 +555,9 @@ internal sealed partial class GameServerHost
 
     private enum InteractionSequenceStream : byte
     {
-        Player = 0,
-        Context = 1,
-        WorldItem = 2,
+        Context = 0,
+        WorldItem = 1,
     }
-
-    private bool TryAdmitPlayerInteractionRequest(
-        ClientSession session,
-        uint sequence,
-        out InteractionResultCode code,
-        out string detail) =>
-        TryAdmitInteractionRequest(session, sequence, InteractionSequenceStream.Player, out code, out detail);
 
     private bool TryAdmitContextInteractionRequest(
         ClientSession session,
@@ -685,7 +601,6 @@ internal sealed partial class GameServerHost
 
         uint previous = stream switch
         {
-            InteractionSequenceStream.Player => session.LastPlayerInteractionSequence,
             InteractionSequenceStream.Context => session.LastContextInteractionSequence,
             InteractionSequenceStream.WorldItem => session.LastWorldItemInteractionSequence,
             _ => 0u,
@@ -698,14 +613,11 @@ internal sealed partial class GameServerHost
             return false;
         }
 
-        // Keep independent freshness streams because the current client owns separate
-        // monotonic counters for player and world-item interactions. A single shared
-        // counter would incorrectly reject valid cross-family requests.
+        // Keep independent freshness streams because Context and WorldItem requests own
+        // separate monotonic counters. A single shared counter would incorrectly reject
+        // valid cross-family requests.
         switch (stream)
         {
-            case InteractionSequenceStream.Player:
-                session.LastPlayerInteractionSequence = sequence;
-                break;
             case InteractionSequenceStream.Context:
                 session.LastContextInteractionSequence = sequence;
                 break;
@@ -837,17 +749,6 @@ internal sealed partial class GameServerHost
             totalAffected = (ushort)Math.Max(0, Math.Min(ushort.MaxValue, result.TotalAffected)),
         };
     }
-
-    private static PlayerInteractionResponseMessage ToGameplayWire(InteractionResult result) =>
-        new PlayerInteractionResponseMessage
-        {
-            success = result.Success,
-            sequence = result.Sequence,
-            actionId = (ushort)result.ActionId,
-            resultCode = (byte)result.ResultCode,
-            targetCharacterId = result.Target.PrimaryId,
-            detail = result.Detail,
-        };
 
     private CombatDamageWire ToGameplayWire(CombatDamageResult result) =>
         new CombatDamageWire

@@ -71,7 +71,6 @@ namespace Player.Networking
             Add(result, PlayerGameplayActionRequestTypes.BasicAttack, "Gameplay.BasicAttack");
             Add(result, PlayerGameplayActionRequestTypes.BeginAbility, "Gameplay.BeginAbility");
             Add(result, PlayerGameplayActionRequestTypes.CancelAbility, "Gameplay.CancelAbility");
-            Add(result, PlayerGameplayActionRequestTypes.Interaction, "Gameplay.Interaction");
             Add(result, PlayerGameplayActionRequestTypes.Respawn, "Gameplay.Respawn");
             Add(result, PlayerGameplayActionRequestTypes.ContextInteraction, "Interactions.Context");
             Add(result, PlayerGameplayActionRequestTypes.WorldLootOpen, "Interactions.WorldLootOpen");
