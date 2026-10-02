@@ -102,6 +102,21 @@ internal sealed partial class GameServerHost
                     return;
                 }
 
+                // AOI visibility is not physical visibility. A modified client can submit a
+                // replicated/guessed target through a wall, so independently reuse the same
+                // authoritative baked-world LOS gate already used by combat.
+                if (!HasAuthoritativeCombatLineOfSight(session, target))
+                {
+                    SendResponse(session, requestId, ContextInteractionResponseMessage.Failed(
+                        request.sequence,
+                        request.target,
+                        request.CategoryId,
+                        request.ActionId,
+                        InteractionResultCode.InvalidTarget,
+                        "player target is occluded"));
+                    return;
+                }
+
                 RunCanonicalPlayerContextInteractionAsync(
                     session,
                     requestId,
@@ -130,6 +145,24 @@ internal sealed partial class GameServerHost
                         request.ActionId,
                         InteractionResultCode.InvalidTarget,
                         "population target is unavailable or outside authoritative interaction range"));
+                    return;
+                }
+
+                var actorLocation = new CharacterLocationState(
+                    actor.MapId,
+                    actor.InstanceId ?? string.Empty,
+                    actor.Position,
+                    actor.YawDegrees);
+
+                if (!HasAuthoritativeCombatLineOfSight(session, actorLocation))
+                {
+                    SendResponse(session, requestId, ContextInteractionResponseMessage.Failed(
+                        request.sequence,
+                        request.target,
+                        request.CategoryId,
+                        request.ActionId,
+                        InteractionResultCode.InvalidTarget,
+                        "population target is occluded"));
                     return;
                 }
 
@@ -211,6 +244,18 @@ internal sealed partial class GameServerHost
                     return;
                 }
 
+                if (!HasAuthoritativeCombatLineOfSight(session, dummy.Runtime))
+                {
+                    SendResponse(session, requestId, ContextInteractionResponseMessage.Failed(
+                        request.sequence,
+                        request.target,
+                        request.CategoryId,
+                        request.ActionId,
+                        InteractionResultCode.InvalidTarget,
+                        "combat test target is occluded"));
+                    return;
+                }
+
                 if (request.ActionId == InteractionActionId.Feed)
                 {
                     InteractionResult feeding = _runtime.Feeding.ExecuteAgainstRuntime(
@@ -259,6 +304,24 @@ internal sealed partial class GameServerHost
                         request.ActionId,
                         InteractionResultCode.TargetUnavailable,
                         "world item is unavailable"));
+                    return;
+                }
+
+                var itemLocation = new CharacterLocationState(
+                    item.MapId,
+                    item.InstanceId ?? string.Empty,
+                    item.Position,
+                    0f);
+
+                if (!HasAuthoritativeCombatLineOfSight(session, itemLocation))
+                {
+                    SendResponse(session, requestId, ContextInteractionResponseMessage.Failed(
+                        request.sequence,
+                        request.target,
+                        request.CategoryId,
+                        request.ActionId,
+                        InteractionResultCode.InvalidTarget,
+                        "world item is occluded"));
                     return;
                 }
 
@@ -445,6 +508,32 @@ internal sealed partial class GameServerHost
             return;
         }
 
+        // Normal scene objects must also be physically visible to the authoritative server.
+        // Objects that ARE their own dynamic blocker (doors/gates) are handled by their
+        // existing authored interaction rules; testing LOS directly to their root would make
+        // the door's own blocker reject interaction with itself. Any slotted hard-alignment
+        // is still checked against its reserved anchor immediately before relocation below.
+        if (target.Definition.dynamicBlockerId <= 0)
+        {
+            var sceneObjectLocation = new CharacterLocationState(
+                source.Location.MapId,
+                source.Location.InstanceId,
+                target.Definition.pose.ToWorldPosition(),
+                target.Definition.pose.yaw);
+
+            if (!HasAuthoritativeCombatLineOfSight(client, sceneObjectLocation))
+            {
+                SendResponse(client, requestId, ContextInteractionResponseMessage.Failed(
+                    request.sequence,
+                    request.target,
+                    request.CategoryId,
+                    request.ActionId,
+                    InteractionResultCode.InvalidTarget,
+                    "scene object is occluded"));
+                return;
+            }
+        }
+
         // Search is a normal category/sub-action request. On success the GameServer pushes
         // the owner-only loot snapshot immediately; the client does not send a second open
         // request. WorldLootOpen remains registered only for explicit reconciliation.
@@ -602,6 +691,35 @@ internal sealed partial class GameServerHost
             }
 
             SendHarvestStarted(client, stableId, harvestPlan);
+        }
+
+        // A hacked client never supplies the slot or anchor, but it can request an action
+        // against a known/guessed object. Before a server-owned authored slot is allowed to
+        // relocate the player, prove that the reserved alignment point is not behind geometry.
+        if (!isHarvest &&
+            !string.IsNullOrWhiteSpace(interactionSession.SlotId))
+        {
+            var anchorLocation = new CharacterLocationState(
+                interactionSession.MapId,
+                interactionSession.InstanceId,
+                interactionSession.AnchorPose.ToWorldPosition(),
+                interactionSession.AnchorPose.yaw);
+
+            if (!HasAuthoritativeCombatLineOfSight(client, anchorLocation))
+            {
+                _runtime.InteractionSessions.CancelForCharacter(
+                    source.CharacterId.Value,
+                    "interaction anchor is occluded");
+
+                SendResponse(client, requestId, ContextInteractionResponseMessage.Failed(
+                    request.sequence,
+                    request.target,
+                    request.CategoryId,
+                    request.ActionId,
+                    InteractionResultCode.InvalidTarget,
+                    "interaction anchor is occluded"));
+                return;
+            }
         }
 
         // Only an actually reserved authored slot requests hard alignment. A timed/session
