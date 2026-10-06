@@ -7,6 +7,7 @@ using Game.Server.Domain.Inventory;
 using Game.Server.Domain.Players;
 using Game.Server.Domain.Stats;
 using Game.Server.Application.Items;
+using Game.Server.Application.Progression;
 using Game.Server.Application.Resources;
 using Game.Shared.Identity;
 
@@ -27,15 +28,32 @@ namespace Game.Server.Application.Characters
                 record.AccountId, record.CharacterId, sessionId,
                 new CharacterState(record.Name), record.Location, record.Revision, record.Appearance, record.PresentationPreferences);
 
+            // Progression must exist before resources are initialized because visible
+            // maximums are derived from the character's hidden skill-driven attributes.
+            runtime.InitializeProgressionState(record.Progression);
+
             StatsState stats = StatsState.DefaultCharacter();
             if (record.PlayerSystems != null)
             {
                 InventoryState inventory = BuildInventory(record.PlayerSystems);
                 EquipmentState equipment = BuildEquipment(record.PlayerSystems);
-                stats = _content == null
+                StatsState equipmentStats = _content == null
                     ? StatsState.DefaultCharacter()
                     : EquipmentStatCalculator.Calculate(_content, equipment);
+                stats = _content == null
+                    ? equipmentStats
+                    : SkillDerivedStatCalculator.Apply(
+                        _content,
+                        runtime.CaptureProgressionState(),
+                        equipmentStats);
                 runtime.InitializePlayerItemSystems(inventory, equipment, stats);
+            }
+            else if (_content != null)
+            {
+                stats = SkillDerivedStatCalculator.Apply(
+                    _content,
+                    runtime.CaptureProgressionState(),
+                    stats);
             }
 
             if (_content != null)
@@ -46,7 +64,6 @@ namespace Game.Server.Application.Characters
                     record.Resources);
                 runtime.InitializeCharacterResources(resources);
             }
-            runtime.InitializeProgressionState(record.Progression);
             return runtime;
         }
 

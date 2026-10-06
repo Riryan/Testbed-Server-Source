@@ -83,6 +83,7 @@ internal sealed class GameServerRuntime : IDisposable
     public PopulationCombatService PopulationCombat { get; }
     public CombatLoadoutService CombatLoadout { get; }
     public BasicAttackService BasicAttacks { get; }
+    public SkillDerivedStatRuntimeService SkillDerivedStats { get; }
     public CombatSkillProgressionService CombatSkills { get; }
     public CombatReloadService Reloads { get; }
     public AbilityService Abilities { get; }
@@ -205,6 +206,14 @@ internal sealed class GameServerRuntime : IDisposable
         Saves = new CharacterSaveService(CharacterRepository);
         Sessions = new PlayerSessionRegistry();
 
+        // Rebuild hidden attributes and the existing owner resource maximums only when
+        // progression or item/equipment state actually changes. No polling and no new wire messages.
+        SkillDerivedStats = new SkillDerivedStatRuntimeService(
+            Content,
+            Progression,
+            Resources,
+            PlayerItems);
+
         // Piggyback on the already-authoritative BasicAttackService result event.
         // This adds no new combat message or request route.
         CombatSkills = new CombatSkillProgressionService(
@@ -287,6 +296,7 @@ internal sealed class GameServerRuntime : IDisposable
 
     public void Dispose()
     {
+        SkillDerivedStats.Dispose();
         CombatSkills.Dispose();
         Combat.CharacterKilled -= Lifecycle.HandleKilled;
         Combat.CharacterKilled -= PopulationCombat.HandleKilled;

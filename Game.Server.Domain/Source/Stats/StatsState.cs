@@ -37,11 +37,15 @@ namespace Game.Server.Domain.Stats
 
         public static StatsState DefaultCharacter() => new StatsState(new[]
         {
-            new KeyValuePair<string, float>("Health.Max", 100f),
-            new KeyValuePair<string, float>("Mana.Max", 100f),
-            new KeyValuePair<string, float>("Stamina.Max", 100f),
+            new KeyValuePair<string, float>("Health.Max", 50f),
+            new KeyValuePair<string, float>("Mana.Max", 50f),
+            new KeyValuePair<string, float>("Stamina.Max", 50f),
             new KeyValuePair<string, float>("Armor", 0f),
             new KeyValuePair<string, float>("AttackPower", 0f),
+            new KeyValuePair<string, float>("Attribute.Strength", 20f),
+            new KeyValuePair<string, float>("Attribute.Dexterity", 20f),
+            new KeyValuePair<string, float>("Attribute.Intelligence", 20f),
+            new KeyValuePair<string, float>("Attribute.Charisma", 20f),
         });
     }
 }
