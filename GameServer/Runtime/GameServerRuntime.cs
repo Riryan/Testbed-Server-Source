@@ -83,6 +83,7 @@ internal sealed class GameServerRuntime : IDisposable
     public PopulationCombatService PopulationCombat { get; }
     public CombatLoadoutService CombatLoadout { get; }
     public BasicAttackService BasicAttacks { get; }
+    public CombatSkillProgressionService CombatSkills { get; }
     public CombatReloadService Reloads { get; }
     public AbilityService Abilities { get; }
     public InteractionService Interactions { get; }
@@ -204,6 +205,14 @@ internal sealed class GameServerRuntime : IDisposable
         Saves = new CharacterSaveService(CharacterRepository);
         Sessions = new PlayerSessionRegistry();
 
+        // Piggyback on the already-authoritative BasicAttackService result event.
+        // This adds no new combat message or request route.
+        CombatSkills = new CombatSkillProgressionService(
+            Content,
+            Progression,
+            BasicAttacks,
+            Sessions);
+
         var characterService = new CharacterService(
             CharacterRepository,
             new CharacterValidator(),
@@ -278,6 +287,7 @@ internal sealed class GameServerRuntime : IDisposable
 
     public void Dispose()
     {
+        CombatSkills.Dispose();
         Combat.CharacterKilled -= Lifecycle.HandleKilled;
         Combat.CharacterKilled -= PopulationCombat.HandleKilled;
         PopulationCombat.Dispose();

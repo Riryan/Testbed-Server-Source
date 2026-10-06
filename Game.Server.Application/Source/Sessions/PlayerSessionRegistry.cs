@@ -63,6 +63,12 @@ namespace Game.Server.Application.Sessions
                 return _byConnection.TryGetValue(connection, out session);
         }
 
+        public bool TryGet(CharacterId characterId, out PlayerSession session)
+        {
+            lock (_gate)
+                return _byCharacter.TryGetValue(characterId, out session);
+        }
+
         /// <summary>
         /// Resolves an exact session generation atomically under the registry lock.
         /// This prevents a remove/reopen race on a reused ConnectionKey between
