@@ -7,7 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Game.Shared.Backend;
 
-namespace Game.UnityIntegration.Backend
+namespace Game.GameServer.Backend
 {
     /// <summary>
     /// Internal game-server client for the standalone backend. The endpoint is
