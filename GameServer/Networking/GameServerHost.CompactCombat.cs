@@ -160,19 +160,6 @@ internal sealed partial class GameServerHost
             DeliveryMethod.ReliableOrdered);
     }
 
-    /// <summary>
-    /// Compatibility overload for current FirearmActions call sites that pass an existing
-    /// positional correction token/sequence before the named includeResources argument.
-    /// </summary>
-    private void SendCombatPredictionCorrection<TCorrection>(
-        ClientSession session,
-        TCorrection correctionToken,
-        bool includeResources = false)
-    {
-        _ = correctionToken;
-        SendCombatPredictionCorrection(session, includeResources);
-    }
-
     private bool TryResolveCompactCombatRange(
         PlayerRuntime source,
         out BasicAttackMode mode,
