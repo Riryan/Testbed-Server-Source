@@ -2,7 +2,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Game.Shared.Backend;
 
-namespace Game.UnityIntegration.Backend
+namespace Game.GameServer.Backend
 {
     public sealed partial class BackendInternalClient
     {
