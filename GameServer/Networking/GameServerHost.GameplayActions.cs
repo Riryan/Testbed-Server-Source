@@ -26,7 +26,6 @@ internal sealed partial class GameServerHost
     private void RegisterGameplayActionRequests(
         Dictionary<ushort, Action<ClientSession, uint, NetDataReader>> handlers)
     {
-        RegisterRequest(handlers, PlayerGameplayActionRequestTypes.BasicAttack, HandleBasicAttack);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.BeginAbility, HandleBeginAbility);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.CancelAbility, HandleCancelAbility);
         RegisterRequest(handlers, PlayerGameplayActionRequestTypes.Reload, HandleReload);
@@ -38,40 +37,6 @@ internal sealed partial class GameServerHost
     // a short burst capacity of 12. This is deliberately independent from movement Hz.
     private const double PlayerInteractionRefillPerSecond = 4d;
     private const double PlayerInteractionBurstCapacity = 6d;
-
-    private void HandleBasicAttack(ClientSession session, uint requestId, NetDataReader reader)
-    {
-        var request = new PlayerBasicAttackRequestMessage();
-        request.Deserialize(reader);
-
-        if (!TryGetGameplayRuntime(session, out PlayerRuntime source))
-        {
-            SendResponse(session, requestId, PlayerBasicAttackResponseMessage.Failed(
-                BasicAttackResultCode.RejectedInvalidSource));
-            return;
-        }
-
-        if (!TryResolveCombatTarget(session, request.target, out PlayerRuntime target))
-        {
-            SendResponse(session, requestId, PlayerBasicAttackResponseMessage.Failed(
-                BasicAttackResultCode.RejectedInvalidTarget));
-            return;
-        }
-
-        if (!HasAuthoritativeCombatLineOfSight(session, target))
-        {
-            SendResponse(session, requestId, PlayerBasicAttackResponseMessage.Failed(
-                BasicAttackResultCode.RejectedInvalidTarget));
-            return;
-        }
-
-        // Legacy request compatibility path. Current clean clients use the compact
-        // CombatActionIntent message. Keep this request authoritative and self-contained
-        // without coupling it to the newer targetless firearm trigger signature.
-        BasicAttackResult result = _runtime.BasicAttacks.TryAttack(
-            source, target, request.InputKind, _scheduler.ServerTime);
-        SendResponse(session, requestId, ToGameplayWire(result));
-    }
 
     private void HandleBeginAbility(ClientSession session, uint requestId, NetDataReader reader)
     {
