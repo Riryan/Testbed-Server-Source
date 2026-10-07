@@ -13,7 +13,7 @@ namespace Player.Networking
     /// </summary>
     public static class PlayerGameplayActionRequestTypes
     {
-        public const ushort BasicAttack = 500;
+        // 500 retired: legacy request/response basic attack path removed. Do not reuse.
         public const ushort BeginAbility = 501;
         public const ushort CancelAbility = 502;
         // 503 retired: legacy PlayerInteraction request removed. Do not reuse.
@@ -200,26 +200,6 @@ namespace Player.Networking
             };
     }
 
-    public struct PlayerBasicAttackRequestMessage : INetSerializable
-    {
-        public CombatTargetReferenceWire target;
-        public byte inputKind;
-
-        public BasicAttackInputKind InputKind => (BasicAttackInputKind)inputKind;
-
-        public void Serialize(NetDataWriter writer)
-        {
-            target.Serialize(writer);
-            writer.Put(inputKind);
-        }
-
-        public void Deserialize(NetDataReader reader)
-        {
-            target.Deserialize(reader);
-            inputKind = reader.GetByte();
-        }
-    }
-
     public struct CombatDamageWire : INetSerializable
     {
         // Participant-only result. Health replication is a separate authoritative state
@@ -260,35 +240,6 @@ namespace Player.Networking
         public CombatDamageResultCode ResultCode => (CombatDamageResultCode)resultCode;
         public CombatDamageCause Cause => (CombatDamageCause)cause;
         public CombatDamagePresentationFlags Flags => (CombatDamagePresentationFlags)flags;
-    }
-
-    public struct PlayerBasicAttackResponseMessage : INetSerializable
-    {
-        // Request acknowledgement only. The detailed result travels once through the
-        // participant combat-result event instead of being duplicated in this response.
-        public bool success;
-        public byte resultCode;
-
-        public void Serialize(NetDataWriter writer)
-        {
-            writer.Put(success);
-            writer.Put(resultCode);
-        }
-
-        public void Deserialize(NetDataReader reader)
-        {
-            success = reader.GetBool();
-            resultCode = reader.GetByte();
-        }
-
-        public BasicAttackResultCode ResultCode => (BasicAttackResultCode)resultCode;
-
-        public static PlayerBasicAttackResponseMessage Failed(BasicAttackResultCode code, string ignored = null) =>
-            new PlayerBasicAttackResponseMessage
-            {
-                success = false,
-                resultCode = (byte)code,
-            };
     }
 
     public struct PlayerBeginAbilityRequestMessage : INetSerializable
