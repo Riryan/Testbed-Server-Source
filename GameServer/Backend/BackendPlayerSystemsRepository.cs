@@ -10,7 +10,7 @@ using Game.Shared.Backend;
 using Game.Shared.Identity;
 using Game.Shared.World;
 
-namespace Game.UnityIntegration.Backend
+namespace Game.GameServer.Backend
 {
     public sealed class BackendPlayerSystemsRepository : IPlayerSystemsRepository, IPlayerItemLifecycleRepository, IWorldItemRepository
     {
@@ -19,22 +19,14 @@ namespace Game.UnityIntegration.Backend
 
         public BackendPlayerSystemsRepository(
             BackendInternalClient backend,
-            ICharacterPersistenceLeaseProofProvider leaseProofProvider = null)
+            ICharacterPersistenceLeaseProofProvider leaseProofProvider)
         {
             _backend = backend ?? throw new ArgumentNullException(nameof(backend));
-            _leaseProofProvider = leaseProofProvider;
+            _leaseProofProvider = leaseProofProvider ?? throw new ArgumentNullException(nameof(leaseProofProvider));
         }
 
         private bool TryGetMutationLeaseOwnerToken(CharacterId characterId, out string leaseOwnerToken)
         {
-            // Unity/legacy composition may still omit the distributed lease provider.
-            // Gateway permits that only while no active Backend-owned lease exists.
-            if (_leaseProofProvider == null)
-            {
-                leaseOwnerToken = string.Empty;
-                return true;
-            }
-
             if (_leaseProofProvider.TryGetPersistenceLeaseOwnerToken(characterId, out leaseOwnerToken) &&
                 !string.IsNullOrWhiteSpace(leaseOwnerToken))
                 return true;
