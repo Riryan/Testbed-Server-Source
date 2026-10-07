@@ -5,7 +5,6 @@ using System.Threading.Tasks;
 using Game.Server.Application.Persistence;
 using Game.Shared.Backend;
 using Game.Shared.Identity;
-using Game.UnityIntegration.Backend;
 
 namespace Game.GameServer.Backend;
 
