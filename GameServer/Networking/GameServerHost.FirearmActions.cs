@@ -246,7 +246,7 @@ internal sealed partial class GameServerHost
         {
             // Clean clients predict deterministic ammo use locally. One reliable correction
             // at the empty boundary prevents long-lived HUD drift without a 10 Hz owner stream.
-            SendCombatPredictionCorrection(session, source, includeResources: false);
+            SendCombatPredictionCorrection(session, includeResources: false);
             StopAutomaticFire(session, state, sendOwnerCorrection: false);
         }
     }
@@ -265,7 +265,7 @@ internal sealed partial class GameServerHost
 
         // This is an exception/resync path only. Normal full-auto cadence produces no
         // owner-cycle packets; the clean client predicts ammo/presentation from shared data.
-        SendCombatPredictionCorrection(session, runtime, includeResources: false);
+        SendCombatPredictionCorrection(session, includeResources: false);
     }
 
     private void QueueFireCycle(ClientSession actor, in FirearmActionResolution resolution, bool aiming, float spanSeconds)
