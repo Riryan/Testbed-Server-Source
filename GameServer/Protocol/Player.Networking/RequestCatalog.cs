@@ -68,7 +68,6 @@ namespace Player.Networking
             Add(result, PlayerStatusEffectRequestTypes.Snapshot, "StatusEffects.Snapshot");
             Add(result, GameplaySettingsRequestTypes.Snapshot, "System.GameplaySettingsSnapshot");
 
-            Add(result, PlayerGameplayActionRequestTypes.BasicAttack, "Gameplay.BasicAttack");
             Add(result, PlayerGameplayActionRequestTypes.BeginAbility, "Gameplay.BeginAbility");
             Add(result, PlayerGameplayActionRequestTypes.CancelAbility, "Gameplay.CancelAbility");
             Add(result, PlayerGameplayActionRequestTypes.Respawn, "Gameplay.Respawn");
