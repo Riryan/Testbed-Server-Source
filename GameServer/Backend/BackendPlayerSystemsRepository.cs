@@ -10,7 +10,7 @@ using Game.Shared.Backend;
 using Game.Shared.Identity;
 using Game.Shared.World;
 
-namespace Game.UnityIntegration.Backend
+namespace Game.GameServer.Backend
 {
     public sealed class BackendPlayerSystemsRepository : IPlayerSystemsRepository, IPlayerItemLifecycleRepository, IWorldItemRepository
     {
