@@ -13,7 +13,7 @@ using Game.Shared.Resources;
 using Game.Shared.StatusEffects;
 using LiteNetLibManager;
 
-namespace Game.UnityIntegration
+namespace Game.GameServer.Integration
 {
     /// <summary>
     /// Deadline scheduler for status expiry and periodic canonical effects. Work enters the

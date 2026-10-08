@@ -12,7 +12,7 @@ using Game.Shared.Progression;
 using Game.Shared.Resources;
 using Game.Shared.World;
 
-namespace Game.UnityIntegration.Backend
+namespace Game.GameServer.Backend
 {
     /// <summary>
     /// Unity game-server repository adapter. The standalone backend owns SQLite;

@@ -26,7 +26,6 @@ using Game.Server.Application.WorldItems;
 using Game.Server.Domain.Characters;
 using Game.Shared.Content;
 using Game.Shared.World;
-using Game.UnityIntegration.Backend;
 
 namespace Game.GameServer.Runtime;
 

@@ -24,7 +24,7 @@ using Game.Shared.Protocol;
 using Game.Shared.Sessions;
 using Game.Shared.World;
 using Game.Shared.WorldItems;
-using Game.UnityIntegration;
+using Game.GameServer.Integration;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using LiteNetLibManager;

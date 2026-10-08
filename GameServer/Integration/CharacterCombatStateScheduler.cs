@@ -6,7 +6,7 @@ using Game.Server.Domain.Combat;
 using Game.Server.Domain.Players;
 using LiteNetLibManager;
 
-namespace Game.UnityIntegration
+namespace Game.GameServer.Integration
 {
     /// <summary>
     /// Event-assisted combat-state deadlines. Combat activity schedules one expiry
