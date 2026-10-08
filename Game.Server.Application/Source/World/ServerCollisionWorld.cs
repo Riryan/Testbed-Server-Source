@@ -355,7 +355,8 @@ namespace Game.Server.Application.World
                 feet,
                 capsule,
                 ignoreGroundContact: false,
-                maximumSlopeDegrees: 0f);
+                maximumSlopeDegrees: 0f,
+                coveredGroundDetailHeight: 0f);
         }
 
         /// <summary>
@@ -372,20 +373,23 @@ namespace Game.Server.Application.World
         public bool IsStandingCapsuleClear(
             WorldPosition feet,
             ServerCapsule capsule,
-            float maximumSlopeDegrees)
+            float maximumSlopeDegrees,
+            float coveredGroundDetailHeight = 0f)
         {
             return IsCapsuleClearInternal(
                 feet,
                 capsule,
                 ignoreGroundContact: true,
-                maximumSlopeDegrees: maximumSlopeDegrees);
+                maximumSlopeDegrees: maximumSlopeDegrees,
+                coveredGroundDetailHeight: Math.Max(0f, coveredGroundDetailHeight));
         }
 
         private bool IsCapsuleClearInternal(
             WorldPosition feet,
             ServerCapsule capsule,
             bool ignoreGroundContact,
-            float maximumSlopeDegrees)
+            float maximumSlopeDegrees,
+            float coveredGroundDetailHeight)
         {
             float radius = capsule.Radius;
             float bottomY = feet.Y + radius;
@@ -399,15 +403,22 @@ namespace Game.Server.Application.World
             {
                 ServerCollisionTriangle t = _triangles[index];
 
-                if (ignoreGroundContact &&
-                    IsGroundContactTriangle(
-                        t,
-                        feet,
-                        radius,
-                        minSupportNormalY,
-                        maximumSlopeDegrees))
+                if (ignoreGroundContact)
                 {
-                    continue;
+                    if (IsGroundContactTriangle(
+                            t,
+                            feet,
+                            radius,
+                            minSupportNormalY,
+                            maximumSlopeDegrees) ||
+                        IsCoveredWalkSurfaceDetailTriangle(
+                            t,
+                            feet,
+                            coveredGroundDetailHeight,
+                            minSupportNormalY))
+                    {
+                        continue;
+                    }
                 }
 
                 float distSq = SegmentTriangleDistanceSquared(
@@ -431,6 +442,70 @@ namespace Game.Server.Application.World
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Ignores only short non-walkable static detail that is physically covered by the
+        /// authoritative walk surface at the same XZ location. This lets a NavMesh ramp own
+        /// grounded locomotion across stair risers/curbs while preserving tall walls,
+        /// railings, ceilings, unsupported obstacles, and all dynamic blockers.
+        /// </summary>
+        private bool IsCoveredWalkSurfaceDetailTriangle(
+            ServerCollisionTriangle triangle,
+            WorldPosition feet,
+            float maximumDetailHeight,
+            float minSupportNormalY)
+        {
+            if (maximumDetailHeight <= 0f ||
+                (triangle.flags & ServerSurfaceFlags.Walkable) != 0)
+            {
+                return false;
+            }
+
+            float minY = Math.Min(triangle.ay, Math.Min(triangle.by, triangle.cy));
+            float maxY = Math.Max(triangle.ay, Math.Max(triangle.by, triangle.cy));
+            float allowedTop = feet.Y + maximumDetailHeight + 0.05f;
+            if (maxY > allowedTop)
+                return false;
+
+            // Keep the check local to the current step envelope. Geometry far below the
+            // actor remains ordinary collision/support data and is not reclassified.
+            if (maxY < feet.Y - maximumDetailHeight - 0.05f)
+                return false;
+
+            float sampleX = (triangle.ax + triangle.bx + triangle.cx) / 3f;
+            float sampleZ = (triangle.az + triangle.bz + triangle.cz) / 3f;
+            float bestWalkY = float.NegativeInfinity;
+
+            // Reuse the candidate set already gathered for this capsule query. Do not launch
+            // a nested spatial query here: _queryScratch is deliberately shared scratch state.
+            foreach (int candidateIndex in _queryScratch)
+            {
+                ServerCollisionTriangle walk = _triangles[candidateIndex];
+                if ((walk.flags & ServerSurfaceFlags.Walkable) == 0 ||
+                    Math.Abs(walk.normalY) < minSupportNormalY ||
+                    !TryTriangleHeightAtXZ(walk, sampleX, sampleZ, out float walkY))
+                {
+                    continue;
+                }
+
+                if (walkY > allowedTop + 0.05f ||
+                    walkY < feet.Y - maximumDetailHeight - 0.10f)
+                {
+                    continue;
+                }
+
+                if (walkY > bestWalkY)
+                    bestWalkY = walkY;
+            }
+
+            if (float.IsNegativeInfinity(bestWalkY))
+                return false;
+
+            // The raw triangle must sit at/below the canonical walk surface. A short object
+            // protruding above that surface remains a blocker even when it is low.
+            return maxY <= bestWalkY + 0.08f &&
+                   minY <= bestWalkY + 0.08f;
         }
 
         private static bool IsGroundContactTriangle(
@@ -606,7 +681,8 @@ namespace Game.Server.Application.World
             if (!IsStandingCapsuleClear(
                     candidate,
                     capsule,
-                    maximumSlopeDegrees))
+                    maximumSlopeDegrees,
+                    stepHeight))
             {
                 return false;
             }
