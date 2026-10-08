@@ -3,7 +3,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Game.Server.Application.Social;
 using Game.Shared.Backend;
-using Game.UnityIntegration.Backend;
 
 namespace Game.GameServer.Backend
 {

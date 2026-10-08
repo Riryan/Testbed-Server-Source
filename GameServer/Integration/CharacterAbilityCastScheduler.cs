@@ -6,7 +6,7 @@ using Game.Server.Domain.Players;
 using Game.Shared.Abilities;
 using LiteNetLibManager;
 
-namespace Game.UnityIntegration
+namespace Game.GameServer.Integration
 {
     /// <summary>
     /// Schedules only active cast completion deadlines. Characters with no active

@@ -8,7 +8,7 @@ using Game.Shared.Content;
 using Game.Shared.Resources;
 using LiteNetLibManager;
 
-namespace Game.UnityIntegration
+namespace Game.GameServer.Integration
 {
     /// <summary>
     /// Event-assisted timed resource work. There is no active-player polling pass.
