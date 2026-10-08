@@ -2,7 +2,6 @@ using Game.GameServer;
 using Game.Server.Application.World;
 using Game.Shared.Backend;
 using Game.Shared.World;
-using Game.UnityIntegration.Backend;
 
 namespace Game.GameServer.Backend;
 
