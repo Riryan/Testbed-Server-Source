@@ -12,7 +12,7 @@ namespace Game.Shared.World
     /// </summary>
     public static class ServerMapFormat
     {
-        public const int Version = 5;
+        public const int Version = 6;
     }
 
     /// <summary>
@@ -73,6 +73,7 @@ namespace Game.Shared.World
         [DataMember(Name = "propertyTemplate")] public ServerPropertyTemplateDefinition propertyTemplate;
         [DataMember(Name = "navMesh")] public ServerNavMeshInfo navMesh;
         [DataMember(Name = "sharedWorld")] public ServerSharedWorldInfo sharedWorld;
+        [DataMember(Name = "movementTriangles")] public ServerCollisionTriangle[] movementTriangles = Array.Empty<ServerCollisionTriangle>();
         [DataMember(Name = "collisionTriangles")] public ServerCollisionTriangle[] collisionTriangles = Array.Empty<ServerCollisionTriangle>();
         [DataMember(Name = "dynamicBlockers")] public ServerDynamicBlocker[] dynamicBlockers = Array.Empty<ServerDynamicBlocker>();
         [DataMember(Name = "traversalLinks")] public ServerTraversalLink[] traversalLinks = Array.Empty<ServerTraversalLink>();
