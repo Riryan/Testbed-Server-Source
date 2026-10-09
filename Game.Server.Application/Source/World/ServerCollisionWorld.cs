@@ -502,8 +502,25 @@ namespace Game.Server.Application.World
             if (float.IsNegativeInfinity(bestWalkY))
                 return false;
 
-            // The raw triangle must sit at/below the canonical walk surface. A short object
-            // protruding above that surface remains a blocker even when it is low.
+            // Ordinary low detail still has to sit essentially at/below the canonical
+            // walk surface. For near-vertical stair risers, however, the Recast support can
+            // legitimately cut through the discrete step profile by more than the ordinary
+            // seam tolerance. If the entire face is step-height-bounded and covered by
+            // authoritative walkable support, let the walk surface own traversal.
+            bool nearVertical = Math.Abs(triangle.normalY) <= 0.35f;
+            if (nearVertical)
+            {
+                float faceHeight = maxY - minY;
+                float aboveWalk = maxY - bestWalkY;
+                float belowWalk = bestWalkY - minY;
+                if (faceHeight <= maximumDetailHeight + 0.10f &&
+                    aboveWalk <= maximumDetailHeight + 0.05f &&
+                    belowWalk <= maximumDetailHeight + 0.10f)
+                {
+                    return true;
+                }
+            }
+
             return maxY <= bestWalkY + 0.08f &&
                    minY <= bestWalkY + 0.08f;
         }
