@@ -1535,29 +1535,53 @@ namespace Game.Server.Application.Population
             if (!TryValidateBakedPortalPose(
                     graph,
                     pop,
-                    portal.interiorSpawn,
+                    portal.exterior,
                     requireDynamicClearance: true,
-                    out WorldPosition interior))
+                    out WorldPosition anchor))
+            {
+                return false;
+            }
+
+            long joinNode = portal.routeNodeId > 0 && graph.Nodes.ContainsKey(portal.routeNodeId)
+                ? portal.routeNodeId
+                : FindNearestNode(graph, anchor);
+
+            if (pop.MovementBehavior == SharedAiMovementMode.Route && joinNode <= 0)
                 return false;
 
             _portalRespawnsThisTick++;
             RecordPortalRelease(portal, pop, now);
             pop.PortalRespawnAttempts = 0;
-            pop.PortalPhase = PopulationPortalSequencePhase.Interior;
-            pop.AiState = PopulationAiState.FollowingRoute;
-            pop.RouteReason = PopulationRouteReason.PortalTravel;
-            pop.Actor.Position = interior;
-            pop.Actor.LastSafePosition = interior;
-            pop.MotorState = new CharacterMotorState(interior);
-            pop.CurrentNodeId = portal.routeNodeId;
-            pop.NextNodeId = 0;
+
+            // Portal presentation is now a single authoritative anchor. Normal Population AI
+            // owns movement immediately after spawn. For route actors, the associated/nearest
+            // route node is installed as the first ordinary movement target, so the shared
+            // ServerCharacterMotor physically joins the route instead of a special doorway
+            // sequence moving or teleporting the actor onto it.
+            pop.PortalPhase = PopulationPortalSequencePhase.None;
+            pop.AiState = pop.MovementBehavior == SharedAiMovementMode.Route
+                ? PopulationAiState.FollowingRoute
+                : PopulationAiState.Idle;
+            pop.RouteReason = PopulationRouteReason.Wander;
+            pop.Actor.Position = anchor;
+            pop.Actor.LastSafePosition = anchor;
+            pop.MotorState = new CharacterMotorState(anchor);
+            pop.PreviousNodeId = 0;
+            pop.CurrentNodeId = joinNode;
+            pop.NextNodeId = pop.MovementBehavior == SharedAiMovementMode.Route ? joinNode : 0;
+            pop.SegmentProgress = 0f;
+            pop.HomePosition = anchor;
+            pop.HasRoamTarget = false;
             pop.AwaitingPlayerActivation = false;
+
             RemoveFromHibernationIndex(pop);
             _actors.ResumeSpatial(pop.Actor);
             _actors.PublishChanged(pop.Actor);
             Changed?.Invoke(pop);
+
             if (scheduleImmediately)
                 ScheduleNow(pop, now);
+
             return true;
         }
 
