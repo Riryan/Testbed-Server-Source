@@ -1454,7 +1454,8 @@ namespace Game.Server.Application.Population
 
             if (graph.PortalByRouteNode.TryGetValue(pop.CurrentNodeId, out ServerPopulationPortal portal) &&
                 PortalAllows(portal, pop.NpcType) &&
-                (portal.mode == PopulationPortalMode.DespawnOnly || portal.mode == PopulationPortalMode.SpawnAndDespawn))
+                (portal.mode == PopulationPortalMode.DespawnOnly || portal.mode == PopulationPortalMode.SpawnAndDespawn) &&
+                (!portal.requireDifferentDestination || portal.stableId != pop.LastPortalId))
             {
                 EnterPortalDormant(pop, portal, now);
                 return;
