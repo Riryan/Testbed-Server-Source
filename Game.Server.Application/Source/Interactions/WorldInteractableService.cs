@@ -715,6 +715,68 @@ namespace Game.Server.Application.Interactions
             if (success) PublishChanged(target);
         }
 
+        /// <summary>
+        /// Opens a world object for an authoritative non-player system actor while preserving
+        /// the object's authored Open-action contract. This is intentionally narrower than
+        /// TrySetOpenState: unsupported, disabled, session-bound, timed, or consent-gated doors
+        /// fail closed instead of being forced open.
+        /// </summary>
+        public bool TryOpenForSystem(
+            string mapId,
+            string instanceId,
+            long stableId,
+            out string reason)
+        {
+            reason = string.Empty;
+
+            if (!TryGet(mapId, instanceId, stableId, out WorldInteractableRuntime target) ||
+                target == null ||
+                !target.Enabled)
+            {
+                reason = "world object is unavailable or disabled";
+                return false;
+            }
+
+            ServerContextualInteractionDefinition definition =
+                FindDefinition(target.Definition, InteractionActionId.Open);
+            if (definition == null)
+            {
+                reason = "world object does not expose the canonical Open action";
+                return false;
+            }
+
+            if (definition.looping ||
+                definition.fixedDurationSeconds > 0f ||
+                definition.consentMode != InteractionConsentMode.None)
+            {
+                reason = "Open action requires an interaction/session flow";
+                return false;
+            }
+
+            if (target.ActiveSessionId != 0)
+            {
+                reason = "world object is currently occupied by another interaction session";
+                return false;
+            }
+
+            if (target.Open)
+                return true;
+
+            if (!TrySetOpenState(mapId, instanceId, stableId, true))
+            {
+                reason = "authoritative open-state transition was rejected";
+                return false;
+            }
+
+            if (!TryGet(mapId, instanceId, stableId, out target) || target == null || !target.Open)
+            {
+                reason = "world object did not enter the open state";
+                return false;
+            }
+
+            return true;
+        }
+
         public bool TrySetOpenState(string mapId, string instanceId, long stableId, bool open)
         {
             if (!TryGet(mapId, instanceId, stableId, out WorldInteractableRuntime target) || !target.Enabled) return false;
