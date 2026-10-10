@@ -1480,7 +1480,12 @@ namespace Game.Server.Application.Population
                     pop.WaitUntil = now + minWait + (maxWait - minWait) * pop.Random.NextDouble();
             }
 
-            if (graph.PortalsByRouteNode.TryGetValue(
+            // Portal activation physically moves from the portal anchor to its first
+            // route node with CurrentNodeId == NextNodeId. Do not interpret that initial
+            // handoff as arrival at a destination portal, especially when neighboring
+            // portals share the same sidewalk marker.
+            if (pop.PreviousNodeId != pop.CurrentNodeId &&
+                graph.PortalsByRouteNode.TryGetValue(
                     pop.CurrentNodeId,
                     out List<ServerPopulationPortal> nodePortals))
             {
