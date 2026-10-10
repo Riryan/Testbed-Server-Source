@@ -129,7 +129,7 @@ namespace Game.Server.Application.Population
             public Dictionary<long, ServerPopulationRouteNode> Nodes = new Dictionary<long, ServerPopulationRouteNode>();
             public Dictionary<long, List<ServerPopulationRouteEdge>> Outgoing = new Dictionary<long, List<ServerPopulationRouteEdge>>();
             public Dictionary<long, ServerPopulationPortal> Portals = new Dictionary<long, ServerPopulationPortal>();
-            public Dictionary<long, ServerPopulationPortal> PortalByRouteNode = new Dictionary<long, ServerPopulationPortal>();
+            public Dictionary<long, List<ServerPopulationPortal>> PortalsByRouteNode = new Dictionary<long, List<ServerPopulationPortal>>();
             public ServerCollisionWorld Collision;
         }
 
@@ -853,8 +853,36 @@ namespace Game.Server.Application.Population
                     ServerPopulationPortal portal = portals[i];
                     if (portal == null || portal.stableId <= 0) continue;
                     graph.Portals[portal.stableId] = portal;
-                    if (portal.routeNodeId > 0)
-                        graph.PortalByRouteNode[portal.routeNodeId] = portal;
+
+                    long[] portalNodes = portal.routeNodeIds != null && portal.routeNodeIds.Length > 0
+                        ? portal.routeNodeIds
+                        : (portal.routeNodeId > 0 ? new[] { portal.routeNodeId } : Array.Empty<long>());
+
+                    for (int n = 0; n < portalNodes.Length; ++n)
+                    {
+                        long nodeId = portalNodes[n];
+                        if (nodeId <= 0 || !graph.Nodes.ContainsKey(nodeId))
+                            continue;
+
+                        if (!graph.PortalsByRouteNode.TryGetValue(nodeId, out List<ServerPopulationPortal> nodePortals))
+                        {
+                            nodePortals = new List<ServerPopulationPortal>(2);
+                            graph.PortalsByRouteNode.Add(nodeId, nodePortals);
+                        }
+
+                        bool duplicate = false;
+                        for (int p = 0; p < nodePortals.Count; ++p)
+                        {
+                            if (nodePortals[p].stableId == portal.stableId)
+                            {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+
+                        if (!duplicate)
+                            nodePortals.Add(portal);
+                    }
                 }
                 _graphs[key] = graph;
             }
@@ -1452,13 +1480,25 @@ namespace Game.Server.Application.Population
                     pop.WaitUntil = now + minWait + (maxWait - minWait) * pop.Random.NextDouble();
             }
 
-            if (graph.PortalByRouteNode.TryGetValue(pop.CurrentNodeId, out ServerPopulationPortal portal) &&
-                PortalAllows(portal, pop.NpcType) &&
-                (portal.mode == PopulationPortalMode.DespawnOnly || portal.mode == PopulationPortalMode.SpawnAndDespawn) &&
-                (!portal.requireDifferentDestination || portal.stableId != pop.LastPortalId))
+            if (graph.PortalsByRouteNode.TryGetValue(
+                    pop.CurrentNodeId,
+                    out List<ServerPopulationPortal> nodePortals))
             {
-                EnterPortalDormant(pop, portal, now);
-                return;
+                for (int i = 0; i < nodePortals.Count; ++i)
+                {
+                    ServerPopulationPortal portal = nodePortals[i];
+                    if (portal == null ||
+                        !PortalAllows(portal, pop.NpcType) ||
+                        (portal.mode != PopulationPortalMode.DespawnOnly &&
+                         portal.mode != PopulationPortalMode.SpawnAndDespawn) ||
+                        (portal.requireDifferentDestination && portal.stableId == pop.LastPortalId))
+                    {
+                        continue;
+                    }
+
+                    EnterPortalDormant(pop, portal, now);
+                    return;
+                }
             }
             EnsureNextNode(graph, pop);
         }
