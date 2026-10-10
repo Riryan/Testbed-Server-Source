@@ -57,11 +57,14 @@ namespace Game.Server.Application.World
         }
 
         private readonly ServerMapSnapshot _map;
+        private readonly ServerCollisionTriangle[] _movementTriangles;
         private readonly ServerCollisionTriangle[] _triangles;
         private readonly float _cellSize;
+        private readonly Dictionary<CellKey, List<int>> _movementTriangleGrid = new Dictionary<CellKey, List<int>>();
         private readonly Dictionary<CellKey, List<int>> _triangleGrid = new Dictionary<CellKey, List<int>>();
         private readonly Dictionary<long, DynamicBlockerState> _dynamicBlockers = new Dictionary<long, DynamicBlockerState>();
         private readonly Dictionary<CellKey, List<long>> _dynamicBlockerGrid = new Dictionary<CellKey, List<long>>();
+        private readonly HashSet<int> _movementQueryScratch = new HashSet<int>();
         private readonly HashSet<int> _queryScratch = new HashSet<int>();
         private readonly HashSet<long> _dynamicBlockerQueryScratch = new HashSet<long>();
 
@@ -88,8 +91,13 @@ namespace Game.Server.Application.World
         {
             _map = map ?? throw new ArgumentNullException(nameof(map));
             _cellSize = IsFinite(cellSize) && cellSize >= 1f ? cellSize : 16f;
+            _movementTriangles = map.movementTriangles ?? Array.Empty<ServerCollisionTriangle>();
             _triangles = map.collisionTriangles ?? Array.Empty<ServerCollisionTriangle>();
+            if (_movementTriangles.Length == 0)
+                throw new InvalidOperationException(
+                    $"Server map '{map.mapId}' has no baked movement surface. Re-bake it with ServerMap format {ServerMapFormat.Version}.");
             ComputeWorldBounds();
+            BuildMovementTriangleGrid();
             BuildTriangleGrid();
 
             ServerDynamicBlocker[] blockers = map.dynamicBlockers ?? Array.Empty<ServerDynamicBlocker>();
@@ -290,11 +298,22 @@ namespace Game.Server.Application.World
             // implementation rebuilt the same spatial-grid candidate set independently for
             // center/+X/-X/+Z/-Z, multiplying dictionary/hash work for every ground probe.
             float queryExtent = ring + 0.01f;
-            QueryTriangles(
-                feet.X - queryExtent,
-                feet.Z - queryExtent,
-                feet.X + queryExtent,
-                feet.Z + queryExtent);
+            if (requireWalkable)
+            {
+                QueryMovementTriangles(
+                    feet.X - queryExtent,
+                    feet.Z - queryExtent,
+                    feet.X + queryExtent,
+                    feet.Z + queryExtent);
+            }
+            else
+            {
+                QueryTriangles(
+                    feet.X - queryExtent,
+                    feet.Z - queryExtent,
+                    feet.X + queryExtent,
+                    feet.Z + queryExtent);
+            }
 
             for (int sample = 0; sample < 5; ++sample)
             {
@@ -349,78 +368,20 @@ namespace Game.Server.Application.World
             return true;
         }
 
-        public bool IsCapsuleClear(WorldPosition feet, ServerCapsule capsule)
-        {
-            return IsCapsuleClearInternal(
-                feet,
-                capsule,
-                ignoreGroundContact: false,
-                maximumSlopeDegrees: 0f,
-                coveredGroundDetailHeight: 0f);
-        }
-
         /// <summary>
-        /// Capsule clearance for an actor that already has authoritative walkable support
-        /// under its feet. Upward/downward wound floor triangles near the feet are treated
-        /// as support, not as a wall penetrating the capsule.
-        ///
-        /// A vertical capsule resting on an inclined plane geometrically overlaps that plane
-        /// unless the capsule is offset along the surface normal. The server motor stores a
-        /// feet/root point on the walk surface instead, so normal capsule-vs-triangle distance
-        /// must ignore the local supporting floor band while still testing walls, ceilings,
-        /// obstacles, and dynamic blockers.
+        /// Raw physical collision used for airborne/falling motion and non-grounded world
+        /// queries. This intentionally keeps full architectural detail.
         /// </summary>
-        public bool IsStandingCapsuleClear(
-            WorldPosition feet,
-            ServerCapsule capsule,
-            float maximumSlopeDegrees,
-            float coveredGroundDetailHeight = 0f)
-        {
-            return IsCapsuleClearInternal(
-                feet,
-                capsule,
-                ignoreGroundContact: true,
-                maximumSlopeDegrees: maximumSlopeDegrees,
-                coveredGroundDetailHeight: Math.Max(0f, coveredGroundDetailHeight));
-        }
-
-        private bool IsCapsuleClearInternal(
-            WorldPosition feet,
-            ServerCapsule capsule,
-            bool ignoreGroundContact,
-            float maximumSlopeDegrees,
-            float coveredGroundDetailHeight)
+        public bool IsCapsuleClear(WorldPosition feet, ServerCapsule capsule)
         {
             float radius = capsule.Radius;
             float bottomY = feet.Y + radius;
             float topY = feet.Y + capsule.Height - radius;
-            float minSupportNormalY = ignoreGroundContact
-                ? MathF.Cos(Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f))
-                : 1.1f;
 
             QueryTriangles(feet.X - radius, feet.Z - radius, feet.X + radius, feet.Z + radius);
             foreach (int index in _queryScratch)
             {
                 ServerCollisionTriangle t = _triangles[index];
-
-                if (ignoreGroundContact)
-                {
-                    if (IsGroundContactTriangle(
-                            t,
-                            feet,
-                            radius,
-                            minSupportNormalY,
-                            maximumSlopeDegrees) ||
-                        IsCoveredWalkSurfaceDetailTriangle(
-                            t,
-                            feet,
-                            coveredGroundDetailHeight,
-                            minSupportNormalY))
-                    {
-                        continue;
-                    }
-                }
-
                 float distSq = SegmentTriangleDistanceSquared(
                     feet.X, bottomY, feet.Z,
                     feet.X, topY, feet.Z,
@@ -445,141 +406,31 @@ namespace Game.Server.Application.World
         }
 
         /// <summary>
-        /// Ignores only short non-walkable static detail that is physically covered by the
-        /// authoritative walk surface at the same XZ location. This lets a NavMesh ramp own
-        /// grounded locomotion across stair risers/curbs while preserving tall walls,
-        /// railings, ceilings, unsupported obstacles, and all dynamic blockers.
+        /// Grounded movement is constrained by the baked movement surface, which is already
+        /// built for the authoritative humanoid radius, height, climb and slope. Static stair
+        /// risers and floor-detail triangles therefore do not participate in grounded capsule
+        /// clearance. Dynamic blockers remain authoritative and still use the real capsule.
         /// </summary>
-        private bool IsCoveredWalkSurfaceDetailTriangle(
-            ServerCollisionTriangle triangle,
+        public bool IsStandingCapsuleClear(
             WorldPosition feet,
-            float maximumDetailHeight,
-            float minSupportNormalY)
-        {
-            if (maximumDetailHeight <= 0f ||
-                (triangle.flags & ServerSurfaceFlags.Walkable) != 0)
-            {
-                return false;
-            }
-
-            float minY = Math.Min(triangle.ay, Math.Min(triangle.by, triangle.cy));
-            float maxY = Math.Max(triangle.ay, Math.Max(triangle.by, triangle.cy));
-            float allowedTop = feet.Y + maximumDetailHeight + 0.05f;
-            if (maxY > allowedTop)
-                return false;
-
-            // Keep the check local to the current step envelope. Geometry far below the
-            // actor remains ordinary collision/support data and is not reclassified.
-            if (maxY < feet.Y - maximumDetailHeight - 0.05f)
-                return false;
-
-            float sampleX = (triangle.ax + triangle.bx + triangle.cx) / 3f;
-            float sampleZ = (triangle.az + triangle.bz + triangle.cz) / 3f;
-            float bestWalkY = float.NegativeInfinity;
-
-            // Reuse the candidate set already gathered for this capsule query. Do not launch
-            // a nested spatial query here: _queryScratch is deliberately shared scratch state.
-            foreach (int candidateIndex in _queryScratch)
-            {
-                ServerCollisionTriangle walk = _triangles[candidateIndex];
-                if ((walk.flags & ServerSurfaceFlags.Walkable) == 0 ||
-                    Math.Abs(walk.normalY) < minSupportNormalY ||
-                    !TryTriangleHeightAtXZ(walk, sampleX, sampleZ, out float walkY))
-                {
-                    continue;
-                }
-
-                if (walkY > allowedTop + 0.05f ||
-                    walkY < feet.Y - maximumDetailHeight - 0.10f)
-                {
-                    continue;
-                }
-
-                if (walkY > bestWalkY)
-                    bestWalkY = walkY;
-            }
-
-            if (float.IsNegativeInfinity(bestWalkY))
-                return false;
-
-            // Ordinary low detail still has to sit essentially at/below the canonical
-            // walk surface. For near-vertical stair risers, however, the Recast support can
-            // legitimately cut through the discrete step profile by more than the ordinary
-            // seam tolerance. If the entire face is step-height-bounded and covered by
-            // authoritative walkable support, let the walk surface own traversal.
-            bool nearVertical = Math.Abs(triangle.normalY) <= 0.35f;
-            if (nearVertical)
-            {
-                float faceHeight = maxY - minY;
-                float aboveWalk = maxY - bestWalkY;
-                float belowWalk = bestWalkY - minY;
-                if (faceHeight <= maximumDetailHeight + 0.10f &&
-                    aboveWalk <= maximumDetailHeight + 0.05f &&
-                    belowWalk <= maximumDetailHeight + 0.10f)
-                {
-                    return true;
-                }
-            }
-
-            return maxY <= bestWalkY + 0.08f &&
-                   minY <= bestWalkY + 0.08f;
-        }
-
-        private static bool IsGroundContactTriangle(
-            ServerCollisionTriangle triangle,
-            WorldPosition feet,
-            float radius,
-            float minSupportNormalY,
+            ServerCapsule capsule,
             float maximumSlopeDegrees)
         {
-            // Static collider winding is not guaranteed to point upward, so use the
-            // absolute Y normal only for this local floor-contact classification.
-            if (Math.Abs(triangle.normalY) < minSupportNormalY)
-                return false;
+            float radius = capsule.Radius;
+            QueryDynamicBlockers(feet.X - radius, feet.Z - radius, feet.X + radius, feet.Z + radius);
+            foreach (long stableId in _dynamicBlockerQueryScratch)
+            {
+                if (_dynamicBlockers.TryGetValue(stableId, out DynamicBlockerState state) &&
+                    state.Enabled &&
+                    CapsuleOverlapsOrientedBox(feet, capsule, state.Definition))
+                {
+                    return false;
+                }
+            }
 
-            float slopeRadians =
-                Math.Clamp(maximumSlopeDegrees, 0f, 89f) * (MathF.PI / 180f);
-
-            // Across one capsule radius, a legal slope can rise by radius*tan(slope).
-            // Add a small skin so triangle seams / quantization do not become blockers.
-            float maxRise = radius * MathF.Tan(slopeRadians) + 0.08f;
-            float maxDrop = radius * 1.5f + 0.10f;
-            float ring = radius * 0.80f;
-
-            if (IsGroundSampleOnTriangle(triangle, feet.X, feet.Z, feet.Y, maxRise, maxDrop))
-                return true;
-            if (IsGroundSampleOnTriangle(triangle, feet.X + ring, feet.Z, feet.Y, maxRise, maxDrop))
-                return true;
-            if (IsGroundSampleOnTriangle(triangle, feet.X - ring, feet.Z, feet.Y, maxRise, maxDrop))
-                return true;
-            if (IsGroundSampleOnTriangle(triangle, feet.X, feet.Z + ring, feet.Y, maxRise, maxDrop))
-                return true;
-            if (IsGroundSampleOnTriangle(triangle, feet.X, feet.Z - ring, feet.Y, maxRise, maxDrop))
-                return true;
-
-            return false;
+            return true;
         }
 
-        private static bool IsGroundSampleOnTriangle(
-            ServerCollisionTriangle triangle,
-            float x,
-            float z,
-            float feetY,
-            float maxRise,
-            float maxDrop)
-        {
-            if (!TryTriangleHeightAtXZ(triangle, x, z, out float y))
-                return false;
-
-            return y <= feetY + maxRise &&
-                   y >= feetY - maxDrop;
-        }
-
-        /// <summary>
-        /// Resolves a short kinematic horizontal displacement with cheap substeps and
-        /// axis-sliding. It is intentionally deterministic and bounded rather than a
-        /// general-purpose physics solver.
-        /// </summary>
         public WorldPosition ResolveHorizontalMove(
             WorldPosition startFeet,
             float deltaX,
@@ -698,8 +549,7 @@ namespace Game.Server.Application.World
             if (!IsStandingCapsuleClear(
                     candidate,
                     capsule,
-                    maximumSlopeDegrees,
-                    stepHeight))
+                    maximumSlopeDegrees))
             {
                 return false;
             }
@@ -759,7 +609,11 @@ namespace Game.Server.Application.World
             out float bestY,
             out ServerCollisionTriangle bestTriangle)
         {
-            QueryTriangles(x - 0.01f, z - 0.01f, x + 0.01f, z + 0.01f);
+            if (requireWalkable)
+                QueryMovementTriangles(x - 0.01f, z - 0.01f, x + 0.01f, z + 0.01f);
+            else
+                QueryTriangles(x - 0.01f, z - 0.01f, x + 0.01f, z + 0.01f);
+
             return TryFindGroundAtPointFromCurrentCandidates(
                 x, z, feetY, probeUp, probeDown, minNormalY, requireWalkable, out bestY, out bestTriangle);
         }
@@ -778,11 +632,12 @@ namespace Game.Server.Application.World
             bestY = float.NegativeInfinity;
             bestTriangle = default;
             bool found = false;
-            foreach (int index in _queryScratch)
+            ServerCollisionTriangle[] source = requireWalkable ? _movementTriangles : _triangles;
+            HashSet<int> candidates = requireWalkable ? _movementQueryScratch : _queryScratch;
+            foreach (int index in candidates)
             {
-                ServerCollisionTriangle t = _triangles[index];
-                if ((requireWalkable && (t.flags & ServerSurfaceFlags.Walkable) == 0) ||
-                    t.normalY < minNormalY)
+                ServerCollisionTriangle t = source[index];
+                if (t.normalY < minNormalY)
                 {
                     continue;
                 }
@@ -837,11 +692,23 @@ namespace Game.Server.Application.World
             _maxZ = Math.Max(_maxZ, z);
         }
 
+        private void BuildMovementTriangleGrid()
+        {
+            IndexTriangles(_movementTriangles, _movementTriangleGrid);
+        }
+
         private void BuildTriangleGrid()
         {
-            for (int i = 0; i < _triangles.Length; ++i)
+            IndexTriangles(_triangles, _triangleGrid);
+        }
+
+        private void IndexTriangles(
+            ServerCollisionTriangle[] source,
+            Dictionary<CellKey, List<int>> grid)
+        {
+            for (int i = 0; i < source.Length; ++i)
             {
-                ServerCollisionTriangle t = _triangles[i];
+                ServerCollisionTriangle t = source[i];
                 float minX = Math.Min(t.ax, Math.Min(t.bx, t.cx));
                 float maxX = Math.Max(t.ax, Math.Max(t.bx, t.cx));
                 float minZ = Math.Min(t.az, Math.Min(t.bz, t.cz));
@@ -854,10 +721,10 @@ namespace Game.Server.Application.World
                 for (int x = minCellX; x <= maxCellX; ++x)
                 {
                     var key = new CellKey(x, z);
-                    if (!_triangleGrid.TryGetValue(key, out List<int> list))
+                    if (!grid.TryGetValue(key, out List<int> list))
                     {
                         list = new List<int>(16);
-                        _triangleGrid.Add(key, list);
+                        grid.Add(key, list);
                     }
                     list.Add(i);
                 }
@@ -908,6 +775,23 @@ namespace Game.Server.Application.World
                     continue;
                 for (int i = 0; i < list.Count; ++i)
                     _dynamicBlockerQueryScratch.Add(list[i]);
+            }
+        }
+
+        private void QueryMovementTriangles(float minX, float minZ, float maxX, float maxZ)
+        {
+            _movementQueryScratch.Clear();
+            int minCellX = ToCell(minX);
+            int maxCellX = ToCell(maxX);
+            int minCellZ = ToCell(minZ);
+            int maxCellZ = ToCell(maxZ);
+            for (int z = minCellZ; z <= maxCellZ; ++z)
+            for (int x = minCellX; x <= maxCellX; ++x)
+            {
+                if (!_movementTriangleGrid.TryGetValue(new CellKey(x, z), out List<int> list))
+                    continue;
+                for (int i = 0; i < list.Count; ++i)
+                    _movementQueryScratch.Add(list[i]);
             }
         }
 

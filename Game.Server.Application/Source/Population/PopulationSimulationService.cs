@@ -1525,12 +1525,7 @@ namespace Game.Server.Application.Population
             pop.PortalPhase = PopulationPortalSequencePhase.Interior;
             pop.AiState = PopulationAiState.FollowingRoute;
             pop.RouteReason = PopulationRouteReason.PortalTravel;
-
-            ServerPose interiorPose = portal.interiorSpawn;
-            if (TryResolvePortalPose(graph, pop, portal.interiorSpawn, out ServerPose resolvedInterior))
-                interiorPose = resolvedInterior;
-
-            pop.Actor.Position = interiorPose.ToWorldPosition();
+            pop.Actor.Position = portal.interiorSpawn.ToWorldPosition();
             pop.Actor.LastSafePosition = pop.Actor.Position;
             pop.MotorState = new CharacterMotorState(pop.Actor.Position);
             pop.CurrentNodeId = portal.routeNodeId;
@@ -1684,9 +1679,6 @@ namespace Game.Server.Application.Population
                 default: pop.PortalPhase = PopulationPortalSequencePhase.None; return;
             }
 
-            if (TryResolvePortalPose(graph, pop, targetPose, out ServerPose resolvedTarget))
-                targetPose = resolvedTarget;
-
             if (MoveTowardPose(graph, pop, targetPose, dt))
             {
                 pop.PortalPhase = pop.PortalPhase switch
@@ -1714,32 +1706,6 @@ namespace Game.Server.Application.Population
                     }
                 }
             }
-        }
-
-        private static bool TryResolvePortalPose(
-            MapGraph graph,
-            PopulationActorRuntime pop,
-            ServerPose authored,
-            out ServerPose resolved)
-        {
-            resolved = authored;
-            if (graph?.Collision == null || pop == null)
-                return true;
-
-            var capsule = new ServerCapsule(
-                Math.Max(0.2f, pop.CapsuleRadius),
-                Math.Max(pop.CapsuleHeight, pop.CapsuleRadius * 2f));
-
-            // Portal authoring points define X/Z/facing. Their Y is only a hint. Resolve each
-            // point onto the same authoritative walk surface used by live movement so stairs,
-            // curbs, and modular seams do not inherit a stale transform height.
-            return graph.Collision.TryValidateSpawn(
-                authored,
-                capsule,
-                1.5f,
-                55f,
-                out resolved,
-                out _);
         }
 
         private bool MoveTowardPose(MapGraph graph, PopulationActorRuntime pop, ServerPose targetPose, float dt)

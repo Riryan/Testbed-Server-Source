@@ -208,6 +208,7 @@ namespace Game.Shared.Population
         [DataMember(Name = "minimumSpawnInterval")] public float minimumSpawnInterval = 0.75f;
         [DataMember(Name = "maximumSpawnInterval")] public float maximumSpawnInterval = 1.75f;
         [DataMember(Name = "spawnBurstLimit")] public int spawnBurstLimit = 1;
+        [DataMember(Name = "maximumActiveInWorld")] public int maximumActiveInWorld = 5;
         [DataMember(Name = "maximumActiveNearby")] public int maximumActiveNearby = 12;
         [DataMember(Name = "activeNearbyRadius")] public float activeNearbyRadius = 18f;
         [DataMember(Name = "exitClearanceRadius")] public float exitClearanceRadius = 0.45f;
