@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using DotRecast.Detour.Io;
 using Game.Shared.Actors;
+using Game.Shared.Population;
 using Game.Shared.World;
 
 namespace Game.GameServer.Runtime;
@@ -44,6 +45,12 @@ internal static class ServerMapDataLoader
             if (string.IsNullOrWhiteSpace(snapshot.mapId))
                 throw new InvalidDataException($"Server map '{file}' has no mapId.");
 
+            // Compose independently baked authoring layers into the existing runtime
+            // ServerMapSnapshot, so movement, Population and spawns keep their contracts.
+            if (snapshot.layerFormatVersion == 1)
+                LoadAuthoringLayers(fullPath, file, snapshot);
+            else if (snapshot.layerFormatVersion != 0)
+                throw new InvalidDataException($"Unsupported map layer format {snapshot.layerFormatVersion} in {file}.");
             ValidateSpawnAnchors(file, snapshot);
             ValidateNavMesh(fullPath, file, snapshot);
             ValidateSharedWorld(fullPath, file, snapshot);
@@ -57,6 +64,82 @@ internal static class ServerMapDataLoader
         return maps;
     }
 
+
+    private sealed class RouteLayerFile
+    {
+        public int formatVersion;
+        public string mapId = string.Empty;
+        public string instanceId = string.Empty;
+        public string coreContentHash = string.Empty;
+        public ServerPopulationRouteNode[] populationNodes = Array.Empty<ServerPopulationRouteNode>();
+        public ServerPopulationRouteEdge[] populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+        public ServerPopulationPortal[] populationPortals = Array.Empty<ServerPopulationPortal>();
+    }
+
+    private sealed class SpawnLayerFile
+    {
+        public int formatVersion;
+        public string mapId = string.Empty;
+        public string instanceId = string.Empty;
+        public string coreContentHash = string.Empty;
+        public ServerSpawnAnchor[] spawnAnchors = Array.Empty<ServerSpawnAnchor>();
+    }
+
+    private static void LoadAuthoringLayers(string folder, string coreFile, ServerMapSnapshot snapshot)
+    {
+        const string coreSuffix = ".servermap.json";
+        string fileName = Path.GetFileName(coreFile);
+        if (!fileName.EndsWith(coreSuffix, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Unexpected core world map filename: {coreFile}");
+        string stem = fileName[..^coreSuffix.Length];
+        string spawnPath = Path.Combine(folder, stem + ".spawns.json");
+        if (!File.Exists(spawnPath))
+            throw new FileNotFoundException(
+                $"Core world '{snapshot.mapId}' published without a valid spawns layer. Re-bake/fix ServerSpawn authoring.",
+                spawnPath);
+        SpawnLayerFile spawns = JsonSerializer.Deserialize<SpawnLayerFile>(
+            File.ReadAllText(spawnPath), JsonOptions) ??
+            throw new InvalidDataException($"Spawns layer contained no data: {spawnPath}");
+        ValidateLayer(spawnPath, snapshot, spawns.formatVersion,
+            spawns.mapId, spawns.instanceId, spawns.coreContentHash);
+        snapshot.spawnAnchors = spawns.spawnAnchors ?? Array.Empty<ServerSpawnAnchor>();
+
+        string routesPath = Path.Combine(folder, stem + ".routes.json");
+        if (File.Exists(routesPath))
+        {
+            RouteLayerFile routes = JsonSerializer.Deserialize<RouteLayerFile>(
+                File.ReadAllText(routesPath), JsonOptions) ??
+                throw new InvalidDataException($"Routes layer contained no data: {routesPath}");
+            ValidateLayer(routesPath, snapshot, routes.formatVersion,
+                routes.mapId, routes.instanceId, routes.coreContentHash);
+            snapshot.populationNodes = routes.populationNodes ?? Array.Empty<ServerPopulationRouteNode>();
+            snapshot.populationEdges = routes.populationEdges ?? Array.Empty<ServerPopulationRouteEdge>();
+            snapshot.populationPortals = routes.populationPortals ?? Array.Empty<ServerPopulationPortal>();
+        }
+        else
+        {
+            // Route authoring failures are isolated from ground/movement and spawns.
+            snapshot.populationNodes = Array.Empty<ServerPopulationRouteNode>();
+            snapshot.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
+            snapshot.populationPortals = Array.Empty<ServerPopulationPortal>();
+            Console.WriteLine($"World route layer absent for map '{snapshot.mapId}'; no baked Population routes loaded.");
+        }
+        Console.WriteLine($"World layers: map='{snapshot.mapId}', spawns={snapshot.spawnAnchors.Length}, " +
+            $"nodes={snapshot.populationNodes.Length}, edges={snapshot.populationEdges.Length}");
+    }
+
+    private static void ValidateLayer(
+        string path, ServerMapSnapshot core, int version,
+        string mapId, string instanceId, string coreHash)
+    {
+        if (version != 1 ||
+            !string.Equals(mapId, core.mapId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(instanceId ?? string.Empty, core.instanceId ?? string.Empty, StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(coreHash) ||
+            !string.Equals(coreHash, core.contentHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException(
+                $"Authoring layer mismatch/stale for '{core.mapId}' at {path}; re-bake the affected layer against current core geometry.");
+    }
 
     private static void ValidateSpawnAnchors(string manifestPath, ServerMapSnapshot snapshot)
     {

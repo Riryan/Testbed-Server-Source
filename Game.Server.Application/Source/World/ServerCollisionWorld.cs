@@ -416,7 +416,32 @@ namespace Game.Server.Application.World
             ServerCapsule capsule,
             float maximumSlopeDegrees)
         {
+            // Ground support is not a substitute for physical standing clearance.
+            // Ignore the supporting walkable floor directly under the capsule (which
+            // would intersect the capsule on slopes), but still test walls, overhead
+            // geometry, steep faces, and other static solid triangles.
             float radius = capsule.Radius;
+            float cylinderBottomY = feet.Y + radius;
+            float cylinderTopY = feet.Y + capsule.Height - radius;
+            float floorNormalY = MathF.Cos(
+                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            QueryTriangles(feet.X - radius, feet.Z - radius,
+                feet.X + radius, feet.Z + radius);
+            foreach (int index in _queryScratch)
+            {
+                ServerCollisionTriangle t = _triangles[index];
+                // Floors below the lower hemisphere are accounted for by the
+                // authoritative movement-support test, including ramps and curbs.
+                if (t.normalY >= floorNormalY &&
+                    Math.Max(t.ay, Math.Max(t.by, t.cy)) <= feet.Y + radius * 1.5f)
+                    continue;
+                float distanceSquared = SegmentTriangleDistanceSquared(
+                    feet.X, cylinderBottomY, feet.Z,
+                    feet.X, cylinderTopY, feet.Z, t);
+                if (distanceSquared < radius * radius - 0.000001f)
+                    return false;
+            }
+
             QueryDynamicBlockers(feet.X - radius, feet.Z - radius, feet.X + radius, feet.Z + radius);
             foreach (long stableId in _dynamicBlockerQueryScratch)
             {

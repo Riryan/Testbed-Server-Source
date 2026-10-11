@@ -68,6 +68,7 @@ namespace Game.Shared.World
         [DataMember(Name = "bakedUtcTicks")] public long bakedUtcTicks;
         [DataMember(Name = "contentHash")] public string contentHash = string.Empty;
         [DataMember(Name = "sourceScene")] public string sourceScene = string.Empty;
+        [DataMember(Name = "layerFormatVersion")] public int layerFormatVersion;
         [DataMember(Name = "mapKind")] public ServerMapKind mapKind = ServerMapKind.World;
         [DataMember(Name = "worldRules")] public ServerWorldRules worldRules = new ServerWorldRules();
         [DataMember(Name = "propertyTemplate")] public ServerPropertyTemplateDefinition propertyTemplate;
