@@ -135,7 +135,13 @@ namespace Game.Server.Application.Movement
                     _settings.MaximumSlopeDegrees,
                     out ServerGroundHit ground))
             {
-                moved = new WorldPosition(moved.X, ground.Position.Y, moved.Z);
+                // Keep the elevated feet through a small stair/curb edge when the
+                // downward settle would intersect the outgoing riser. Once the full
+                // capsule can descend, the same query lands it on real baked ground.
+                // This also preserves the short pre-step lift needed on ascent.
+                if (CanSettleGroundHeight(collisionWorld, moved, ground.Position.Y))
+                    moved = new WorldPosition(moved.X, ground.Position.Y, moved.Z);
+
                 state.GroundSurfaceId = ground.SurfaceId;
                 state.VerticalVelocity = 0f;
                 state.Grounded = true;
@@ -201,6 +207,29 @@ namespace Game.Server.Application.Movement
             state.Position = moved;
             if (state.Grounded && collisionWorld.IsCapsuleClear(state.Position, _capsule))
                 state.LastSafePosition = state.Position;
+        }
+
+        private bool CanSettleGroundHeight(
+            ServerCollisionWorld world, WorldPosition current, float supportY)
+        {
+            float deltaY = supportY - current.Y;
+            if (Math.Abs(deltaY) < 0.001f)
+                return true;
+
+            // Test the vertical path, not just the destination. This is at most a
+            // handful of local spatial queries for an actual step transition and
+            // never adds network traffic or separate motor state.
+            float increment = Math.Max(0.05f, _capsule.Radius * 0.5f);
+            int samples = Math.Clamp((int)Math.Ceiling(Math.Abs(deltaY) / increment), 1, 12);
+            for (int i = 1; i <= samples; ++i)
+            {
+                float height = current.Y + deltaY * i / samples;
+                if (!world.IsStandingCapsuleClear(
+                        new WorldPosition(current.X, height, current.Z),
+                        _capsule, _settings.MaximumSlopeDegrees))
+                    return false;
+            }
+            return true;
         }
 
         private static void Sanitize(CharacterMotorSettings settings)

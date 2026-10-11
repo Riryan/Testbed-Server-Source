@@ -430,10 +430,15 @@ namespace Game.Server.Application.World
             foreach (int index in _queryScratch)
             {
                 ServerCollisionTriangle t = _triangles[index];
-                // Floors below the lower hemisphere are accounted for by the
-                // authoritative movement-support test, including ramps and curbs.
+                // A long ramp triangle can span several metres in Y. Its highest
+                // vertex is not the ground at this capsule: use the local height
+                // nearest to the capsule footprint instead. Only upward-facing,
+                // locally low support may be excluded. Walls, risers, ceiling and
+                // elevated geometry still go through the full capsule-distance test.
                 if (t.normalY >= floorNormalY &&
-                    Math.Max(t.ay, Math.Max(t.by, t.cy)) <= feet.Y + radius * 1.5f)
+                    (Math.Max(t.ay, Math.Max(t.by, t.cy)) <= feet.Y + radius * 1.5f ||
+                     (TryClosestTriangleHeightAtXZ(t, feet.X, feet.Z, out float localFloorY) &&
+                      localFloorY <= feet.Y + radius * 1.5f)))
                     continue;
                 float distanceSquared = SegmentTriangleDistanceSquared(
                     feet.X, cylinderBottomY, feet.Z,
@@ -545,42 +550,127 @@ namespace Game.Server.Application.World
                 return true;
             }
 
-            // Grounded movement is projected onto the walk surface at every bounded
-            // horizontal substep. Ramps therefore change Y continuously instead of moving
-            // flat first and snapping upward after the whole tick.
-            if (!TryFindGround(
-                    desired,
-                    capsule.Radius,
-                    Math.Max(0.05f, stepHeight + 0.05f),
-                    Math.Max(0.05f, groundSnapDistance),
-                    maximumSlopeDegrees,
-                    out ServerGroundHit support))
-            {
+            // Grounded movement uses the exact baked walk surface. Resolve the end
+            // support first, then find a physically clear capsule height. Stepping up
+            // must be possible before the capsule center reaches the next tread; stepping
+            // down must not push the capsule into the previous tread's exposed edge.
+            float probeUp = Math.Max(0.05f, stepHeight + 0.05f);
+            float probeDown = Math.Max(0.05f, groundSnapDistance);
+            if (!TryFindGround(desired, capsule.Radius, probeUp, probeDown,
+                    maximumSlopeDegrees, out ServerGroundHit support))
                 return false;
+
+            float supportY = support.Position.Y;
+            if (supportY > current.Y + stepHeight + 0.05f ||
+                supportY < current.Y - groundSnapDistance - 0.05f)
+                return false;
+
+            var groundedPose = new WorldPosition(desired.X, supportY, desired.Z);
+            bool groundClear = IsStandingCapsuleClear(groundedPose, capsule, maximumSlopeDegrees);
+            if (groundClear)
+            {
+                // While stepping over a tread edge, do not drop a raised capsule onto
+                // a lower center sample just because the next tread has not yet reached
+                // the capsule center. This is a local, bounded pose choice, not a new
+                // movement mode, and is checked by the same physical clearance query.
+                if (supportY < current.Y - 0.01f &&
+                    IsStandingCapsuleClear(desired, capsule, maximumSlopeDegrees) &&
+                    HasWalkableTreadAhead(desired, deltaX, deltaZ, current.Y,
+                        capsule.Radius, stepHeight, maximumSlopeDegrees, supportY))
+                {
+                    resolved = desired;
+                    return true;
+                }
+
+                // A rising transition may not teleport the capsule through a ceiling
+                // over the *starting* position. Verify the elevated starting pose.
+                if (supportY > current.Y + 0.01f &&
+                    !IsGroundedStepElevationClear(
+                        current, supportY, capsule, maximumSlopeDegrees))
+                    return false;
+
+                resolved = groundedPose;
+                return true;
             }
 
-            float verticalDelta = support.Position.Y - current.Y;
-            if (verticalDelta > stepHeight + 0.05f ||
-                verticalDelta < -groundSnapDistance - 0.05f)
+            // A valid downward step can overlap the outgoing stair riser/road edge
+            // if the feet are lowered prematurely. Keep the old feet height while
+            // moving horizontally, then settle as soon as the lower pose becomes clear.
+            if (supportY < current.Y - 0.01f &&
+                IsStandingCapsuleClear(desired, capsule, maximumSlopeDegrees))
             {
-                return false;
+                resolved = desired;
+                return true;
             }
 
-            WorldPosition candidate = new WorldPosition(
-                desired.X,
-                support.Position.Y,
-                desired.Z);
-
-            if (!IsStandingCapsuleClear(
-                    candidate,
-                    capsule,
-                    maximumSlopeDegrees))
+            // Stair ascent: the capsule hits a riser *before* its center reaches the
+            // upper tread. Probe one radius in the movement direction for an actual
+            // authored higher floor, capped by StepHeight. Never climb an unsupported
+            // wall or an active dynamic blocker.
+            float planar = MathF.Sqrt(deltaX * deltaX + deltaZ * deltaZ);
+            if (planar > 0.000001f)
             {
-                return false;
+                float leadX = desired.X + deltaX / planar * capsule.Radius;
+                float leadZ = desired.Z + deltaZ / planar * capsule.Radius;
+                float minNormalY = MathF.Cos(Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+                if (TryFindGroundAtPoint(leadX, leadZ, current.Y,
+                        probeUp, probeDown, minNormalY, true,
+                        out float leadY, out _) &&
+                    leadY > supportY + 0.01f &&
+                    leadY >= current.Y - 0.01f &&
+                    leadY <= current.Y + stepHeight + 0.05f)
+                {
+                    var raisedEnd = new WorldPosition(desired.X, leadY, desired.Z);
+                    if (IsGroundedStepElevationClear(current, leadY, capsule, maximumSlopeDegrees) &&
+                        IsStandingCapsuleClear(raisedEnd, capsule, maximumSlopeDegrees))
+                    {
+                        resolved = raisedEnd;
+                        return true;
+                    }
+                }
             }
 
-            resolved = candidate;
+            return false;
+        }
+
+        private bool IsGroundedStepElevationClear(
+            WorldPosition start, float raisedY, ServerCapsule capsule,
+            float maximumSlopeDegrees)
+        {
+            float rise = raisedY - start.Y;
+            if (rise < 0f)
+                return false;
+            float unit = Math.Max(0.05f, capsule.Radius * 0.5f);
+            int samples = Math.Clamp((int)Math.Ceiling(rise / unit), 1, 12);
+            for (int step = 1; step <= samples; ++step)
+            {
+                float y = start.Y + rise * step / samples;
+                if (!IsStandingCapsuleClear(
+                        new WorldPosition(start.X, y, start.Z),
+                        capsule, maximumSlopeDegrees))
+                    return false;
+            }
             return true;
+        }
+
+        private bool HasWalkableTreadAhead(
+            WorldPosition desired, float dx, float dz,
+            float currentY, float radius, float stepHeight,
+            float maximumSlopeDegrees, float centerGroundY)
+        {
+            float planar = MathF.Sqrt(dx * dx + dz * dz);
+            if (planar <= 0.000001f)
+                return false;
+            float x = desired.X + dx / planar * radius;
+            float z = desired.Z + dz / planar * radius;
+            float minimumUp = MathF.Cos(Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            return TryFindGroundAtPoint(x, z, currentY,
+                       Math.Max(0.05f, stepHeight + 0.05f),
+                       Math.Max(0.05f, stepHeight + 0.05f),
+                       minimumUp, true, out float aheadY, out _) &&
+                   aheadY > centerGroundY + 0.01f &&
+                   aheadY >= currentY - 0.01f &&
+                   aheadY <= currentY + stepHeight + 0.05f;
         }
 
         public bool TryValidateSpawn(
@@ -838,6 +928,49 @@ namespace Game.Server.Application.World
         }
 
         private int ToCell(float value) => (int)MathF.Floor(value / _cellSize);
+
+        // Return the triangle's height at the closest XZ location to the capsule
+        // center. On an inclined mesh, the remote high vertex is irrelevant to the
+        // capsule that is standing near the low end of the same large triangle.
+        // No allocations, no spatial-grid changes, no additional network state.
+        private static bool TryClosestTriangleHeightAtXZ(
+            ServerCollisionTriangle t, float x, float z, out float y)
+        {
+            if (TryTriangleHeightAtXZ(t, x, z, out y))
+                return true;
+
+            float bestDistance = float.PositiveInfinity;
+            y = 0f;
+            SampleClosestXZEdge(x, z, t.ax, t.ay, t.az,
+                t.bx, t.by, t.bz, ref bestDistance, ref y);
+            SampleClosestXZEdge(x, z, t.bx, t.by, t.bz,
+                t.cx, t.cy, t.cz, ref bestDistance, ref y);
+            SampleClosestXZEdge(x, z, t.cx, t.cy, t.cz,
+                t.ax, t.ay, t.az, ref bestDistance, ref y);
+            return IsFinite(y) && bestDistance < float.PositiveInfinity;
+        }
+
+        private static void SampleClosestXZEdge(
+            float px, float pz,
+            float ax, float ay, float az,
+            float bx, float by, float bz,
+            ref float bestDistance, ref float nearestHeight)
+        {
+            float dx = bx - ax;
+            float dz = bz - az;
+            float lengthSquared = dx * dx + dz * dz;
+            float t = lengthSquared > 0.00000001f
+                ? Math.Clamp(((px - ax) * dx + (pz - az) * dz) / lengthSquared, 0f, 1f)
+                : 0f;
+            float nx = ax + dx * t - px;
+            float nz = az + dz * t - pz;
+            float squared = nx * nx + nz * nz;
+            if (squared < bestDistance)
+            {
+                bestDistance = squared;
+                nearestHeight = ay + (by - ay) * t;
+            }
+        }
 
         private static bool TryTriangleHeightAtXZ(ServerCollisionTriangle t, float x, float z, out float y)
         {
