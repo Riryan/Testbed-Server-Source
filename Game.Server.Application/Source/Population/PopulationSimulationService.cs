@@ -129,6 +129,10 @@ namespace Game.Server.Application.Population
             public Dictionary<long, List<ServerPopulationRouteEdge>> Outgoing = new Dictionary<long, List<ServerPopulationRouteEdge>>();
             public Dictionary<long, ServerPopulationPortal> Portals = new Dictionary<long, ServerPopulationPortal>();
             public Dictionary<long, List<ServerPopulationPortal>> PortalsByRouteNode = new Dictionary<long, List<ServerPopulationPortal>>();
+            // One live identity per authored spawn slot. Portal counts include dormant slots.
+            public HashSet<long> OccupiedSpawnAnchors = new HashSet<long>();
+            public Dictionary<long, long> SpawnPortalByAnchor = new Dictionary<long, long>();
+            public Dictionary<long, int> PortalOwnedCounts = new Dictionary<long, int>();
             public ServerCollisionWorld Collision;
         }
 
@@ -207,6 +211,33 @@ namespace Game.Server.Application.Population
         private readonly Dictionary<string, Dictionary<long, List<PopulationActorRuntime>>> _hibernatedByPartition =
             new Dictionary<string, Dictionary<long, List<PopulationActorRuntime>>>(StringComparer.Ordinal);
         private readonly HashSet<PopulationActorRuntime> _activationScratch = new HashSet<PopulationActorRuntime>();
+
+        // Dormant activation is processed through one shared rotating cursor, not a full
+        // players x cells x dormant-Pops scan inside one AI scheduler invocation.
+        private readonly struct WakeSearchPlayer
+        {
+            public readonly PopulationPlayerView Player;
+            public readonly Dictionary<long, List<PopulationActorRuntime>> Cells;
+
+            public WakeSearchPlayer(PopulationPlayerView player, Dictionary<long, List<PopulationActorRuntime>> cells)
+            {
+                Player = player;
+                Cells = cells;
+            }
+        }
+
+        private readonly List<WakeSearchPlayer> _wakeSearchPlayers = new List<WakeSearchPlayer>(64);
+        private int _wakePlayerCursor;
+        private int _wakeCellCursor;
+        private int _wakeActorCursor;
+        private bool _wakeScanPending;
+
+        // Per-invocation ceilings. These bound preparatory work even if a portal contains
+        // a dense hibernated crowd; the next AI heartbeat resumes the same spatial cell.
+        private const int MaxWakeCellsPerPass = 48;
+        private const int MaxWakeActorsCheckedPerPass = 96;
+        private const int MaxWakeActionsPerPass = 4;
+        private const int MaxStaleSchedulePrunesPerCall = 32;
         private readonly List<AuthoritativeActorRuntime> _nearbyScratch = new List<AuthoritativeActorRuntime>();
         private readonly Dictionary<long, PortalReleaseState> _portalReleaseStates =
             new Dictionary<long, PortalReleaseState>();
@@ -321,8 +352,12 @@ namespace Game.Server.Application.Population
             // player presence without polling every dormant actor. This closes the scheduler
             // deadlock where HasDueWork() could remain false forever and therefore never call
             // PrepareBudgetedTick(), which is the place that wakes nearby dormant identities.
-            _nextActivationHeartbeatAt = now + Math.Max(0.25d, ActivationHeartbeatSeconds);
             WakeHibernatedNearPlayers(now);
+            // When the shared scan hits its work ceiling, finish the outstanding work
+            // on a short heartbeat. Otherwise preserve the configured idle heartbeat.
+            _nextActivationHeartbeatAt = now + (_wakeScanPending
+                ? 0.20d
+                : Math.Max(0.25d, ActivationHeartbeatSeconds));
         }
 
         public bool HasDueWork(double now)
@@ -354,7 +389,7 @@ namespace Game.Server.Application.Population
             bool dead = !pop.Actor.Alive || pop.AiState == PopulationAiState.Dead;
             if (dead && pop.DeadDecayAt > 0d && now >= pop.DeadDecayAt)
             {
-                RemovePopulation(pop);
+                RemovePopulation(pop, now);
                 return true;
             }
 
@@ -388,12 +423,15 @@ namespace Game.Server.Application.Population
 
         private void PruneStaleScheduleHeads()
         {
+            int removed = 0;
             while (_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out _))
             {
                 PopulationActorRuntime pop = scheduled.Actor;
                 if (pop != null && pop.Actor != null && scheduled.Version == pop.ScheduleVersion)
                     return;
                 _dueSchedule.Dequeue();
+                if (++removed >= MaxStaleSchedulePrunesPerCall)
+                    break;
             }
         }
 
@@ -709,7 +747,7 @@ namespace Game.Server.Application.Population
             ScheduleNow(pop, Math.Max(0d, pop.LastSimulationAt));
         }
 
-        private void RemovePopulation(PopulationActorRuntime pop)
+        private void RemovePopulation(PopulationActorRuntime pop, double now)
         {
             if (pop?.Actor == null)
                 return;
@@ -718,12 +756,31 @@ namespace Game.Server.Application.Population
             if (!_population.TryGetValue(actorId, out PopulationActorRuntime current) || !ReferenceEquals(current, pop))
                 return;
 
+            string partitionKey = MapKey(pop.Actor.MapId, pop.Actor.InstanceId);
             RemoveFromHibernationIndex(pop);
             _population.Remove(actorId);
             _populationSchedule.Remove(pop);
             pop.ScheduleVersion = pop.ScheduleVersion == uint.MaxValue ? 1u : pop.ScheduleVersion + 1u;
             _actors.Remove(pop.Actor.Handle);
+
+            // Release the exact baked slot, never a destination portal's slot.
+            if (_graphs.TryGetValue(partitionKey, out MapGraph graph))
+            {
+                graph.OccupiedSpawnAnchors.Remove(pop.SpawnAnchorId);
+                if (graph.SpawnPortalByAnchor.Remove(pop.SpawnAnchorId, out long ownerPortalId) &&
+                    graph.PortalOwnedCounts.TryGetValue(ownerPortalId, out int owned))
+                {
+                    if (owned <= 1)
+                        graph.PortalOwnedCounts.Remove(ownerPortalId);
+                    else
+                        graph.PortalOwnedCounts[ownerPortalId] = owned - 1;
+                }
+            }
+
+            // Subscribers synchronously retire presentation and transient death loot before a
+            // new authoritative actor identity is created from this same authored spawn slot.
             Removed?.Invoke(pop);
+            SpawnBakedPopulation(pop.SpawnAnchorId, partitionKey, now);
         }
 
         private void BuildGraphs()
@@ -767,11 +824,12 @@ namespace Game.Server.Application.Population
                     if (portal == null || portal.stableId <= 0) continue;
                     graph.Portals[portal.stableId] = portal;
 
-                    long[] portalNodes = portal.routeNodeId > 0 ? new[] { portal.routeNodeId } : Array.Empty<long>();
-
-                    for (int n = 0; n < portalNodes.Length; ++n)
+                    // Include the primary connection even for old map files with no array.
+                    // New baked maps also carry every validated nearby route connection.
+                    long[] portalNodes = portal.routeNodeIds ?? Array.Empty<long>();
+                    for (int n = -1; n < portalNodes.Length; ++n)
                     {
-                        long nodeId = portalNodes[n];
+                        long nodeId = n < 0 ? portal.routeNodeId : portalNodes[n];
                         if (nodeId <= 0 || !graph.Nodes.ContainsKey(nodeId))
                             continue;
 
@@ -809,16 +867,33 @@ namespace Game.Server.Application.Population
             list.Add(edge);
         }
 
-        private void SpawnBakedPopulation()
+        private void SpawnBakedPopulation(long onlyAnchorId = 0, string onlyPartitionKey = null, double respawnAt = 0d)
         {
             foreach (MapGraph graph in _graphs.Values)
             {
+                if (onlyAnchorId > 0 && !string.Equals(
+                        MapKey(graph.Map.mapId, graph.Map.instanceId), onlyPartitionKey, StringComparison.Ordinal))
+                    continue;
+
                 ServerSpawnAnchor[] anchors = graph.Map.spawnAnchors ?? Array.Empty<ServerSpawnAnchor>();
                 for (int i = 0; i < anchors.Length; ++i)
                 {
                     ServerSpawnAnchor anchor = anchors[i];
-                    if (anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind))
+                    if (anchor == null || !anchor.enabled || !IsSharedAiSpawnKind(anchor.kind) ||
+                        (onlyAnchorId > 0 && anchor.stableId != onlyAnchorId) ||
+                        graph.OccupiedSpawnAnchors.Contains(anchor.stableId))
                         continue;
+
+                    ServerPopulationPortal owningPortal = null;
+                    bool portalOwned = anchor.portalId > 0 &&
+                        graph.Portals.TryGetValue(anchor.portalId, out owningPortal) &&
+                        owningPortal.mode != PopulationPortalMode.DespawnOnly &&
+                        PortalAllows(owningPortal, InferNpcType(anchor.archetypeId));
+                    if (portalOwned &&
+                        graph.PortalOwnedCounts.TryGetValue(owningPortal.stableId, out int existingOwnedCount) &&
+                        existingOwnedCount >= Math.Max(1, owningPortal.maximumActiveInWorld))
+                        continue;
+
                     if (!TryResolveSpawn(graph, anchor, out ServerPose spawnPose))
                         continue;
 
@@ -892,6 +967,13 @@ namespace Game.Server.Application.Population
 
                     _population.Add(actor.Handle.actorId, pop);
                     _populationSchedule.Add(pop);
+                    graph.OccupiedSpawnAnchors.Add(anchor.stableId);
+                    if (portalOwned)
+                    {
+                        graph.SpawnPortalByAnchor[anchor.stableId] = owningPortal.stableId;
+                        graph.PortalOwnedCounts.TryGetValue(owningPortal.stableId, out int previousOwnedCount);
+                        graph.PortalOwnedCounts[owningPortal.stableId] = previousOwnedCount + 1;
+                    }
 
                     if (anchor.portalId > 0 &&
                         graph.Portals.TryGetValue(anchor.portalId, out ServerPopulationPortal initialPortal) &&
@@ -906,14 +988,25 @@ namespace Game.Server.Application.Population
                         // Keep the already validated spawn anchor as the safe dormant position.
                         pop.Actor.LastSafePosition = pop.Actor.Position;
                         pop.MotorState = new CharacterMotorState(pop.Actor.Position);
-                        pop.DormantUntil = 0d;
-                        ParkForPlayerActivation(pop, initialPortal.exterior.ToWorldPosition(), 0d);
+                        if (onlyAnchorId > 0)
+                        {
+                            double minDelay = Math.Max(0.1d, initialPortal.minimumRespawnDelay);
+                            double maxDelay = Math.Max(minDelay, initialPortal.maximumRespawnDelay);
+                            pop.DormantUntil = respawnAt + minDelay +
+                                (maxDelay - minDelay) * pop.Random.NextDouble();
+                        }
+                        else
+                        {
+                            pop.DormantUntil = 0d;
+                        }
+                        ParkForPlayerActivation(pop, initialPortal.exterior.ToWorldPosition(),
+                            onlyAnchorId > 0 ? respawnAt : 0d);
                     }
                     else
                     {
                         if (pop.MovementBehavior == SharedAiMovementMode.Route)
                             OrganicStartupDistribution(graph, pop, false);
-                        EnterAoiHibernate(pop, 0d);
+                        EnterAoiHibernate(pop, onlyAnchorId > 0 ? respawnAt : 0d);
                     }
 
                     Added?.Invoke(pop);
@@ -1428,7 +1521,15 @@ namespace Game.Server.Application.Population
             pop.AwaitingPlayerActivation = false;
             pop.AiState = PopulationAiState.PortalDormant;
             pop.SimulationLod = PopulationSimulationLod.Dormant;
-            pop.LastPortalId = portal.stableId;
+            // A destination is an exit, not a new owner of the traveller's spawn slot.
+            // Return owned identities to their existing origin spawner for future journeys.
+            long nextSourcePortalId = portal.stableId;
+            if (TryGetGraph(pop.Actor, out MapGraph homeGraph) &&
+                homeGraph.SpawnPortalByAnchor.TryGetValue(pop.SpawnAnchorId, out long homeId) &&
+                homeGraph.Portals.TryGetValue(homeId, out ServerPopulationPortal homePortal) &&
+                homePortal.mode != PopulationPortalMode.DespawnOnly)
+                nextSourcePortalId = homeId;
+            pop.LastPortalId = nextSourcePortalId;
             pop.NextNodeId = 0;
             pop.PortalPhase = PopulationPortalSequencePhase.None;
             double min = Math.Max(0.1, portal.minimumRespawnDelay);
@@ -1503,8 +1604,17 @@ namespace Game.Server.Application.Population
             }
 
             long joinNode = portal.routeNodeId > 0 && graph.Nodes.ContainsKey(portal.routeNodeId)
-                ? portal.routeNodeId
-                : FindNearestNode(graph, anchor);
+                ? portal.routeNodeId : 0;
+            // Old/partial maps may have a missing primary link but valid extra links.
+            if (joinNode <= 0 && portal.routeNodeIds != null)
+                for (int i = 0; i < portal.routeNodeIds.Length; ++i)
+                    if (graph.Nodes.ContainsKey(portal.routeNodeIds[i]))
+                    {
+                        joinNode = portal.routeNodeIds[i];
+                        break;
+                    }
+            if (joinNode <= 0)
+                joinNode = FindNearestNode(graph, anchor);
 
             if (pop.MovementBehavior == SharedAiMovementMode.Route && joinNode <= 0)
                 return false;
@@ -2046,66 +2156,114 @@ namespace Game.Server.Application.Population
 
         private void WakeHibernatedNearPlayers(double now)
         {
+            _wakeScanPending = false;
+            _wakeSearchPlayers.Clear();
             if (_hibernatingCount <= 0 || _playersByPartition.Count == 0)
-                return;
-
-            _activationScratch.Clear();
-            float activation = Math.Max(1f, PlayerActivationDistance);
-            int cellRadius = Math.Max(1, (int)Math.Ceiling(activation / HibernationCellSize));
-            float activationSq = activation * activation;
-
-            foreach (KeyValuePair<string, PlayerSpatialPartition> partitionPair in _playersByPartition)
             {
-                PlayerSpatialPartition partition = partitionPair.Value;
+                _wakePlayerCursor = _wakeCellCursor = _wakeActorCursor = 0;
+                return;
+            }
+
+            // Build a reusable flat player view. Multiple maps/instances retain their own
+            // hibernation cells, and no dormant actor receives an individual polling timer.
+            foreach (KeyValuePair<string, PlayerSpatialPartition> pair in _playersByPartition)
+            {
+                PlayerSpatialPartition partition = pair.Value;
                 if (partition == null || partition.Players.Count == 0 ||
-                    !_hibernatedByPartition.TryGetValue(partitionPair.Key, out Dictionary<long, List<PopulationActorRuntime>> cells))
-                {
+                    !_hibernatedByPartition.TryGetValue(
+                        pair.Key, out Dictionary<long, List<PopulationActorRuntime>> cells))
                     continue;
-                }
 
                 for (int p = 0; p < partition.Players.Count; ++p)
+                    _wakeSearchPlayers.Add(new WakeSearchPlayer(partition.Players[p], cells));
+            }
+
+            if (_wakeSearchPlayers.Count == 0)
+            {
+                _wakePlayerCursor = _wakeCellCursor = _wakeActorCursor = 0;
+                return;
+            }
+
+            float activation = Math.Max(1f, PlayerActivationDistance);
+            int radius = Math.Max(1, (int)Math.Ceiling(activation / HibernationCellSize));
+            // The normal radius is one cell. Bound invalid/extreme authoring settings
+            // rather than overflow the integer cell-count calculation.
+            radius = Math.Min(radius, 256);
+            int side = radius * 2 + 1;
+            int cellsPerPlayer = side * side;
+            float activationSq = activation * activation;
+            _wakePlayerCursor %= _wakeSearchPlayers.Count;
+            _wakeCellCursor %= cellsPerPlayer;
+            _wakeActorCursor = Math.Max(0, _wakeActorCursor);
+            _activationScratch.Clear();
+
+            int cellChecks = 0;
+            int actorChecks = 0;
+            int completedPlayers = 0;
+            while (completedPlayers < _wakeSearchPlayers.Count &&
+                   cellChecks < MaxWakeCellsPerPass &&
+                   actorChecks < MaxWakeActorsCheckedPerPass &&
+                   _activationScratch.Count < MaxWakeActionsPerPass)
+            {
+                WakeSearchPlayer entry = _wakeSearchPlayers[_wakePlayerCursor];
+                int centerX = ToHibernationCell(entry.Player.Position.X);
+                int centerZ = ToHibernationCell(entry.Player.Position.Z);
+                int dx = _wakeCellCursor % side - radius;
+                int dz = _wakeCellCursor / side - radius;
+
+                ++cellChecks;
+                if (entry.Cells.TryGetValue(
+                        PackPlayerCell(centerX + dx, centerZ + dz),
+                        out List<PopulationActorRuntime> cell) && cell != null)
                 {
-                    PopulationPlayerView player = partition.Players[p];
-                    int centerX = ToHibernationCell(player.Position.X);
-                    int centerZ = ToHibernationCell(player.Position.Z);
-                    for (int dz = -cellRadius; dz <= cellRadius; ++dz)
+                    // The cell may shrink when a previous pass wakes a Pop. Clamp the
+                    // continuation cursor and eventually revisit cells on each rotation.
+                    _wakeActorCursor = Math.Min(_wakeActorCursor, cell.Count);
+                    while (_wakeActorCursor < cell.Count &&
+                           actorChecks < MaxWakeActorsCheckedPerPass &&
+                           _activationScratch.Count < MaxWakeActionsPerPass)
                     {
-                        for (int dx = -cellRadius; dx <= cellRadius; ++dx)
-                        {
-                            if (!cells.TryGetValue(PackPlayerCell(centerX + dx, centerZ + dz), out List<PopulationActorRuntime> cell))
-                                continue;
-                            for (int i = 0; i < cell.Count; ++i)
-                            {
-                                PopulationActorRuntime pop = cell[i];
-                                if (pop == null || !pop.AwaitingPlayerActivation || pop.Actor == null)
-                                    continue;
-                                float px = pop.HibernationPosition.X - player.Position.X;
-                                float pz = pop.HibernationPosition.Z - player.Position.Z;
-                                if (px * px + pz * pz <= activationSq)
-                                    _activationScratch.Add(pop);
-                            }
-                        }
+                        PopulationActorRuntime pop = cell[_wakeActorCursor++];
+                        ++actorChecks;
+                        if (pop == null || !pop.AwaitingPlayerActivation || pop.Actor == null)
+                            continue;
+
+                        float x = pop.HibernationPosition.X - entry.Player.Position.X;
+                        float z = pop.HibernationPosition.Z - entry.Player.Position.Z;
+                        if (x * x + z * z <= activationSq)
+                            _activationScratch.Add(pop);
                     }
+                    if (_wakeActorCursor < cell.Count)
+                        break; // Resume the same dense cell next AI tick.
+                }
+
+                _wakeActorCursor = 0;
+                if (++_wakeCellCursor >= cellsPerPlayer)
+                {
+                    _wakeCellCursor = 0;
+                    if (++_wakePlayerCursor >= _wakeSearchPlayers.Count)
+                        _wakePlayerCursor = 0;
+                    ++completedPlayers;
                 }
             }
 
-            if (_activationScratch.Count == 0)
-                return;
-
-            PopulationActorRuntime[] wake = new PopulationActorRuntime[_activationScratch.Count];
-            _activationScratch.CopyTo(wake);
-            for (int i = 0; i < wake.Length; ++i)
+            // No temporary array allocation. Wake callbacks can modify the hibernation
+            // index, but not this independent HashSet. Portal rate/density/clearance checks
+            // and canonical wake/catch-up behavior remain owned by existing methods.
+            foreach (PopulationActorRuntime pop in _activationScratch)
             {
-                PopulationActorRuntime pop = wake[i];
-                if (pop != null && pop.AiState == PopulationAiState.PortalDormant)
-                {
-                    WakePortalDormantImmediately(pop, now);
+                if (pop == null || !pop.AwaitingPlayerActivation)
                     continue;
-                }
-
-                WakeImmediately(pop, now, catchUp: true);
+                if (pop.AiState == PopulationAiState.PortalDormant)
+                    WakePortalDormantImmediately(pop, now);
+                else
+                    WakeImmediately(pop, now, catchUp: true);
             }
             _activationScratch.Clear();
+
+            _wakeScanPending = cellChecks >= MaxWakeCellsPerPass ||
+                               actorChecks >= MaxWakeActorsCheckedPerPass ||
+                               completedPlayers < _wakeSearchPlayers.Count;
         }
 
         /// <summary>

@@ -201,6 +201,7 @@ namespace Game.Shared.Population
         [DataMember(Name = "threshold")] public ServerPose threshold;
         [DataMember(Name = "exterior")] public ServerPose exterior;
         [DataMember(Name = "routeNodeId")] public long routeNodeId;
+        [DataMember(Name = "routeNodeIds")] public long[] routeNodeIds = Array.Empty<long>();
         [DataMember(Name = "doorWorldObjectId")] public long doorWorldObjectId;
         [DataMember(Name = "minimumRespawnDelay")] public float minimumRespawnDelay = 8f;
         [DataMember(Name = "maximumRespawnDelay")] public float maximumRespawnDelay = 20f;
