@@ -234,9 +234,9 @@ namespace Game.Server.Application.Population
 
         // Per-invocation ceilings. These bound preparatory work even if a portal contains
         // a dense hibernated crowd; the next AI heartbeat resumes the same spatial cell.
-        private const int MaxWakeCellsPerPass = 48;
-        private const int MaxWakeActorsCheckedPerPass = 96;
-        private const int MaxWakeActionsPerPass = 4;
+        private const int MaxWakeCellsPerPass = 16;
+        private const int MaxWakeActorsCheckedPerPass = 32;
+        private const int MaxWakeActionsPerPass = 1;
         private const int MaxStaleSchedulePrunesPerCall = 32;
         private readonly List<AuthoritativeActorRuntime> _nearbyScratch = new List<AuthoritativeActorRuntime>();
         private readonly Dictionary<long, PortalReleaseState> _portalReleaseStates =
@@ -245,6 +245,21 @@ namespace Game.Server.Application.Population
         private int _portalRespawnsThisTick;
         private int _hibernatingCount;
         private double _nextActivationHeartbeatAt;
+        // The first AI work unit prepares the player partitions; the following unit
+        // performs activation. This persists across AI ticks if the scheduler allows
+        // only one work unit before its frame/channel budget is exhausted.
+        private bool _activationHandoffPending;
+        private bool _activationHandoffReady;
+
+        // Ambient Population admission is shared across all portals and observers in an area.
+        // Source portals are opportunities, not a request to keep every authored actor awake.
+        private const float AmbientAdmissionCellSize = 128f;
+        private readonly Dictionary<string, Dictionary<long, double>> _ambientNextAdmission =
+            new Dictionary<string, Dictionary<long, double>>(StringComparer.Ordinal);
+        private int _ambientAdmissionsThisTick;
+        private int _ambientAttemptsThisTick;
+        private int _ambientActiveCountSnapshot = -1;
+        private double _nextGlobalAmbientAdmissionAt;
 
         public float EngagedDistance { get; set; } = 28f;
         public float ActiveDistance { get; set; } = 80f;
@@ -255,6 +270,18 @@ namespace Game.Server.Application.Population
         public float CoarseDistance { get; set; } = 250f;
         public float VisibilitySuppressionDistance { get; set; } = 35f;
         public int MaximumPortalRespawnsPerTick { get; set; } = 8;
+
+        // These defaults are conservative admission safety limits for the first runtime test,
+        // NOT measured server capacity. They do not apply to monsters, combat NPCs, or forced
+        // authoritative combat activations. Raise them only after profiling.
+        public int MaximumActiveAmbientPopulation { get; set; } = 256;
+        public int MaximumAmbientPopulationNearby { get; set; } = 12;
+        public float AmbientDensityRadius { get; set; } = 96f;
+        public int MaximumAmbientAdmissionsPerAiTick { get; set; } = 1;
+        public int MaximumAmbientAttemptsPerAiTick { get; set; } = 1;
+        public int MaximumAmbientWakeCatchUpHops { get; set; } = 24;
+        public double AmbientAreaAdmissionIntervalSeconds { get; set; } = 0.75d;
+        public double AmbientGlobalAdmissionIntervalSeconds { get; set; } = 0.60d;
         // Network travel, not radial distance from origin. Ordinary trips must cover
         // several links before a portal can end them. Same-origin fallback is longer.
         public float MinimumPortalJourneyDistance { get; set; } = 60f;
@@ -282,6 +309,23 @@ namespace Game.Server.Application.Population
         public int Count => _population.Count;
         public int HibernatingCount => _hibernatingCount;
         public int SpatiallyActiveCount => Math.Max(0, _population.Count - _hibernatingCount);
+        public int ActiveAmbientCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (PopulationActorRuntime pop in _population.Values)
+                    if (IsActiveAmbient(pop)) ++count;
+                return count;
+            }
+        }
+
+        private static bool IsActiveAmbient(PopulationActorRuntime pop) =>
+            pop?.Actor != null && pop.Actor.Alive &&
+            pop.SpawnKind == ServerSpawnKind.Population &&
+            !pop.AwaitingPlayerActivation &&
+            pop.AiState != PopulationAiState.PortalDormant &&
+            pop.AiState != PopulationAiState.Dead;
 
         public event Action<PopulationActorRuntime> Added;
         public event Action<PopulationActorRuntime> Changed;
@@ -327,6 +371,15 @@ namespace Game.Server.Application.Population
                 return 0;
 
             PrepareBudgetedTick(players, now);
+            // Compatibility path: preparation and activation do not count as
+            // simulated actors. Consume at most two dedicated work units here.
+            if (_hibernatingCount > 0 && now + 0.000001d >= _nextActivationHeartbeatAt)
+            {
+                if (_activationHandoffPending)
+                    TickNextBudgeted(fixedDelta, now);
+                if (_activationHandoffReady)
+                    TickNextBudgeted(fixedDelta, now);
+            }
             int processed = 0;
             int toProcess = Math.Min(maxActors, _populationSchedule.Count);
             while (processed < toProcess && TickNextBudgeted(fixedDelta, now))
@@ -341,23 +394,30 @@ namespace Game.Server.Application.Population
         /// </summary>
         public void PrepareBudgetedTick(IReadOnlyList<PopulationPlayerView> players, double now)
         {
-            BuildPlayerPartitions(players);
+            // Reuse partitions across the handoff to keep the wake invocation
+            // independent from the player-partition rebuild. A full disconnect
+            // invalidates that snapshot immediately, preventing phantom wakes.
+            if (!_activationHandoffReady || players == null || players.Count == 0)
+                BuildPlayerPartitions(players);
+            if (_hibernatingCount <= 0)
+                _activationHandoffPending = _activationHandoffReady = false;
+            else if (now + 0.000001d >= _nextActivationHeartbeatAt &&
+                     !_activationHandoffPending && !_activationHandoffReady)
+                _activationHandoffPending = true;
+            _ambientAdmissionsThisTick = 0;
+            _ambientAttemptsThisTick = 0;
+            _ambientActiveCountSnapshot = -1;
             _portalRespawnsThisTick = 0;
             _portalAdmissionGeneration = _portalAdmissionGeneration == uint.MaxValue
                 ? 1u
                 : _portalAdmissionGeneration + 1u;
 
-            // Hibernated Population is intentionally absent from the normal per-actor due queue.
-            // Advance a single shared activation heartbeat here so the core scheduler can probe
-            // player presence without polling every dormant actor. This closes the scheduler
-            // deadlock where HasDueWork() could remain false forever and therefore never call
-            // PrepareBudgetedTick(), which is the place that wakes nearby dormant identities.
-            WakeHibernatedNearPlayers(now);
-            // When the shared scan hits its work ceiling, finish the outstanding work
-            // on a short heartbeat. Otherwise preserve the configured idle heartbeat.
-            _nextActivationHeartbeatAt = now + (_wakeScanPending
-                ? 0.20d
-                : Math.Max(0.25d, ActivationHeartbeatSeconds));
+            // Only refresh the shared observer partitions in this preparation phase.
+            // Do NOT admit Population here: the host measures PrepareBudgetedTick and
+            // TickNextBudgeted together as one 2 ms invocation. A wake may perform
+            // collision/ground checks and would otherwise be charged together with the
+            // next actor motor tick. Activation instead consumes a separate scheduler
+            // work unit from TickNextBudgeted at its own heartbeat cadence.
         }
 
         public bool HasDueWork(double now)
@@ -375,6 +435,34 @@ namespace Game.Server.Application.Population
         {
             if (fixedDelta <= 0f || _populationSchedule.Count == 0)
                 return false;
+
+            // First yield the preparation unit to the scheduler. In the existing
+            // host, PrepareBudgetedTick() and this method share one timed invocation:
+            // yielding prevents it from also performing a potentially expensive wake.
+            if (_activationHandoffPending)
+            {
+                _activationHandoffPending = false;
+                _activationHandoffReady = true;
+                return true;
+            }
+
+            // The next AI work unit performs ONLY the bounded activation scan.
+            // If that unit is deferred to the next AI tick, preparation reuses
+            // the existing partitions rather than combining the costs again.
+            if (_activationHandoffReady)
+            {
+                _activationHandoffReady = false;
+                if (_hibernatingCount > 0 && now + 0.000001d >= _nextActivationHeartbeatAt)
+                {
+                    WakeHibernatedNearPlayers(now);
+                    // Continue a dense scan at most twice per second; otherwise
+                    // preserve the existing one-second activation heartbeat.
+                    _nextActivationHeartbeatAt = now + (_wakeScanPending
+                        ? 0.50d
+                        : Math.Max(0.25d, ActivationHeartbeatSeconds));
+                }
+                return true;
+            }
 
             PruneStaleScheduleHeads();
             if (!_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out double due) ||
@@ -1569,6 +1657,13 @@ namespace Game.Server.Application.Population
                 return;
             }
 
+            WorldPosition entrance = portal.exterior.ToWorldPosition();
+            if (!CanAdmitAmbient(pop, entrance, now))
+            {
+                // Preserve this dormant identity and try later; no collision work or spawn.
+                pop.DormantUntil = now + Math.Max(0.25d, AmbientAreaAdmissionIntervalSeconds);
+                return;
+            }
             if (!PortalSpawnClear(graph, portal, pop, players))
             {
                 pop.PortalRespawnAttempts++;
@@ -1581,6 +1676,8 @@ namespace Game.Server.Application.Population
                 pop.PortalRespawnAttempts++;
                 pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
             }
+            else
+                RecordAmbientAdmission(pop, entrance, now);
         }
 
         private bool ActivatePortalSpawn(
@@ -1720,6 +1817,80 @@ namespace Game.Server.Application.Population
 
                 state.NextReleaseAt = now + interval;
             }
+        }
+
+        // A player is a demand signal, not an independent allocation of civilians. Density
+        // is measured against ALL spatially active ambient Pops, independent of who sees them.
+        // QueryRadius reuses the authoritative actor spatial index (no full actor scan).
+        private bool CanAdmitAmbient(PopulationActorRuntime pop, WorldPosition where, double now)
+        {
+            if (pop == null || pop.Actor == null)
+                return false;
+            if (pop.SpawnKind != ServerSpawnKind.Population)
+                return true; // Do not throttle authored monster / combat-NPC gameplay.
+
+            if (_ambientAdmissionsThisTick >= Math.Max(1, MaximumAmbientAdmissionsPerAiTick) ||
+                _ambientAttemptsThisTick >= Math.Max(1, MaximumAmbientAttemptsPerAiTick))
+                return false;
+            if (now < _nextGlobalAmbientAdmissionAt)
+                return false;
+
+            if (_ambientActiveCountSnapshot < 0)
+                _ambientActiveCountSnapshot = ActiveAmbientCount;
+            if (_ambientActiveCountSnapshot >= Math.Max(1, MaximumActiveAmbientPopulation))
+                return false;
+
+            string key = MapKey(pop.Actor.MapId, pop.Actor.InstanceId);
+            long cellId = PackPlayerCell(
+                (int)MathF.Floor(where.X / AmbientAdmissionCellSize),
+                (int)MathF.Floor(where.Z / AmbientAdmissionCellSize));
+            if (_ambientNextAdmission.TryGetValue(key, out Dictionary<long, double> deadlines) &&
+                deadlines.TryGetValue(cellId, out double nextAt) && now < nextAt)
+                return false;
+
+            _actors.QueryRadius(pop.Actor.MapId, pop.Actor.InstanceId, where,
+                Math.Max(1f, AmbientDensityRadius), _nearbyScratch);
+            int nearby = 0;
+            for (int i = 0; i < _nearbyScratch.Count; ++i)
+            {
+                AuthoritativeActorRuntime actor = _nearbyScratch[i];
+                if (actor == null || !actor.Alive ||
+                    actor.Handle.actorId == pop.Actor.Handle.actorId ||
+                    actor.Handle.kind != AuthoritativeActorKind.Population)
+                    continue;
+                if (_population.TryGetValue(actor.Handle.actorId, out PopulationActorRuntime other) &&
+                    IsActiveAmbient(other) &&
+                    ++nearby >= Math.Max(1, MaximumAmbientPopulationNearby))
+                    return false;
+            }
+            // One admission attempt may involve expensive ground, collision and spawn
+            // clearance checks. Even a failed candidate consumes the shared time slot.
+            // This avoids an invalid portal causing repeated per-tick CPU spikes.
+            ++_ambientAttemptsThisTick;
+            _nextGlobalAmbientAdmissionAt = now + Math.Max(0.05d, AmbientGlobalAdmissionIntervalSeconds);
+            return true;
+        }
+
+        private void RecordAmbientAdmission(PopulationActorRuntime pop, WorldPosition where, double now)
+        {
+            if (pop?.Actor == null || pop.SpawnKind != ServerSpawnKind.Population)
+                return;
+            ++_ambientAdmissionsThisTick;
+            _nextGlobalAmbientAdmissionAt = now + Math.Max(0.05d, AmbientGlobalAdmissionIntervalSeconds);
+            if (_ambientActiveCountSnapshot >= 0)
+                ++_ambientActiveCountSnapshot;
+
+            string key = MapKey(pop.Actor.MapId, pop.Actor.InstanceId);
+            if (!_ambientNextAdmission.TryGetValue(key, out Dictionary<long, double> deadlines))
+            {
+                deadlines = new Dictionary<long, double>();
+                _ambientNextAdmission.Add(key, deadlines);
+            }
+            long cellId = PackPlayerCell(
+                (int)MathF.Floor(where.X / AmbientAdmissionCellSize),
+                (int)MathF.Floor(where.Z / AmbientAdmissionCellSize));
+            // A fixed number of authored cells bounds this map. No timer per NPC/spawner.
+            deadlines[cellId] = now + Math.Max(0.05d, AmbientAreaAdmissionIntervalSeconds);
         }
 
         private bool PortalSpawnClear(MapGraph graph, ServerPopulationPortal portal, PopulationActorRuntime pop, IReadOnlyList<PopulationPlayerView> players)
@@ -2255,9 +2426,19 @@ namespace Game.Server.Application.Population
                 if (pop == null || !pop.AwaitingPlayerActivation)
                     continue;
                 if (pop.AiState == PopulationAiState.PortalDormant)
+                {
                     WakePortalDormantImmediately(pop, now);
+                }
                 else
+                {
+                    // The cap is shared across every player/spawner, not per player.
+                    WorldPosition wakePosition = pop.HibernationPosition;
+                    if (!CanAdmitAmbient(pop, wakePosition, now))
+                        continue;
                     WakeImmediately(pop, now, catchUp: true);
+                    if (!pop.AwaitingPlayerActivation && pop.Actor.Alive)
+                        RecordAmbientAdmission(pop, wakePosition, now);
+                }
             }
             _activationScratch.Clear();
 
@@ -2289,7 +2470,13 @@ namespace Game.Server.Application.Population
             if (!TryGetGraph(pop.Actor, out MapGraph graph) ||
                 !graph.Portals.TryGetValue(pop.LastPortalId, out ServerPopulationPortal portal))
             {
-                WakeImmediately(pop, now, catchUp: false);
+                if (CanAdmitAmbient(pop, pop.HibernationPosition, now))
+                {
+                    WorldPosition activation = pop.HibernationPosition;
+                    WakeImmediately(pop, now, catchUp: false);
+                    if (!pop.AwaitingPlayerActivation && pop.Actor.Alive)
+                        RecordAmbientAdmission(pop, activation, now);
+                }
                 return;
             }
 
@@ -2301,6 +2488,10 @@ namespace Game.Server.Application.Population
                 return;
 
             if (!PortalCadenceAllows(portal, now, out _))
+                return;
+
+            WorldPosition entrance = portal.exterior.ToWorldPosition();
+            if (!CanAdmitAmbient(pop, entrance, now))
                 return;
 
             if (!PortalSpawnClear(graph, portal, pop, players))
@@ -2315,6 +2506,8 @@ namespace Game.Server.Application.Population
                 pop.PortalRespawnAttempts++;
                 pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
             }
+            else
+                RecordAmbientAdmission(pop, entrance, now);
         }
 
         private void WakeImmediately(PopulationActorRuntime pop, double now, bool catchUp)
@@ -2382,6 +2575,8 @@ namespace Game.Server.Application.Population
             double cursor = now - elapsed;
             int hops = 0;
             int maxHops = Math.Max(8, MaximumLogicalCatchUpHops);
+            if (pop.SpawnKind == ServerSpawnKind.Population)
+                maxHops = Math.Min(maxHops, Math.Max(1, MaximumAmbientWakeCatchUpHops));
             while (elapsed > 0.0001d && hops < maxHops && pop.Actor.Alive && pop.AiState != PopulationAiState.PortalDormant)
             {
                 if (pop.WaitUntil > cursor)

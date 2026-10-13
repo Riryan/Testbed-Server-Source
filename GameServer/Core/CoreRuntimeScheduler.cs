@@ -1034,6 +1034,7 @@ namespace LiteNetLibManager
             {
                 long prepareStart = Stopwatch.GetTimestamp();
                 bool prepareFailed = false;
+                bool prepareOverran = false;
                 try
                 {
                     prepared.Prepare(context);
@@ -1046,10 +1047,13 @@ namespace LiteNetLibManager
                 finally
                 {
                     double elapsed = ElapsedMilliseconds(prepareStart);
+                    prepareOverran = elapsed >= entry.InvocationLimitMilliseconds;
                     RecordInvocation(entry, elapsed, channel, prepareFailed);
                 }
 
-                if (prepareFailed || entry.PendingRemoval || _serverTime < entry.QuarantineUntil)
+                // Preparation is a cooperative work unit too. Do not compound an
+                // already-expensive snapshot/update with actor work in this channel tick.
+                if (prepareOverran || prepareFailed || entry.PendingRemoval || _serverTime < entry.QuarantineUntil)
                     return;
             }
 
@@ -1061,6 +1065,7 @@ namespace LiteNetLibManager
 
                 long start = Stopwatch.GetTimestamp();
                 bool failed = false;
+                bool workUnitOverran = false;
                 try
                 {
                     entry.WorkSystem.ExecuteOneWorkUnit(context);
@@ -1073,11 +1078,15 @@ namespace LiteNetLibManager
                 finally
                 {
                     double elapsed = ElapsedMilliseconds(start);
+                    workUnitOverran = elapsed >= entry.InvocationLimitMilliseconds;
                     RecordInvocation(entry, elapsed, channel, failed);
                 }
 
                 units++;
-                if (failed || entry.PendingRemoval || _serverTime < entry.QuarantineUntil)
+                // A cooperative work unit cannot be interrupted halfway through.
+                // After an overrun, defer the remaining units to another AI/channel
+                // tick; global and channel budgets still bound admission each frame.
+                if (workUnitOverran || failed || entry.PendingRemoval || _serverTime < entry.QuarantineUntil)
                     break;
             }
         }
@@ -1112,6 +1121,25 @@ namespace LiteNetLibManager
                         $"[CoreRuntimeScheduler] Startup grace: system '{entry.Name}' in channel '{channel.Config.name}' " +
                         $"took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
                         $"Measured, no strike. Grace remaining {StartupGraceRemainingSeconds:F2}s.");
+                    entry.NextWarningTime = _serverTime + _settings.warningCooldownSeconds;
+                }
+                return;
+            }
+
+            // Budgeted work systems cooperate with the scheduler, so a completed
+            // but slow work unit is a backpressure event, not a system failure.
+            // Its caller yields further work until a later channel tick. Preserve
+            // the overrun metrics/warnings, and reserve quarantine strikes for
+            // exceptions and non-cooperative fixed-tick systems. Do not reset any
+            // existing exception strikes here.
+            if (!failed && entry.WorkSystem != null)
+            {
+                if (_serverTime >= entry.NextWarningTime)
+                {
+                    CoreRuntimeSchedulerLog.Warning(
+                        $"[CoreRuntimeScheduler] Budgeted system '{entry.Name}' in channel '{channel.Config.name}' " +
+                        $"took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
+                        "Further work deferred; no quarantine strike for a successful work unit.");
                     entry.NextWarningTime = _serverTime + _settings.warningCooldownSeconds;
                 }
                 return;
