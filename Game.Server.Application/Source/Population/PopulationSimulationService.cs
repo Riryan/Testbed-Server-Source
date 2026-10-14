@@ -218,14 +218,22 @@ namespace Game.Server.Application.Population
         {
             public readonly PopulationPlayerView Player;
             public readonly Dictionary<long, List<PopulationActorRuntime>> Cells;
+            public readonly PlayerSpatialPartition PlayerPartition;
 
-            public WakeSearchPlayer(PopulationPlayerView player, Dictionary<long, List<PopulationActorRuntime>> cells)
+            public WakeSearchPlayer(
+                PopulationPlayerView player,
+                Dictionary<long, List<PopulationActorRuntime>> cells,
+                PlayerSpatialPartition playerPartition)
             {
                 Player = player;
                 Cells = cells;
+                PlayerPartition = playerPartition;
             }
         }
 
+        // Reused only while preparing a wake pass; no per-player/NPC registrations.
+        // Players in the same hibernation cell share the identical cell search area.
+        private readonly HashSet<long> _wakePlayerCenterCells = new HashSet<long>();
         private readonly List<WakeSearchPlayer> _wakeSearchPlayers = new List<WakeSearchPlayer>(64);
         private int _wakePlayerCursor;
         private int _wakeCellCursor;
@@ -552,7 +560,11 @@ namespace Game.Server.Application.Population
             double now,
             IReadOnlyList<PopulationPlayerView> players)
         {
-            UpdateSimulationLod(pop);
+            float nearestPlayerSq = pop.Actor.Alive &&
+                pop.AiState != PopulationAiState.PortalDormant
+                    ? GetNearestPlayerDistanceSquared(pop.Actor)
+                    : float.PositiveInfinity;
+            UpdateSimulationLod(pop, nearestPlayerSq);
 
             // Canonical Population death is terminal for normal simulation until an explicit
             // future decay/respawn policy changes it. Do not let dormant/logical route ticking
@@ -575,7 +587,7 @@ namespace Game.Server.Application.Population
                 return;
             }
 
-            if (ShouldHibernateForPlayerDistance(pop))
+            if (ShouldHibernateForPlayerDistance(pop, nearestPlayerSq))
             {
                 EnterAoiHibernate(pop, now);
                 return;
@@ -623,7 +635,6 @@ namespace Game.Server.Application.Population
                 float freeRoamDistance = FreeRoamActiveDistance > 0f
                     ? Math.Min(FreeRoamActiveDistance, ActiveDistance)
                     : ActiveDistance;
-                float nearestPlayerSq = GetNearestPlayerDistanceSquared(pop.Actor);
                 if (nearestPlayerSq <= freeRoamDistance * freeRoamDistance)
                 {
                     TickFreeRoam(pop, Math.Min(fixedDelta, 0.25f), now);
@@ -728,6 +739,42 @@ namespace Game.Server.Application.Population
             }
 
             return nearestSq <= coarseSq ? nearestSq : float.PositiveInfinity;
+        }
+
+        // A grouped wake cell may contain several players. Test eligibility against
+        // all players in this map/instance using the EXISTING 64 m spatial cells;
+        // do not use only the representative player's position.
+        private static bool HasWakeObserverWithin(
+            PlayerSpatialPartition partition,
+            WorldPosition candidate,
+            float activationSquared,
+            int playerCellRadius)
+        {
+            if (partition == null || partition.Players.Count == 0)
+                return false;
+
+            int centerX = ToPlayerCell(candidate.X);
+            int centerZ = ToPlayerCell(candidate.Z);
+            for (int dz = -playerCellRadius; dz <= playerCellRadius; ++dz)
+            {
+                for (int dx = -playerCellRadius; dx <= playerCellRadius; ++dx)
+                {
+                    if (!partition.Cells.TryGetValue(
+                            PackPlayerCell(centerX + dx, centerZ + dz),
+                            out List<PopulationPlayerView> cell))
+                        continue;
+
+                    for (int i = 0; i < cell.Count; ++i)
+                    {
+                        PopulationPlayerView player = cell[i];
+                        float x = candidate.X - player.Position.X;
+                        float z = candidate.Z - player.Position.Z;
+                        if (x * x + z * z <= activationSquared)
+                            return true;
+                    }
+                }
+            }
+            return false;
         }
 
         private static int ToPlayerCell(float value) =>
@@ -1203,15 +1250,13 @@ namespace Game.Server.Application.Population
             }
         }
 
-        private void UpdateSimulationLod(PopulationActorRuntime pop)
+        private void UpdateSimulationLod(PopulationActorRuntime pop, float nearestSq)
         {
             if (pop.AiState == PopulationAiState.PortalDormant || !pop.Actor.Alive)
             {
                 pop.SimulationLod = PopulationSimulationLod.Dormant;
                 return;
             }
-
-            float nearestSq = GetNearestPlayerDistanceSquared(pop.Actor);
 
             if (pop.ThreatUntil > 0d && (pop.AiState == PopulationAiState.Fleeing || pop.AiState == PopulationAiState.Fighting))
                 pop.SimulationLod = PopulationSimulationLod.Engaged;
@@ -2285,7 +2330,7 @@ namespace Game.Server.Application.Population
             return lane * half;
         }
 
-        private bool ShouldHibernateForPlayerDistance(PopulationActorRuntime pop)
+        private bool ShouldHibernateForPlayerDistance(PopulationActorRuntime pop, float nearestPlayerSq)
         {
             if (pop == null || pop.Actor == null || pop.AwaitingPlayerActivation ||
                 pop.AiState == PopulationAiState.PortalDormant ||
@@ -2296,7 +2341,7 @@ namespace Game.Server.Application.Population
             }
 
             float hibernate = Math.Max(PlayerActivationDistance + 1f, PlayerHibernateDistance);
-            return GetNearestPlayerDistanceSquared(pop.Actor) > hibernate * hibernate;
+            return nearestPlayerSq > hibernate * hibernate;
         }
 
         private void EnterAoiHibernate(PopulationActorRuntime pop, double now)
@@ -2345,8 +2390,18 @@ namespace Game.Server.Application.Population
                         pair.Key, out Dictionary<long, List<PopulationActorRuntime>> cells))
                     continue;
 
+                // One search origin per occupied 96 m hibernation cell, not
+                // one per overlapping player. Preserve per-map/instance partitions.
+                _wakePlayerCenterCells.Clear();
                 for (int p = 0; p < partition.Players.Count; ++p)
-                    _wakeSearchPlayers.Add(new WakeSearchPlayer(partition.Players[p], cells));
+                {
+                    PopulationPlayerView player = partition.Players[p];
+                    long centerCell = PackPlayerCell(
+                        ToHibernationCell(player.Position.X),
+                        ToHibernationCell(player.Position.Z));
+                    if (_wakePlayerCenterCells.Add(centerCell))
+                        _wakeSearchPlayers.Add(new WakeSearchPlayer(player, cells, partition));
+                }
             }
 
             if (_wakeSearchPlayers.Count == 0)
@@ -2363,6 +2418,8 @@ namespace Game.Server.Application.Population
             int side = radius * 2 + 1;
             int cellsPerPlayer = side * side;
             float activationSq = activation * activation;
+            int playerCellRadius = Math.Max(1,
+                (int)Math.Ceiling(activation / PlayerSpatialCellSize));
             _wakePlayerCursor %= _wakeSearchPlayers.Count;
             _wakeCellCursor %= cellsPerPlayer;
             _wakeActorCursor = Math.Max(0, _wakeActorCursor);
@@ -2399,9 +2456,11 @@ namespace Game.Server.Application.Population
                         if (pop == null || !pop.AwaitingPlayerActivation || pop.Actor == null)
                             continue;
 
-                        float x = pop.HibernationPosition.X - entry.Player.Position.X;
-                        float z = pop.HibernationPosition.Z - entry.Player.Position.Z;
-                        if (x * x + z * z <= activationSq)
+                        if (HasWakeObserverWithin(
+                                entry.PlayerPartition,
+                                pop.HibernationPosition,
+                                activationSq,
+                                playerCellRadius))
                             _activationScratch.Add(pop);
                     }
                     if (_wakeActorCursor < cell.Count)
