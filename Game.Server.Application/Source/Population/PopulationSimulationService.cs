@@ -562,7 +562,7 @@ namespace Game.Server.Application.Population
         {
             float nearestPlayerSq = pop.Actor.Alive &&
                 pop.AiState != PopulationAiState.PortalDormant
-                    ? GetNearestPlayerDistanceSquared(pop.Actor)
+                    ? GetNearestPlayerDistanceSquared(pop.Actor, players)
                     : float.PositiveInfinity;
             UpdateSimulationLod(pop, nearestPlayerSq);
 
@@ -693,23 +693,49 @@ namespace Game.Server.Application.Population
             return Array.Empty<PopulationPlayerView>();
         }
 
-        private float GetNearestPlayerDistanceSquared(AuthoritativeActorRuntime actor)
+        private float GetNearestPlayerDistanceSquared(
+            AuthoritativeActorRuntime actor,
+            IReadOnlyList<PopulationPlayerView> players)
         {
-            if (actor == null ||
-                !_playersByPartition.TryGetValue(
-                    MapKey(actor.MapId, actor.InstanceId),
-                    out PlayerSpatialPartition partition) ||
-                partition.Players.Count == 0)
-            {
+            if (actor == null || players == null || players.Count == 0)
                 return float.PositiveInfinity;
-            }
 
             float searchDistance = Math.Max(1f, CoarseDistance);
+            float coarseSq = searchDistance * searchDistance;
+
+            // Most maps/instances have only a handful of connected players.
+            // A direct scan avoids probing up to 81 mostly empty spatial cells
+            // per Population tick at the default 250 m coarse range. For
+            // crowded instances keep the existing indexed spatial lookup.
+            if (players.Count <= 8)
+            {
+                float nearest = float.PositiveInfinity;
+                for (int i = 0; i < players.Count; ++i)
+                {
+                    PopulationPlayerView player = players[i];
+                    float x = actor.Position.X - player.Position.X;
+                    float z = actor.Position.Z - player.Position.Z;
+                    float sq = x * x + z * z;
+                    if (sq < nearest)
+                    {
+                        nearest = sq;
+                        if (nearest <= 0.0001f)
+                            break;
+                    }
+                }
+                return nearest <= coarseSq ? nearest : float.PositiveInfinity;
+            }
+
+            // Larger crowds still use the canonical per-map player-cell index.
+            if (!_playersByPartition.TryGetValue(
+                    MapKey(actor.MapId, actor.InstanceId),
+                    out PlayerSpatialPartition partition))
+                return float.PositiveInfinity;
+
             int radius = Math.Max(1, (int)Math.Ceiling(searchDistance / PlayerSpatialCellSize));
             int centerX = ToPlayerCell(actor.Position.X);
             int centerZ = ToPlayerCell(actor.Position.Z);
             float nearestSq = float.PositiveInfinity;
-            float coarseSq = searchDistance * searchDistance;
 
             for (int dz = -radius; dz <= radius; ++dz)
             {
@@ -752,6 +778,22 @@ namespace Game.Server.Application.Population
         {
             if (partition == null || partition.Players.Count == 0)
                 return false;
+
+            // The same public actor positions determine eligibility in either
+            // lookup path. Avoid many empty-cell dictionary probes in small
+            // instances; retain indexed traversal for dense crowds.
+            if (partition.Players.Count <= 8)
+            {
+                for (int i = 0; i < partition.Players.Count; ++i)
+                {
+                    PopulationPlayerView player = partition.Players[i];
+                    float x = candidate.X - player.Position.X;
+                    float z = candidate.Z - player.Position.Z;
+                    if (x * x + z * z <= activationSquared)
+                        return true;
+                }
+                return false;
+            }
 
             int centerX = ToPlayerCell(candidate.X);
             int centerZ = ToPlayerCell(candidate.Z);

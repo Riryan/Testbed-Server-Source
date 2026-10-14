@@ -32,6 +32,9 @@ namespace Game.GameServer.Networking;
 
 internal sealed partial class GameServerHost
 {
+    // Diagnostic watermark only; the existing completion queue remains authoritative.
+    private long _lastCompletionProducerWaits;
+
     // Player replication integration: AOI edge application, spawn/destroy/snapshot emission,
     // appearance deltas, and replication diagnostics. Simulation authority remains elsewhere.
     private void ScheduleReplicationDiagnostics()
@@ -51,14 +54,27 @@ internal sealed partial class GameServerHost
         bool combatWireActivity = _options.CombatWireDiagnostics &&
             (_wireCombatDamageMessages > 0 || _wireAbilityStateMessages > 0 ||
              _wireResourceDeltaMessages > 0 || _wireStatusDeltaMessages > 0);
-        bool nonOutboundActivity = _replicationBudgetDeferrals > 0 ||
-            _mainThreadCompletions.Count > 0 ||
-            combatWireActivity;
+        // Normal movement packets and brief completion-queue activity are not
+        // server-load problems. Preserve the existing ten-second accounting and
+        // emit its summary only for actual backpressure/drops or explicit debug.
+        // Inspect the outbound counters BEFORE CaptureOutboundDiagnosticsAndReset
+        // clears them. This does not change the outbound admission/budget path.
+        bool outboundPressure = _outboundBudgetDeferrals > 0 ||
+            _outboundDroppedUnreliable > 0 ||
+            _outboundQueueLimitDisconnects > 0 ||
+            _outboundMaxQueueAgeMilliseconds >= 500 ||
+            _outboundMaxPendingBytes >= 262144;
+        long producerWaits = _mainThreadCompletions.ProducerWaits;
+        bool completionPressure = _mainThreadCompletions.Count >= 128 ||
+            producerWaits > _lastCompletionProducerWaits;
+        _lastCompletionProducerWaits = producerWaits;
+        bool report = _replicationBudgetDeferrals > 0 ||
+            outboundPressure || completionPressure || combatWireActivity;
         string outboundSummary = CaptureOutboundDiagnosticsAndReset(
-            out bool outboundActivity,
-            forceSummary: nonOutboundActivity);
+            out _,
+            forceSummary: report);
 
-        if (nonOutboundActivity || outboundActivity)
+        if (report)
         {
             Console.WriteLine(
                 $"Server load: replPackets={_replicationSnapshotPacketsSent}, replBytes={_replicationPayloadBytes}, " +
