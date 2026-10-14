@@ -86,6 +86,13 @@ namespace Game.Server.Application.Population
         internal WorldPosition RoamTarget;
         internal bool HasRoamTarget;
         internal double NextRoamDecisionAt;
+        // Avoid only the edge that just blocked this actor. No graph or cache rebuild.
+        internal long BlockedRouteFromNodeId;
+        internal long BlockedRouteToNodeId;
+        internal double BlockedRouteUntil;
+        // Flee-only direction fallback; follows the existing Population work cadence.
+        internal double FleeSideStepUntil;
+        internal int FleeSideStepSign;
 
         public AuthoritativeActorRuntime Actor { get; internal set; }
         public PlayerRuntime CombatRuntime { get; internal set; }
@@ -259,6 +266,79 @@ namespace Game.Server.Application.Population
         private bool _activationHandoffPending;
         private bool _activationHandoffReady;
 
+        // Diagnostics are sampled only from the existing Population work path.
+        // Severe overrun details have their own five-second cooldown; normal actor
+        // ticks and ordinary network activity never produce messages.
+        private enum SlowWorkPhase : byte
+        {
+            None, Handoff, WakeScan, DueQueue, DeadDecay, ActorDistance,
+            ActorDead, ActorDormant, ActorHibernate, ActorThreat,
+            ActorRecovery, ActorWaiting, PortalExit, FreeRoamMotor,
+            Stationary, LogicalRoute, CoarseRoute, ActiveMotor
+        }
+
+        private const double SevereWorkMilliseconds = 4.0d;
+        private const double SlowWorkDetailCooldownSeconds = 5.0d;
+        private double _nextSlowWorkDetailAt;
+        private SlowWorkPhase _diagnosticPhase;
+        private long _diagnosticActorId;
+        private double _diagnosticPrepareMs;
+        private double _diagnosticActorMs;
+        // Separate the movement/collision runtime from actor spatial publication
+        // and the existing Population.Changed observer-presentation callback.
+        // These are passive elapsed-time counters, not a new execution route.
+        private double _diagnosticMotorCollisionMs;
+        private double _diagnosticActorPublishMs;
+        private double _diagnosticObserverPresentationMs;
+        private int _diagnosticMotorCalls;
+        private double _diagnosticDistanceMs;
+        private double _diagnosticWakeScanMs;
+        private double _diagnosticWakeAdmissionMs;
+        private double _diagnosticPortalMs;
+        private double _diagnosticCatchUpMs;
+        private int _diagnosticCatchUpHops;
+        private int _diagnosticWakeCells;
+        private int _diagnosticWakeActorChecks;
+        private int _diagnosticWakeOrigins;
+        private int _diagnosticWakeCandidates;
+        private int _diagnosticWakeAdmitted;
+
+        public bool EnableSlowWorkDiagnostics { get; set; } = true;
+
+        private static double ElapsedDiagnosticMilliseconds(long startedAt) =>
+            (System.Diagnostics.Stopwatch.GetTimestamp() - startedAt) *
+            (1000d / System.Diagnostics.Stopwatch.Frequency);
+
+        private void ReportSlowPopulationWork(double now, long startedAt, string operation)
+        {
+            if (!EnableSlowWorkDiagnostics || now < _nextSlowWorkDetailAt)
+                return;
+            double totalMs = ElapsedDiagnosticMilliseconds(startedAt);
+            if (totalMs < SevereWorkMilliseconds)
+                return;
+
+            _nextSlowWorkDetailAt = now + SlowWorkDetailCooldownSeconds;
+            double otherActorMs = Math.Max(0d,
+                _diagnosticActorMs - _diagnosticDistanceMs - _diagnosticMotorCollisionMs -
+                _diagnosticActorPublishMs - _diagnosticObserverPresentationMs);
+            // One bounded warning for a real slow unit, not one line per actor or
+            // an independent timer. Values are durations of measured sub-steps;
+            // they are not guaranteed to add up to the total wall-clock time.
+            Console.Error.WriteLine(
+                $"[PopulationAuthority] Slow-work detail: unit={operation}, total={totalMs:F3}ms, " +
+                $"phase={_diagnosticPhase}, prep={_diagnosticPrepareMs:F3}ms, " +
+                $"actor={_diagnosticActorId}, actorWork={_diagnosticActorMs:F3}ms, distance={_diagnosticDistanceMs:F3}ms, " +
+                $"motorCollision={_diagnosticMotorCollisionMs:F3}ms/{_diagnosticMotorCalls}calls, " +
+                $"actorPublish={_diagnosticActorPublishMs:F3}ms, " +
+                $"observerPresentation={_diagnosticObserverPresentationMs:F3}ms, " +
+                $"actorOther={otherActorMs:F3}ms, wakeScan={_diagnosticWakeScanMs:F3}ms, wakeAdmission={_diagnosticWakeAdmissionMs:F3}ms, " +
+                $"portal={_diagnosticPortalMs:F3}ms, catchUp={_diagnosticCatchUpMs:F3}ms/{_diagnosticCatchUpHops}hops, " +
+                $"wakeCells={_diagnosticWakeCells}, wakeActors={_diagnosticWakeActorChecks}, " +
+                $"origins={_diagnosticWakeOrigins}, candidates={_diagnosticWakeCandidates}, " +
+                $"admitted={_diagnosticWakeAdmitted}, hibernating={_hibernatingCount}, " +
+                $"scheduled={_dueSchedule.Count}.");
+        }
+
         // Ambient Population admission is shared across all portals and observers in an area.
         // Source portals are opportunities, not a request to keep every authored actor awake.
         private const float AmbientAdmissionCellSize = 128f;
@@ -402,6 +482,29 @@ namespace Game.Server.Application.Population
         /// </summary>
         public void PrepareBudgetedTick(IReadOnlyList<PopulationPlayerView> players, double now)
         {
+            // Preparation can overrun independently; do not report attribution
+            // left behind by the preceding actor work unit.
+            _diagnosticActorId = 0;
+            _diagnosticActorMs = 0d;
+            _diagnosticMotorCollisionMs = 0d;
+            _diagnosticActorPublishMs = 0d;
+            _diagnosticObserverPresentationMs = 0d;
+            _diagnosticMotorCalls = 0;
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                PrepareBudgetedTickCore(players, now);
+            }
+            finally
+            {
+                _diagnosticPrepareMs = ElapsedDiagnosticMilliseconds(startedAt);
+                _diagnosticPhase = SlowWorkPhase.Handoff;
+                ReportSlowPopulationWork(now, startedAt, "prepare");
+            }
+        }
+
+        private void PrepareBudgetedTickCore(IReadOnlyList<PopulationPlayerView> players, double now)
+        {
             // Reuse partitions across the handoff to keep the wake invocation
             // independent from the player-partition rebuild. A full disconnect
             // invalidates that snapshot immediately, preventing phantom wakes.
@@ -441,6 +544,38 @@ namespace Game.Server.Application.Population
 
         public bool TickNextBudgeted(float fixedDelta, double now)
         {
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            _diagnosticPhase = SlowWorkPhase.None;
+            _diagnosticActorId = 0;
+            _diagnosticActorMs = 0d;
+            _diagnosticMotorCollisionMs = 0d;
+            _diagnosticActorPublishMs = 0d;
+            _diagnosticObserverPresentationMs = 0d;
+            _diagnosticMotorCalls = 0;
+            _diagnosticDistanceMs = 0d;
+            _diagnosticWakeScanMs = 0d;
+            _diagnosticWakeAdmissionMs = 0d;
+            _diagnosticPortalMs = 0d;
+            _diagnosticCatchUpMs = 0d;
+            _diagnosticCatchUpHops = 0;
+            _diagnosticWakeCells = 0;
+            _diagnosticWakeActorChecks = 0;
+            _diagnosticWakeOrigins = 0;
+            _diagnosticWakeCandidates = 0;
+            _diagnosticWakeAdmitted = 0;
+            try
+            {
+                return TickNextBudgetedCore(fixedDelta, now);
+            }
+            finally
+            {
+                ReportSlowPopulationWork(now, startedAt, "work");
+                _diagnosticPrepareMs = 0d;
+            }
+        }
+
+        private bool TickNextBudgetedCore(float fixedDelta, double now)
+        {
             if (fixedDelta <= 0f || _populationSchedule.Count == 0)
                 return false;
 
@@ -449,6 +584,7 @@ namespace Game.Server.Application.Population
             // yielding prevents it from also performing a potentially expensive wake.
             if (_activationHandoffPending)
             {
+                _diagnosticPhase = SlowWorkPhase.Handoff;
                 _activationHandoffPending = false;
                 _activationHandoffReady = true;
                 return true;
@@ -459,6 +595,7 @@ namespace Game.Server.Application.Population
             // the existing partitions rather than combining the costs again.
             if (_activationHandoffReady)
             {
+                _diagnosticPhase = SlowWorkPhase.WakeScan;
                 _activationHandoffReady = false;
                 if (_hibernatingCount > 0 && now + 0.000001d >= _nextActivationHeartbeatAt)
                 {
@@ -472,6 +609,7 @@ namespace Game.Server.Application.Population
                 return true;
             }
 
+            _diagnosticPhase = SlowWorkPhase.DueQueue;
             PruneStaleScheduleHeads();
             if (!_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out double due) ||
                 due > now + 0.000001d)
@@ -485,6 +623,8 @@ namespace Game.Server.Application.Population
             bool dead = !pop.Actor.Alive || pop.AiState == PopulationAiState.Dead;
             if (dead && pop.DeadDecayAt > 0d && now >= pop.DeadDecayAt)
             {
+                _diagnosticPhase = SlowWorkPhase.DeadDecay;
+                _diagnosticActorId = pop.Actor.Handle.actorId;
                 RemovePopulation(pop, now);
                 return true;
             }
@@ -495,7 +635,10 @@ namespace Game.Server.Application.Population
             pop.LastSimulationAt = now;
 
             IReadOnlyList<PopulationPlayerView> partitionPlayers = GetPartitionPlayers(pop.Actor);
+            _diagnosticActorId = pop.Actor.Handle.actorId;
+            long actorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             TickActor(pop, actorDelta, now, partitionPlayers);
+            _diagnosticActorMs = ElapsedDiagnosticMilliseconds(actorStartedAt);
 
             if (pop.AwaitingPlayerActivation)
                 return true;
@@ -560,17 +703,21 @@ namespace Game.Server.Application.Population
             double now,
             IReadOnlyList<PopulationPlayerView> players)
         {
+            _diagnosticPhase = SlowWorkPhase.ActorDistance;
+            long distanceStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             float nearestPlayerSq = pop.Actor.Alive &&
                 pop.AiState != PopulationAiState.PortalDormant
                     ? GetNearestPlayerDistanceSquared(pop.Actor, players)
                     : float.PositiveInfinity;
             UpdateSimulationLod(pop, nearestPlayerSq);
+            _diagnosticDistanceMs = ElapsedDiagnosticMilliseconds(distanceStartedAt);
 
             // Canonical Population death is terminal for normal simulation until an explicit
             // future decay/respawn policy changes it. Do not let dormant/logical route ticking
             // overwrite Dead movement state and make a defeated Pop appear to respawn.
             if (!pop.Actor.Alive || pop.AiState == PopulationAiState.Dead)
             {
+                _diagnosticPhase = SlowWorkPhase.ActorDead;
                 pop.Actor.MovementMode = ActorMovementMode.Dead;
                 pop.Actor.VelocityX = 0f;
                 pop.Actor.VelocityY = 0f;
@@ -583,23 +730,27 @@ namespace Game.Server.Application.Population
 
             if (pop.AiState == PopulationAiState.PortalDormant)
             {
+                _diagnosticPhase = SlowWorkPhase.ActorDormant;
                 TickDormant(pop, now, players);
                 return;
             }
 
             if (ShouldHibernateForPlayerDistance(pop, nearestPlayerSq))
             {
+                _diagnosticPhase = SlowWorkPhase.ActorHibernate;
                 EnterAoiHibernate(pop, now);
                 return;
             }
 
             if (pop.ThreatUntil > now)
             {
+                _diagnosticPhase = SlowWorkPhase.ActorThreat;
                 TickThreat(pop, Math.Min(fixedDelta, 0.25f), now);
                 return;
             }
             if (pop.AiState == PopulationAiState.Fleeing || pop.AiState == PopulationAiState.Fighting)
             {
+                _diagnosticPhase = SlowWorkPhase.ActorRecovery;
                 pop.RouteReason = PopulationRouteReason.Recovery;
                 if (pop.MovementBehavior == SharedAiMovementMode.Route)
                 {
@@ -616,12 +767,14 @@ namespace Game.Server.Application.Population
 
             if (pop.WaitUntil > now)
             {
+                _diagnosticPhase = SlowWorkPhase.ActorWaiting;
                 pop.AiState = PopulationAiState.Waiting;
                 return;
             }
 
             if (pop.PortalPhase != PopulationPortalSequencePhase.None)
             {
+                _diagnosticPhase = SlowWorkPhase.PortalExit;
                 TickPortalExitSequence(pop, Math.Min(fixedDelta, 0.25f), now);
                 return;
             }
@@ -637,10 +790,12 @@ namespace Game.Server.Application.Population
                     : ActiveDistance;
                 if (nearestPlayerSq <= freeRoamDistance * freeRoamDistance)
                 {
+                    _diagnosticPhase = SlowWorkPhase.FreeRoamMotor;
                     TickFreeRoam(pop, Math.Min(fixedDelta, 0.25f), now);
                 }
                 else
                 {
+                    _diagnosticPhase = SlowWorkPhase.Stationary;
                     TickStationary(pop);
                 }
                 return;
@@ -648,16 +803,26 @@ namespace Game.Server.Application.Population
 
             if (pop.MovementBehavior == SharedAiMovementMode.Stationary)
             {
+                _diagnosticPhase = SlowWorkPhase.Stationary;
                 TickStationary(pop);
                 return;
             }
 
             if (pop.SimulationLod <= PopulationSimulationLod.Logical)
+            {
+                _diagnosticPhase = SlowWorkPhase.LogicalRoute;
                 TickLogical(pop, fixedDelta, now);
+            }
             else if (pop.SimulationLod == PopulationSimulationLod.CoarseRoute)
+            {
+                _diagnosticPhase = SlowWorkPhase.CoarseRoute;
                 TickCoarse(pop, fixedDelta, now);
+            }
             else
+            {
+                _diagnosticPhase = SlowWorkPhase.ActiveMotor;
                 TickActive(pop, Math.Min(fixedDelta, 0.25f), now);
+            }
         }
 
         private void BuildPlayerPartitions(IReadOnlyList<PopulationPlayerView> players)
@@ -1401,8 +1566,39 @@ namespace Game.Server.Application.Population
             if (graph.Collision != null)
             {
                 var intent = new CharacterMovementIntent(dx * inv, dz * inv, false, false);
-                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision);
+                bool blocked = false;
+                long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                try
+                {
+                    pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
+                        allowWallSlide: false, out blocked);
+                }
+                finally
+                {
+                    _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
+                    ++_diagnosticMotorCalls;
+                }
                 ApplyMotor(pop);
+                if (blocked)
+                {
+                    // A ground/capsule-validated position previously occupied by this
+                    // actor is safer than picking another target through the same wall.
+                    if (DistanceXZ(pop.Actor.Position, pop.LastProgressPosition) > 0.75f &&
+                        pop.RouteReason != PopulationRouteReason.Recovery)
+                    {
+                        pop.RoamTarget = pop.LastProgressPosition;
+                        pop.HasRoamTarget = true;
+                        pop.RouteReason = PopulationRouteReason.Recovery;
+                    }
+                    else
+                    {
+                        pop.HasRoamTarget = false;
+                        pop.NextRoamDecisionAt = now + 0.5d;
+                    }
+                    pop.LastProgressAt = now;
+                    pop.LastProgressPosition = pop.Actor.Position;
+                    return;
+                }
             }
             else
             {
@@ -1527,9 +1723,23 @@ namespace Game.Server.Application.Population
             bool running = pop.AiState == PopulationAiState.Fleeing;
             var intent = new CharacterMovementIntent(dx * inv, dz * inv, running, false);
             pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
-            pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision);
+            bool blocked = false;
+            long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
+                    allowWallSlide: false, out blocked);
+            }
+            finally
+            {
+                _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
+                ++_diagnosticMotorCalls;
+            }
             ApplyMotor(pop);
-            DetectStuck(graph, pop, now);
+            if (blocked)
+                RecoverBlockedRoute(pop, now);
+            else
+                DetectStuck(graph, pop, now);
         }
 
         private void TickThreat(PopulationActorRuntime pop, float dt, double now)
@@ -1546,12 +1756,155 @@ namespace Game.Server.Application.Population
             float dz = pop.Actor.Position.Z - pop.ThreatPosition.Z;
             float lenSq = dx * dx + dz * dz;
             if (lenSq < 0.001f) { dx = 1f; dz = 0f; lenSq = 1f; }
+
+            bool onRoute = TryGetFleeRouteTarget(graph, pop, now, out WorldPosition routeTarget);
+            if (onRoute)
+            {
+                dx = routeTarget.X - pop.Actor.Position.X;
+                dz = routeTarget.Z - pop.Actor.Position.Z;
+                lenSq = dx * dx + dz * dz;
+            }
+            else if (now < pop.FleeSideStepUntil)
+            {
+                // Select one escape heading per work unit. This is not collision
+                // sliding and never performs additional same-tick collision probes.
+                float sideX = -dz * pop.FleeSideStepSign;
+                dz = dx * pop.FleeSideStepSign;
+                dx = sideX;
+                lenSq = dx * dx + dz * dz;
+            }
+            if (lenSq <= 0.000001f) return;
+
             float inv = 1f / MathF.Sqrt(lenSq);
             var intent = new CharacterMovementIntent(dx * inv, dz * inv, true, false);
             pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
-            pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision);
+            bool blocked = false;
+            long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
+                    allowWallSlide: false, out blocked);
+            }
+            finally
+            {
+                _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
+                ++_diagnosticMotorCalls;
+            }
             ApplyMotor(pop);
+            if (blocked)
+            {
+                if (onRoute && pop.NextNodeId > 0)
+                    RecoverBlockedRoute(pop, now);
+                else
+                {
+                    // Alternate the chosen side only on a blocked movement event.
+                    // Do not feed both X/Z slides into the collision solver.
+                    pop.FleeSideStepSign = pop.FleeSideStepSign == 1 ? -1 : 1;
+                    pop.FleeSideStepUntil = now + 0.65d;
+                    pop.LastProgressAt = now;
+                    pop.LastProgressPosition = pop.Actor.Position;
+                }
+                return;
+            }
             DetectStuck(graph, pop, now);
+        }
+
+        private bool TryGetFleeRouteTarget(
+            MapGraph graph, PopulationActorRuntime pop, double now, out WorldPosition target)
+        {
+            target = default;
+            if (pop.MovementBehavior != SharedAiMovementMode.Route ||
+                pop.CurrentNodeId <= 0 || !graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode currentNode))
+                return false;
+
+            // The actor is already on a baked route. Prefer the next connected
+            // marker when it leads away from the threat. Reversing to CurrentNode
+            // retraces the already-cleared segment if the forward direction is unsafe.
+            if (pop.NextNodeId > 0 && graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode nextNode))
+            {
+                target = nextNode.pose.ToWorldPosition();
+                if (DistanceXZ(target, pop.Actor.Position) > 0.35f)
+                {
+                    if (pop.NextNodeId == pop.CurrentNodeId ||
+                        DistanceXZ(target, pop.ThreatPosition) >
+                        DistanceXZ(currentNode.pose.ToWorldPosition(), pop.ThreatPosition) + 0.15f)
+                        return true;
+                    pop.NextNodeId = pop.CurrentNodeId;
+                    target = currentNode.pose.ToWorldPosition();
+                    if (DistanceXZ(target, pop.Actor.Position) > 0.35f)
+                        return true;
+                }
+                else
+                {
+                    pop.PreviousNodeId = pop.CurrentNodeId;
+                    pop.CurrentNodeId = pop.NextNodeId;
+                    pop.NextNodeId = 0;
+                }
+            }
+
+            if (!graph.Nodes.TryGetValue(pop.CurrentNodeId, out currentNode)) return false;
+            float currentThreatSq = DistanceXZ(currentNode.pose.ToWorldPosition(), pop.ThreatPosition);
+            ServerPopulationRouteEdge best = null;
+            float bestScore = currentThreatSq + 0.15f;
+            if (graph.Outgoing.TryGetValue(pop.CurrentNodeId, out List<ServerPopulationRouteEdge> edges))
+            {
+                long blockedNode = BlockedDestinationFor(pop, pop.CurrentNodeId, now);
+                for (int i = 0; i < edges.Count; ++i)
+                {
+                    ServerPopulationRouteEdge edge = edges[i];
+                    if (!EdgeAllows(graph, edge, pop.NpcType) || edge.toNodeId == blockedNode)
+                        continue;
+                    WorldPosition end = graph.Nodes[edge.toNodeId].pose.ToWorldPosition();
+                    float score = DistanceXZ(end, pop.ThreatPosition);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        best = edge;
+                    }
+                }
+            }
+            if (best != null)
+            {
+                pop.NextNodeId = best.toNodeId;
+                pop.LaneOffset = ChooseLaneOffset(best.width, pop.Random);
+                target = OffsetTargetForLane(graph, pop,
+                    graph.Nodes[pop.NextNodeId].pose.ToWorldPosition());
+                return true;
+            }
+
+            // The current route has no connected safe escape edge. The next
+            // heading is chosen from the existing threat position, still no-slide.
+            return false;
+        }
+
+        private static long BlockedDestinationFor(
+            PopulationActorRuntime pop, long sourceNode, double now) =>
+            now < pop.BlockedRouteUntil && pop.BlockedRouteFromNodeId == sourceNode
+                ? pop.BlockedRouteToNodeId : 0;
+
+        private void RecoverBlockedRoute(PopulationActorRuntime pop, double now)
+        {
+            if (pop.CurrentNodeId > 0 && pop.NextNodeId > 0 &&
+                pop.CurrentNodeId != pop.NextNodeId)
+            {
+                pop.BlockedRouteFromNodeId = pop.CurrentNodeId;
+                pop.BlockedRouteToNodeId = pop.NextNodeId;
+                pop.BlockedRouteUntil = now + 10d;
+                pop.NextNodeId = pop.CurrentNodeId;
+                pop.LaneOffset = 0f;
+                pop.RouteReason = PopulationRouteReason.Recovery;
+                if (pop.AiState != PopulationAiState.Fleeing)
+                    pop.AiState = PopulationAiState.Recovering;
+            }
+            else
+            {
+                // Cannot physically retrace this segment. Stay put rather than
+                // repeatedly checking a blocked direction on every AI work item.
+                pop.NextNodeId = 0;
+                pop.WaitUntil = now + 0.75d;
+            }
+            pop.LastProgressAt = now;
+            pop.LastProgressPosition = pop.Actor.Position;
         }
 
         private void ApplyMotor(PopulationActorRuntime pop)
@@ -1564,8 +1917,31 @@ namespace Game.Server.Application.Population
             pop.Actor.VelocityX = next.X - previous.X;
             pop.Actor.VelocityY = next.Y - previous.Y;
             pop.Actor.VelocityZ = next.Z - previous.Z;
-            _actors.PublishChanged(pop.Actor);
-            Changed?.Invoke(pop);
+
+            // ActorRegistry.PublishChanged owns canonical spatial updates and its
+            // existing actor subscribers. Population.Changed is consumed by the
+            // GameServer observer-presentation reconciliation/snapshot path.
+            // Preserve invocation order and exception propagation. Both readings
+            // are inclusive wall-clock durations (GC/OS pauses are possible).
+            long publishStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                _actors.PublishChanged(pop.Actor);
+            }
+            finally
+            {
+                _diagnosticActorPublishMs += ElapsedDiagnosticMilliseconds(publishStartedAt);
+            }
+
+            long presentationStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                Changed?.Invoke(pop);
+            }
+            finally
+            {
+                _diagnosticObserverPresentationMs += ElapsedDiagnosticMilliseconds(presentationStartedAt);
+            }
         }
 
         private void DetectStuck(MapGraph graph, PopulationActorRuntime pop, double now)
@@ -1824,6 +2200,9 @@ namespace Game.Server.Application.Population
             pop.Actor.LastSafePosition = anchor;
             pop.MotorState = new CharacterMotorState(anchor);
             pop.PreviousNodeId = 0;
+            pop.BlockedRouteFromNodeId = 0;
+            pop.BlockedRouteToNodeId = 0;
+            pop.BlockedRouteUntil = 0d;
             pop.CurrentNodeId = joinNode;
             pop.NextNodeId = pop.MovementBehavior == SharedAiMovementMode.Route ? joinNode : 0;
             pop.SegmentProgress = 0f;
@@ -2112,7 +2491,13 @@ namespace Game.Server.Application.Population
                 return;
             }
 
-            if (MoveTowardPose(graph, pop, targetPose, dt))
+            bool arrived = MoveTowardPose(graph, pop, targetPose, dt, out bool blocked);
+            if (blocked)
+            {
+                FailPortalTraversal(pop, portal, now);
+                return;
+            }
+            if (arrived)
             {
                 pop.PortalPhase = pop.PortalPhase switch
                 {
@@ -2141,8 +2526,10 @@ namespace Game.Server.Application.Population
             }
         }
 
-        private bool MoveTowardPose(MapGraph graph, PopulationActorRuntime pop, ServerPose targetPose, float dt)
+        private bool MoveTowardPose(MapGraph graph, PopulationActorRuntime pop,
+            ServerPose targetPose, float dt, out bool blocked)
         {
+            blocked = false;
             if (graph == null || graph.Collision == null || pop == null || pop.Actor == null || pop.Motor == null)
                 return false;
 
@@ -2159,7 +2546,17 @@ namespace Game.Server.Application.Population
             float inv = 1f / MathF.Sqrt(Math.Max(0.0001f, distSq));
             var intent = new CharacterMovementIntent(dx * inv, dz * inv, false, false);
             pop.Actor.YawDegrees = NormalizeYaw(targetPose.yaw);
-            pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision);
+            long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
+                    allowWallSlide: false, out blocked);
+            }
+            finally
+            {
+                _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
+                ++_diagnosticMotorCalls;
+            }
             ApplyMotor(pop);
             return false;
         }
@@ -2260,7 +2657,9 @@ namespace Game.Server.Application.Population
             if (pop.NextNodeId > 0 && graph.Nodes.ContainsKey(pop.NextNodeId)) return true;
             if (pop.CurrentNodeId <= 0 || !graph.Nodes.ContainsKey(pop.CurrentNodeId))
                 pop.CurrentNodeId = FindNearestNode(graph, pop.Actor.Position);
-            ServerPopulationRouteEdge edge = ChooseEdge(graph, pop.CurrentNodeId, pop.PreviousNodeId, pop.NpcType, pop.Random);
+            long blockedDestination = BlockedDestinationFor(pop, pop.CurrentNodeId, pop.LastSimulationAt);
+            ServerPopulationRouteEdge edge = ChooseEdge(graph, pop.CurrentNodeId, pop.PreviousNodeId,
+                pop.NpcType, pop.Random, blockedDestination);
             if (edge == null) return false;
             pop.NextNodeId = edge.toNodeId;
             pop.SegmentProgress = 0f;
@@ -2273,7 +2672,8 @@ namespace Game.Server.Application.Population
             long nodeId,
             long previousNodeId,
             PopulationNpcType npcType,
-            Random random)
+            Random random,
+            long excludedToNodeId = 0)
         {
             if (nodeId <= 0 || !graph.Outgoing.TryGetValue(nodeId, out List<ServerPopulationRouteEdge> edges) || edges.Count == 0)
                 return null;
@@ -2284,7 +2684,8 @@ namespace Game.Server.Application.Population
             for (int i = 0; i < edges.Count; ++i)
             {
                 ServerPopulationRouteEdge edge = edges[i];
-                if (edge == null || !EdgeAllows(graph, edge, npcType))
+                if (edge == null || !EdgeAllows(graph, edge, npcType) ||
+                    edge.toNodeId == excludedToNodeId)
                     continue;
                 if (edge.toNodeId != previousNodeId)
                 {
@@ -2297,7 +2698,8 @@ namespace Game.Server.Application.Population
             for (int i = 0; i < edges.Count; ++i)
             {
                 ServerPopulationRouteEdge edge = edges[i];
-                if (edge == null || !EdgeAllows(graph, edge, npcType))
+                if (edge == null || !EdgeAllows(graph, edge, npcType) ||
+                    edge.toNodeId == excludedToNodeId)
                     continue;
                 if (hasForwardOption && edge.toNodeId == previousNodeId)
                     continue;
@@ -2311,7 +2713,8 @@ namespace Game.Server.Application.Population
             for (int i = 0; i < edges.Count; ++i)
             {
                 ServerPopulationRouteEdge edge = edges[i];
-                if (edge == null || !EdgeAllows(graph, edge, npcType))
+                if (edge == null || !EdgeAllows(graph, edge, npcType) ||
+                    edge.toNodeId == excludedToNodeId)
                     continue;
                 if (hasForwardOption && edge.toNodeId == previousNodeId)
                     continue;
@@ -2414,6 +2817,7 @@ namespace Game.Server.Application.Population
 
         private void WakeHibernatedNearPlayers(double now)
         {
+            long wakeStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             _wakeScanPending = false;
             _wakeSearchPlayers.Clear();
             if (_hibernatingCount <= 0 || _playersByPartition.Count == 0)
@@ -2519,6 +2923,13 @@ namespace Game.Server.Application.Population
                 }
             }
 
+            _diagnosticWakeCells = cellChecks;
+            _diagnosticWakeActorChecks = actorChecks;
+            _diagnosticWakeOrigins = _wakeSearchPlayers.Count;
+            _diagnosticWakeCandidates = _activationScratch.Count;
+            _diagnosticWakeScanMs = ElapsedDiagnosticMilliseconds(wakeStartedAt);
+            long admissionStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+
             // No temporary array allocation. Wake callbacks can modify the hibernation
             // index, but not this independent HashSet. Portal rate/density/clearance checks
             // and canonical wake/catch-up behavior remain owned by existing methods.
@@ -2528,7 +2939,9 @@ namespace Game.Server.Application.Population
                     continue;
                 if (pop.AiState == PopulationAiState.PortalDormant)
                 {
+                    long portalStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
                     WakePortalDormantImmediately(pop, now);
+                    _diagnosticPortalMs += ElapsedDiagnosticMilliseconds(portalStartedAt);
                 }
                 else
                 {
@@ -2540,7 +2953,10 @@ namespace Game.Server.Application.Population
                     if (!pop.AwaitingPlayerActivation && pop.Actor.Alive)
                         RecordAmbientAdmission(pop, wakePosition, now);
                 }
+                if (!pop.AwaitingPlayerActivation)
+                    ++_diagnosticWakeAdmitted;
             }
+            _diagnosticWakeAdmissionMs = ElapsedDiagnosticMilliseconds(admissionStartedAt);
             _activationScratch.Clear();
 
             _wakeScanPending = cellChecks >= MaxWakeCellsPerPass ||
@@ -2674,6 +3090,7 @@ namespace Game.Server.Application.Population
             }
 
             double cursor = now - elapsed;
+            long catchUpStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             int hops = 0;
             int maxHops = Math.Max(8, MaximumLogicalCatchUpHops);
             if (pop.SpawnKind == ServerSpawnKind.Population)
@@ -2724,6 +3141,7 @@ namespace Game.Server.Application.Population
                 hops++;
             }
 
+            _diagnosticCatchUpHops = hops;
             if (pop.AiState != PopulationAiState.PortalDormant &&
                 TryPositionOnEdge(graph, pop.CurrentNodeId, pop.NextNodeId, pop.SegmentProgress, pop.LaneOffset, out WorldPosition position, out float yaw))
             {
@@ -2734,6 +3152,7 @@ namespace Game.Server.Application.Population
                 pop.Actor.YawDegrees = yaw;
                 pop.MotorState = new CharacterMotorState(position);
             }
+            _diagnosticCatchUpMs += ElapsedDiagnosticMilliseconds(catchUpStartedAt);
         }
 
         private void AddToHibernationIndex(PopulationActorRuntime pop, WorldPosition position)
