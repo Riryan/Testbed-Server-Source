@@ -73,6 +73,20 @@ namespace Game.Server.Application.Movement
 
         public void Tick(CharacterMotorState state, CharacterMovementIntent intent, float fixedDelta, ServerCollisionWorld collisionWorld)
         {
+            Tick(state, intent, fixedDelta, collisionWorld, allowWallSlide: true, out _);
+        }
+
+        // Population may forbid side-sliding and needs an explicit blocked result.
+        // Existing four-argument motor callers retain normal player-style sliding.
+        public void Tick(
+            CharacterMotorState state,
+            CharacterMovementIntent intent,
+            float fixedDelta,
+            ServerCollisionWorld collisionWorld,
+            bool allowWallSlide,
+            out bool blocked)
+        {
+            blocked = false;
             if (state == null || fixedDelta <= 0f || float.IsNaN(fixedDelta) || float.IsInfinity(fixedDelta))
                 return;
 
@@ -116,7 +130,8 @@ namespace Game.Server.Application.Movement
                 _settings.GroundSnapDistance,
                 _settings.MaximumSlopeDegrees,
                 state.Grounded,
-                out _);
+                allowWallSlide,
+                out blocked);
 
             bool canJump = state.Grounded && state.Mode == ActorMovementMode.Grounded;
             if (intent.Jump && canJump)

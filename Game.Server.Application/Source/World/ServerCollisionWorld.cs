@@ -461,6 +461,63 @@ namespace Game.Server.Application.World
             return true;
         }
 
+        public bool IsStandingCapsuleClearStatic(
+            WorldPosition feet,
+            ServerCapsule capsule,
+            float maximumSlopeDegrees)
+        {
+            // Ground support is not a substitute for physical standing clearance.
+            // Ignore the supporting walkable floor directly under the capsule (which
+            // would intersect the capsule on slopes), but still test walls, overhead
+            // geometry, steep faces, and other static solid triangles.
+            float radius = capsule.Radius;
+            float cylinderBottomY = feet.Y + radius;
+            float cylinderTopY = feet.Y + capsule.Height - radius;
+            float floorNormalY = MathF.Cos(
+                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            QueryTriangles(feet.X - radius, feet.Z - radius,
+                feet.X + radius, feet.Z + radius);
+            foreach (int index in _queryScratch)
+            {
+                ServerCollisionTriangle t = _triangles[index];
+                // A long ramp triangle can span several metres in Y. Its highest
+                // vertex is not the ground at this capsule: use the local height
+                // nearest to the capsule footprint instead. Only upward-facing,
+                // locally low support may be excluded. Walls, risers, ceiling and
+                // elevated geometry still go through the full capsule-distance test.
+                if (t.normalY >= floorNormalY &&
+                    (Math.Max(t.ay, Math.Max(t.by, t.cy)) <= feet.Y + radius * 1.5f ||
+                     (TryClosestTriangleHeightAtXZ(t, feet.X, feet.Z, out float localFloorY) &&
+                      localFloorY <= feet.Y + radius * 1.5f)))
+                    continue;
+                float distanceSquared = SegmentTriangleDistanceSquared(
+                    feet.X, cylinderBottomY, feet.Z,
+                    feet.X, cylinderTopY, feet.Z, t);
+                if (distanceSquared < radius * radius - 0.000001f)
+                    return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Dynamic blockers only: cheap corridor runtime check. Static corridor clearance is
+        /// proven separately and cached by Population, without relaxing door collision.
+        /// </summary>
+        public bool IsDynamicCapsuleClear(WorldPosition feet, ServerCapsule capsule)
+        {
+            float radius = capsule.Radius;
+            QueryDynamicBlockers(feet.X - radius, feet.Z - radius, feet.X + radius, feet.Z + radius);
+            foreach (long stableId in _dynamicBlockerQueryScratch)
+            {
+                if (_dynamicBlockers.TryGetValue(stableId, out DynamicBlockerState state) &&
+                    state.Enabled &&
+                    CapsuleOverlapsOrientedBox(feet, capsule, state.Definition))
+                    return false;
+            }
+            return true;
+        }
+
         public WorldPosition ResolveHorizontalMove(
             WorldPosition startFeet,
             float deltaX,
@@ -470,6 +527,24 @@ namespace Game.Server.Application.World
             float groundSnapDistance,
             float maximumSlopeDegrees,
             bool grounded,
+            out bool blocked)
+        {
+            return ResolveHorizontalMove(
+                startFeet, deltaX, deltaZ, capsule, stepHeight,
+                groundSnapDistance, maximumSlopeDegrees, grounded,
+                allowWallSlide: true, out blocked);
+        }
+
+        public WorldPosition ResolveHorizontalMove(
+            WorldPosition startFeet,
+            float deltaX,
+            float deltaZ,
+            ServerCapsule capsule,
+            float stepHeight,
+            float groundSnapDistance,
+            float maximumSlopeDegrees,
+            bool grounded,
+            bool allowWallSlide,
             out bool blocked)
         {
             blocked = false;
@@ -498,6 +573,13 @@ namespace Game.Server.Application.World
                 {
                     current = resolved;
                     continue;
+                }
+
+                // Population routes stop at a blocked step rather than sliding sideways.
+                if (!allowWallSlide)
+                {
+                    blocked = true;
+                    break;
                 }
 
                 // Soft slide. Grounded candidates still require authored walkable support,
