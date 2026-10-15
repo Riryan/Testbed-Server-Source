@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Game.Shared.Population;
 using Game.Shared.World;
 
 namespace Game.Server.Application.World
@@ -68,6 +69,27 @@ namespace Game.Server.Application.World
         private readonly HashSet<int> _queryScratch = new HashSet<int>();
         private readonly HashSet<long> _dynamicBlockerQueryScratch = new HashSet<long>();
 
+        // World Bake has already established the static shape of each portal entrance.
+        // Pre-warm exactly the queries Population uses for admission and activation when
+        // the immutable map loads. Dictionary hits then replace expensive repeated
+        // broadphase/narrowphase work; live dynamic-blocker checks are never cached.
+        private readonly Dictionary<(float, float, float, float, float, float, float),
+            BakedPortalGroundResult> _bakedPortalGround =
+            new Dictionary<(float, float, float, float, float, float, float), BakedPortalGroundResult>();
+        private readonly Dictionary<(float, float, float, float, float, float), bool>
+            _bakedPortalStanding = new Dictionary<(float, float, float, float, float, float), bool>();
+
+        private readonly struct BakedPortalGroundResult
+        {
+            public readonly bool Found;
+            public readonly ServerGroundHit Hit;
+            public BakedPortalGroundResult(bool found, ServerGroundHit hit)
+            {
+                Found = found;
+                Hit = hit;
+            }
+        }
+
         private bool _hasWorldBounds;
         private float _minX;
         private float _minY;
@@ -113,6 +135,95 @@ namespace Game.Server.Application.World
                 };
                 IndexDynamicBlocker(blocker);
             }
+
+            // Do this ONCE after both immutable triangle grids exist. The Population
+            // runtime will still independently check current density, visibility,
+            // portal cadence and dynamic blockers on every attempted admission.
+            PrewarmBakedPortalStaticClearance();
+        }
+
+        /// <summary>
+        /// Populate the existing collision-query path's STATIC answers for baked
+        /// Population portals. Static map geometry is immutable until a new map
+        /// instance is constructed. This moves costly triangle checks out of the
+        /// real-time admission budget, without bypassing any failed validation.
+        /// </summary>
+        private void PrewarmBakedPortalStaticClearance()
+        {
+            ServerPopulationPortal[] portals = _map.populationPortals ?? Array.Empty<ServerPopulationPortal>();
+            ServerSpawnAnchor[] anchors = _map.spawnAnchors ?? Array.Empty<ServerSpawnAnchor>();
+            for (int i = 0; i < portals.Length; ++i)
+            {
+                ServerPopulationPortal portal = portals[i];
+                if (portal == null || portal.stableId <= 0)
+                    continue;
+
+                bool hadAnchor = false;
+                for (int j = 0; j < anchors.Length; ++j)
+                {
+                    ServerSpawnAnchor anchor = anchors[j];
+                    if (anchor == null || !anchor.enabled || anchor.portalId != portal.stableId)
+                        continue;
+                    hadAnchor = true;
+                    WarmBakedPortalForCapsule(portal,
+                        Math.Max(0.2f, anchor.capsuleRadius),
+                        Math.Max(anchor.capsuleHeight, Math.Max(0.2f, anchor.capsuleRadius) * 2f));
+                }
+
+                // Standalone isolated-world tests can have portals without populated
+                // spawn layers. Normal shipped maps use each actual spawn capsule.
+                if (!hadAnchor)
+                {
+                    float radius = Math.Max(0.2f, _map.navMesh != null ? _map.navMesh.agentRadius : 0.35f);
+                    float height = Math.Max(radius * 2f,
+                        _map.navMesh != null ? _map.navMesh.agentHeight : 1.8f);
+                    WarmBakedPortalForCapsule(portal, radius, height);
+                }
+            }
+        }
+
+        private void WarmBakedPortalForCapsule(
+            ServerPopulationPortal portal, float actorRadius, float actorHeight)
+        {
+            WorldPosition feet = portal.exterior.ToWorldPosition();
+            float exitRadius = Math.Max(Math.Max(0.2f, portal.exitClearanceRadius), actorRadius);
+            float exitHeight = Math.Max(actorHeight, exitRadius * 2f);
+
+            // PortalSpawnClear's original static ground/capsule checks.
+            WarmBakedPortalGroundAndStanding(feet, exitRadius, exitHeight,
+                0.25f, 0.35f, 55f);
+
+            // ActivatePortalSpawn's original static ground/capsule checks. Its
+            // stricter ground probe remains distinct; neither result is invented.
+            WarmBakedPortalGroundAndStanding(feet, actorRadius,
+                Math.Max(actorHeight, actorRadius * 2f), 0.15f, 0.15f, 55f);
+        }
+
+        private void WarmBakedPortalGroundAndStanding(
+            WorldPosition feet, float radius, float height,
+            float probeUp, float probeDown, float maximumSlopeDegrees)
+        {
+            var groundKey = (feet.X, feet.Y, feet.Z, radius,
+                probeUp, probeDown, maximumSlopeDegrees);
+            if (!_bakedPortalGround.TryGetValue(groundKey, out BakedPortalGroundResult cached))
+            {
+                bool found = TryFindSupport(feet, radius, probeUp, probeDown,
+                    maximumSlopeDegrees, requireWalkable: true, out ServerGroundHit ground);
+                cached = new BakedPortalGroundResult(found, ground);
+                _bakedPortalGround.Add(groundKey, cached);
+            }
+            if (!cached.Found)
+                return;
+
+            // Static capsule clearance is computed exactly once. Failure is also
+            // cached; an invalid pose never becomes valid merely because it was baked.
+            WorldPosition grounded = cached.Hit.Position;
+            var standingKey = (grounded.X, grounded.Y, grounded.Z,
+                radius, height, maximumSlopeDegrees);
+            if (!_bakedPortalStanding.ContainsKey(standingKey))
+                _bakedPortalStanding.Add(standingKey,
+                    IsStandingCapsuleClearStatic(grounded,
+                        new ServerCapsule(radius, height), maximumSlopeDegrees));
         }
 
         /// <summary>
@@ -239,6 +350,14 @@ namespace Game.Server.Application.World
             float maximumSlopeDegrees,
             out ServerGroundHit hit)
         {
+            if (_bakedPortalGround.TryGetValue(
+                (feet.X, feet.Y, feet.Z, footprintRadius, probeUp, probeDown, maximumSlopeDegrees),
+                out BakedPortalGroundResult baked))
+            {
+                hit = baked.Hit;
+                return baked.Found;
+            }
+
             return TryFindSupport(
                 feet,
                 footprintRadius,
@@ -416,6 +535,15 @@ namespace Game.Server.Application.World
             ServerCapsule capsule,
             float maximumSlopeDegrees)
         {
+            if (_bakedPortalStanding.TryGetValue(
+                (feet.X, feet.Y, feet.Z, capsule.Radius, capsule.Height, maximumSlopeDegrees),
+                out bool bakedStaticClear))
+            {
+                // The static result belongs to this immutable baked map. Dynamic
+                // doors/obstacles are deliberately checked LIVE on every attempt.
+                return bakedStaticClear && IsDynamicCapsuleClear(feet, capsule);
+            }
+
             // Ground support is not a substitute for physical standing clearance.
             // Ignore the supporting walkable floor directly under the capsule (which
             // would intersect the capsule on slopes), but still test walls, overhead
