@@ -12,10 +12,8 @@ namespace Game.Server.Application.Population
         private int _diagnosticAmbientSamples;
         private int _diagnosticAmbientFallbacks;
 
-        // No new baked fields or wire messages: the saved validatedClear bit is
-        // older centerline validation, so never trust it as full lane clearance.
-        // Certify each actual Population lane once against immutable baked geometry.
-        // Every failed lane remains on the existing authoritative motor path.
+        // Existing startup-only certification against immutable baked geometry.
+        // No extra periodic work, new runtime manager, or wire message.
         private static void CertifyBakedRouteLanes(MapGraph graph)
         {
             if (graph?.Collision == null || graph.Nodes.Count == 0)
@@ -60,18 +58,40 @@ namespace Game.Server.Application.Population
                     }
                 }
             }
-            // One bounded map-load summary, not per-actor diagnostics/logging.
             Console.WriteLine($"[PopulationRoute] static lane certification map={graph.Map.mapId} " +
                               $"instance={graph.Map.instanceId} valid={accepted} invalid={rejected}");
         }
 
-        // Replaces V1-V3's 1..24 repeated static collision samples. Only actual
-        // dynamic blockers are queried during ordinary on-route movement.
-        // Off-route, unverified, combat/interaction and recovery still use the
-        // existing character motor without an invented substitute.
+        // Authored route travel does not examine dynamic doors or props each step.
+        // Certified lanes preserve the current lane offset; uncatalogued or off-lane
+        // ordinary travel reuses the existing baked-graph rail helper rather than the
+        // full player-grade collision motor. Threat/flee handling stays separate.
         private bool TryTickAmbientRouteFast(
             MapGraph graph, PopulationActorRuntime pop, WorldPosition target,
             float dt, double now, bool fleeing = false)
+        {
+            if (fleeing)
+                return TryTickAmbientRouteCertified(graph, pop, dt, now, fleeing: true);
+
+            if (pop?.Actor == null || pop.MotorState == null ||
+                pop.MovementBehavior != SharedAiMovementMode.Route ||
+                !pop.Actor.Alive || pop.AwaitingPlayerActivation ||
+                pop.PortalPhase != PopulationPortalSequencePhase.None ||
+                (pop.AiState != PopulationAiState.FollowingRoute &&
+                 pop.AiState != PopulationAiState.Waiting) ||
+                pop.ThreatUntil > now)
+                return false;
+
+            if (TryTickAmbientRouteCertified(graph, pop, dt, now, fleeing: false))
+                return true;
+
+            // Existing dormant rail helper: valid baked routes only, no live door
+            // checks, no movement motor. It owns normal route arrival and recovery.
+            return TryTickValidatedRouteCorridor(pop, graph, dt, now);
+        }
+
+        private bool TryTickAmbientRouteCertified(
+            MapGraph graph, PopulationActorRuntime pop, float dt, double now, bool fleeing)
         {
             if (graph?.Collision == null || pop?.Actor == null ||
                 pop.Motor == null || pop.MotorState == null ||
@@ -130,8 +150,6 @@ namespace Game.Server.Application.Population
             float expectedY = from.pose.y + (to.pose.y - from.pose.y) * projected;
             float offX = start.X - expectedX;
             float offZ = start.Z - expectedZ;
-            // Fail to the existing motor unless we are ON this certified lane.
-            // In particular, don't teleport from a portal, lane change, or recovery.
             if (offX * offX + offZ * offZ > 0.15f * 0.15f ||
                 Math.Abs(start.Y - expectedY) > 0.12f)
                 return false;
@@ -144,24 +162,8 @@ namespace Game.Server.Application.Population
             float newZ = laneZ + dz * progress;
             float newY = from.pose.y + (to.pose.y - from.pose.y) * progress;
             var next = new WorldPosition(newX, newY, newZ);
-            var capsule = new ServerCapsule(pop.Motor.Settings.Radius, pop.Motor.Settings.Height);
-            // Dynamic blocker checks remain LIVE. A closed door is authoritative
-            // and cannot be crossed in one tick even at sprint speed.
-            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-            bool clear = graph.Collision.IsLiveRouteStepClear(start, next, capsule,
-                out int samples);
-            _diagnosticAmbientCollisionMs += ElapsedDiagnosticMilliseconds(startedAt);
-            _diagnosticAmbientSamples += samples;
-            if (!clear)
-            {
-                // An actual closed door is not a reason to run expensive static
-                // collision this tick. Stay in place; canonical stuck/recovery
-                // chooses a different route after its normal grace period.
-                ApplyMotor(pop); // publish the stopped state through existing AOI events
-                DetectStuck(graph, pop, now);
-                return true;
-            }
 
+            // The authored/certified lane is authoritative. No live door/prop query.
             pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
             pop.SegmentProgress = progress;
             pop.MotorState.Position = next;
@@ -170,7 +172,6 @@ namespace Game.Server.Application.Population
             pop.MotorState.Grounded = true;
             pop.MotorState.Mode = ActorMovementMode.Grounded;
             ApplyMotor(pop);
-            // Existing arrived-node and portal lifecycle must remain canonical.
             if (progress >= 0.99999f ||
                 Math.Abs(newX - (to.pose.x + sideX * pop.LaneOffset)) +
                 Math.Abs(newZ - (to.pose.z + sideZ * pop.LaneOffset)) <= 0.15f)

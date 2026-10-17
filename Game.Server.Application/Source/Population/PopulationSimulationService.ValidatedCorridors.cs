@@ -8,15 +8,11 @@ using Game.Shared.World;
 namespace Game.Server.Application.Population
 {
     /// <summary>
-    /// TEMPORARY TEST MODE: routed Population follows the EXISTING baked graph directly.
-    /// No static triangle queries, per-segment clearance warming, or character motor calls
-    /// during normal routed movement. This deliberately prioritizes inexpensive deterministic
-    /// routing over physical precision, and should not be regarded as a production-safe
-    /// replacement for fully validated corridors.
-    ///
-    /// Uses the pre-existing TickActive hook from Population Validated Route Corridors V1.
-    /// Nothing here creates network messages, actors, new schedules, or a second route graph.
-    /// Existing dynamic WorldInteractable blockers are still checked along each movement step.
+    /// Authored-route-only movement for ordinary routed Population.
+    /// Uses the existing baked graph; the map's validatedClear edges are the
+    /// movement contract. No per-step dynamic door/prop checks or character
+    /// motor calls occur on this path. Combat/off-route movement remains with
+    /// the existing authoritative systems, and no network protocol is added.
     /// </summary>
     public sealed partial class PopulationSimulationService
     {
@@ -28,7 +24,7 @@ namespace Game.Server.Application.Population
                 pop.MovementBehavior != SharedAiMovementMode.Route)
                 return false;
 
-            // Never allow the rail shortcut to override authoritative incapacitation.
+            // Do not override authoritative incapacitation or portal state.
             ActorMovementMode mode = pop.MotorState.Mode;
             if (mode == ActorMovementMode.Dead ||
                 mode == ActorMovementMode.InteractionLocked ||
@@ -40,11 +36,11 @@ namespace Game.Server.Application.Population
             if (dt <= 0f || float.IsNaN(dt) || float.IsInfinity(dt))
                 return true;
             if (pop.PortalPhase != PopulationPortalSequencePhase.None)
-                return false; // preserve the existing explicit portal sequence
+                return false;
 
             if (pop.CurrentNodeId <= 0 || pop.NextNodeId <= 0 ||
                 !graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode to))
-                return true; // no valid rail target; do not run off-route via the motor
+                return true; // no route target: do not wander through collision geometry
 
             WorldPosition previous = pop.Actor.Position;
             WorldPosition destination;
@@ -57,8 +53,7 @@ namespace Game.Server.Application.Population
 
             if (pop.CurrentNodeId == pop.NextNodeId)
             {
-                // Spawn/portal anchor -> its assigned first route marker. This is a
-                // direct, bounded-speed join, not a teleport and not an ordinary edge.
+                // Spawn/portal to first route marker; bounded by authored speed.
                 WorldPosition waypoint = to.pose.ToWorldPosition();
                 float dx = waypoint.X - previous.X;
                 float dz = waypoint.Z - previous.Z;
@@ -82,8 +77,8 @@ namespace Game.Server.Application.Population
             }
             else
             {
-                // Fail closed to movement, NOT over to the full motor, if the current
-                // segment is absent from the validated baked graph.
+                // An invalid authored edge must not silently enter the expensive
+                // full player-grade collision motor. Reuse the route recovery.
                 if (!graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode from) ||
                     !graph.Outgoing.TryGetValue(pop.CurrentNodeId,
                         out List<ServerPopulationRouteEdge> edges))
@@ -120,38 +115,20 @@ namespace Game.Server.Application.Population
                 else
                 {
                     float length = MathF.Sqrt(lengthSquared);
-                    // Existing coarse simulation owns SegmentProgress. Projection also
-                    // permits a seamless transition if an actor was previously motor-driven.
                     float projected = ((previous.X - a.X) * dx +
                                        (previous.Z - a.Z) * dz) / lengthSquared;
                     float startT = Math.Clamp(
                         Math.Max(pop.SegmentProgress, projected), 0f, 1f);
                     float endT = Math.Min(1f, startT + travel / length);
-                    // V2 debug mode uses only the validated CENTERLINE. Previous lane
-                    // offsets are deliberately ignored: lateral width wasn't proven safe.
+                    // Existing centerline rail. No door, dynamic prop, or spatial
+                    // collision query: authored graph controls route movement.
                     destination = new WorldPosition(
                         a.X + dx * endT,
                         a.Y + (b.Y - a.Y) * endT,
                         a.Z + dz * endT);
                     yaw = MathF.Atan2(dx, dz) * (180f / MathF.PI);
                     reached = endT >= 1f;
-                    // Commit SegmentProgress only after live blocker checks succeed.
-                    // The candidate is stored below on success via the same projection.
                 }
-            }
-
-            var capsule = new ServerCapsule(pop.CapsuleRadius, pop.CapsuleHeight);
-            if (!IsRailStepDynamicallyClear(graph.Collision, previous, destination, capsule))
-            {
-                // Never try a motor detour around a door/obstruction in rail-only mode.
-                pop.MotorState.Position = previous;
-                pop.MotorState.LastSafePosition = previous;
-                pop.MotorState.VerticalVelocity = 0f;
-                pop.MotorState.Grounded = true;
-                pop.MotorState.Mode = ActorMovementMode.Grounded;
-                ApplyMotor(pop);
-                RecoverBlockedRoute(pop, now); // existing route avoidance/cooldown
-                return true;
             }
 
             pop.Actor.YawDegrees = NormalizeYaw(yaw);
@@ -161,7 +138,7 @@ namespace Game.Server.Application.Population
             pop.MotorState.VerticalVelocity = 0f;
             pop.MotorState.Grounded = true;
             pop.MotorState.Mode = ActorMovementMode.Grounded;
-            ApplyMotor(pop); // existing authority, AOI, spatial index and presentation hooks
+            ApplyMotor(pop); // preserve canonical spatial/AOI/presentation publication
 
             if (reached)
             {
@@ -182,32 +159,6 @@ namespace Game.Server.Application.Population
                 DetectStuck(graph, pop, now);
             }
 
-            return true;
-        }
-
-        private static bool IsRailStepDynamicallyClear(
-            ServerCollisionWorld world,
-            WorldPosition from,
-            WorldPosition to,
-            ServerCapsule capsule)
-        {
-            float dx = to.X - from.X;
-            float dy = to.Y - from.Y;
-            float dz = to.Z - from.Z;
-            float horizontal = MathF.Sqrt(dx * dx + dz * dz);
-            // These are CHEAP dynamic-blocker queries, never static triangle queries.
-            // Divide the movement chord so a single long step cannot skip a closed door.
-            int checks = Math.Clamp(
-                (int)Math.Ceiling(horizontal / Math.Max(0.15f, capsule.Radius * 0.75f)),
-                1, 16);
-            for (int i = 1; i <= checks; ++i)
-            {
-                float t = i / (float)checks;
-                WorldPosition probe = new WorldPosition(
-                    from.X + dx * t, from.Y + dy * t, from.Z + dz * t);
-                if (!world.IsDynamicCapsuleClear(probe, capsule))
-                    return false;
-            }
             return true;
         }
     }

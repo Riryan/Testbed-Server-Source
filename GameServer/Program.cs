@@ -40,9 +40,11 @@ internal static class Program
             // Every generic worker may load the same baked world package. Register that
             // capability first, let Gateway establish the current authority assignment, then
             // construct the expensive authoritative runtime from only the maps this worker owns.
+            Console.WriteLine("SERVER STARTING: World data...");
             IReadOnlyList<ServerMapSnapshot> availableSnapshots =
                 ServerMapDataLoader.LoadDirectory(options.MapDataDirectory, options.RequireMapData);
             var availableMaps = new ServerMapCatalog(availableSnapshots);
+            Console.WriteLine("World data COMPLETED.");
 
             using var directoryBackend = new BackendInternalClient(
                 options.BackendInternalBaseUrl,
@@ -52,11 +54,16 @@ internal static class Program
                 directoryBackend,
                 options,
                 availableMaps);
+            Console.WriteLine("SERVER STARTING: Directory registration...");
             directoryLease.Start(shutdown.Token);
 
             IReadOnlyList<ServerMapSnapshot> authoritativeSnapshots =
                 directoryLease.ResolveInitialOwnedMaps(availableMaps, shutdown.Token);
+            Console.WriteLine("Directory registration COMPLETED.");
 
+            // Runtime construction creates canonical Population identities at startup.
+            // The expensive initial portal release now runs below in controlled units.
+            Console.WriteLine("SERVER SPAWNING: Initial world population...");
             using var runtime = new GameServerRuntime(
                 options.BackendInternalBaseUrl,
                 gameServerKey,
@@ -66,13 +73,28 @@ internal static class Program
                 options.StaffAuthorizationFile,
                 options.StaffAuditFile);
 
+            // The network host has not started, so no player can enter the world during
+            // this slow, deliberately serialized initial portal-release phase.
+            runtime.Population.PrepareStartupPortalPrewarm();
+            while (!runtime.Population.StartupPortalPrewarmFinished)
+            {
+                shutdown.Token.ThrowIfCancellationRequested();
+                runtime.Population.PrewarmNextStartupPortal(out _);
+                if (!runtime.Population.StartupPortalPrewarmFinished)
+                    Thread.Sleep(50);
+            }
+            Console.WriteLine(
+                $"SPAWNING COMPLETE: actors={runtime.Population.Count}, " +
+                $"initialPortalsPrepared={runtime.Population.StartupPortalPrewarmSucceeded}, " +
+                $"deferred={runtime.Population.StartupPortalPrewarmDeferred}.");
+
             // Reuse the existing GameServer presentation distance as the FreeRoam-only
             // movement cutoff. Routed Population/NPC ActiveDistance remains unchanged.
             runtime.Population.FreeRoamActiveDistance = options.CombatPresentationRange;
 
             using var host = new GameServerHost(options, runtime, directoryLease);
 
-            Console.WriteLine("GameServer starting...");
+            Console.WriteLine("SERVER STARTING: Networking and simulation...");
             host.Run(shutdown.Token);
             Console.WriteLine("GameServer stopped.");
             return 0;
