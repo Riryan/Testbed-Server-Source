@@ -39,7 +39,7 @@ namespace Game.Server.Application.World
     /// Lightweight static collision/query world over baked modular-map triangles. It is a
     /// query structure, not a rigidbody simulation. Active characters remain kinematic.
     /// </summary>
-    public sealed class ServerCollisionWorld
+    public sealed partial class ServerCollisionWorld
     {
         private readonly struct CellKey : IEquatable<CellKey>
         {
@@ -400,91 +400,18 @@ namespace Game.Server.Application.World
             bool requireWalkable,
             out ServerGroundHit hit)
         {
-            hit = default;
-            float radius = Math.Max(0f, footprintRadius);
-            float ring = radius * 0.6f;
-            float minNormalY = MathF.Cos(Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
-
-            bool centerSupported = false;
-            float centerY = float.NegativeInfinity;
-            ServerCollisionTriangle center = default;
-
-            int supportCount = 0;
-            float bestY = float.NegativeInfinity;
-            ServerCollisionTriangle best = default;
-
-            // Gather the complete five-point footprint candidate set once. The previous
-            // implementation rebuilt the same spatial-grid candidate set independently for
-            // center/+X/-X/+Z/-Z, multiplying dictionary/hash work for every ground probe.
-            float queryExtent = ring + 0.01f;
+            // One candidate collection per normal ground query. The common center-
+            // supported case now exits before the four unnecessary footprint tests.
+            float extent = Math.Max(0f, footprintRadius) * 0.6f + 0.01f;
             if (requireWalkable)
-            {
-                QueryMovementTriangles(
-                    feet.X - queryExtent,
-                    feet.Z - queryExtent,
-                    feet.X + queryExtent,
-                    feet.Z + queryExtent);
-            }
+                QueryMovementTriangles(feet.X - extent, feet.Z - extent,
+                    feet.X + extent, feet.Z + extent);
             else
-            {
-                QueryTriangles(
-                    feet.X - queryExtent,
-                    feet.Z - queryExtent,
-                    feet.X + queryExtent,
-                    feet.Z + queryExtent);
-            }
-
-            for (int sample = 0; sample < 5; ++sample)
-            {
-                float offsetX = sample == 1 ? ring : sample == 2 ? -ring : 0f;
-                float offsetZ = sample == 3 ? ring : sample == 4 ? -ring : 0f;
-                float x = feet.X + offsetX;
-                float z = feet.Z + offsetZ;
-
-                if (!TryFindGroundAtPointFromCurrentCandidates(
-                        x,
-                        z,
-                        feet.Y,
-                        probeUp,
-                        probeDown,
-                        minNormalY,
-                        requireWalkable,
-                        out float y,
-                        out ServerCollisionTriangle triangle))
-                {
-                    continue;
-                }
-
-                supportCount++;
-                if (sample == 0)
-                {
-                    centerSupported = true;
-                    centerY = y;
-                    center = triangle;
-                }
-
-                if (y > bestY)
-                {
-                    bestY = y;
-                    best = triangle;
-                }
-            }
-
-            if (!centerSupported && supportCount < 2)
-                return false;
-
-            // Center height is the stable root height on slopes. The old highest-footprint
-            // behavior made the capsule ride its uphill sample and visibly stair-step.
-            ServerCollisionTriangle chosen = centerSupported ? center : best;
-            float chosenY = centerSupported ? centerY : bestY;
-
-            hit = new ServerGroundHit(
-                chosen.surfaceId,
-                new WorldPosition(feet.X, chosenY, feet.Z),
-                chosen.normalX,
-                chosen.normalY,
-                chosen.normalZ);
-            return true;
+                QueryTriangles(feet.X - extent, feet.Z - extent,
+                    feet.X + extent, feet.Z + extent);
+            return TryFindSupportFromCurrentCandidates(
+                feet, footprintRadius, probeUp, probeDown,
+                maximumSlopeDegrees, requireWalkable, out hit);
         }
 
         /// <summary>
@@ -558,6 +485,11 @@ namespace Game.Server.Application.World
             foreach (int index in _queryScratch)
             {
                 ServerCollisionTriangle t = _triangles[index];
+                // Exclude triangles whose full 3D bounds cannot intersect this
+                // standing capsule before the more expensive exact predicates.
+                // This is conservative: no potentially colliding triangle is omitted.
+                if (IsTriangleOutsideStandingCapsuleBounds(t, feet, capsule))
+                    continue;
                 // A long ramp triangle can span several metres in Y. Its highest
                 // vertex is not the ground at this capsule: use the local height
                 // nearest to the capsule footprint instead. Only upward-facing,
@@ -594,38 +526,11 @@ namespace Game.Server.Application.World
             ServerCapsule capsule,
             float maximumSlopeDegrees)
         {
-            // Ground support is not a substitute for physical standing clearance.
-            // Ignore the supporting walkable floor directly under the capsule (which
-            // would intersect the capsule on slopes), but still test walls, overhead
-            // geometry, steep faces, and other static solid triangles.
             float radius = capsule.Radius;
-            float cylinderBottomY = feet.Y + radius;
-            float cylinderTopY = feet.Y + capsule.Height - radius;
-            float floorNormalY = MathF.Cos(
-                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
             QueryTriangles(feet.X - radius, feet.Z - radius,
                 feet.X + radius, feet.Z + radius);
-            foreach (int index in _queryScratch)
-            {
-                ServerCollisionTriangle t = _triangles[index];
-                // A long ramp triangle can span several metres in Y. Its highest
-                // vertex is not the ground at this capsule: use the local height
-                // nearest to the capsule footprint instead. Only upward-facing,
-                // locally low support may be excluded. Walls, risers, ceiling and
-                // elevated geometry still go through the full capsule-distance test.
-                if (t.normalY >= floorNormalY &&
-                    (Math.Max(t.ay, Math.Max(t.by, t.cy)) <= feet.Y + radius * 1.5f ||
-                     (TryClosestTriangleHeightAtXZ(t, feet.X, feet.Z, out float localFloorY) &&
-                      localFloorY <= feet.Y + radius * 1.5f)))
-                    continue;
-                float distanceSquared = SegmentTriangleDistanceSquared(
-                    feet.X, cylinderBottomY, feet.Z,
-                    feet.X, cylinderTopY, feet.Z, t);
-                if (distanceSquared < radius * radius - 0.000001f)
-                    return false;
-            }
-
-            return true;
+            return IsStandingCapsuleClearStaticFromCurrentCandidates(
+                feet, capsule, maximumSlopeDegrees);
         }
 
         /// <summary>
@@ -635,15 +540,9 @@ namespace Game.Server.Application.World
         public bool IsDynamicCapsuleClear(WorldPosition feet, ServerCapsule capsule)
         {
             float radius = capsule.Radius;
-            QueryDynamicBlockers(feet.X - radius, feet.Z - radius, feet.X + radius, feet.Z + radius);
-            foreach (long stableId in _dynamicBlockerQueryScratch)
-            {
-                if (_dynamicBlockers.TryGetValue(stableId, out DynamicBlockerState state) &&
-                    state.Enabled &&
-                    CapsuleOverlapsOrientedBox(feet, capsule, state.Definition))
-                    return false;
-            }
-            return true;
+            QueryDynamicBlockers(feet.X - radius, feet.Z - radius,
+                feet.X + radius, feet.Z + radius);
+            return IsDynamicCapsuleClearFromCurrentCandidates(feet, capsule);
         }
 
         public WorldPosition ResolveHorizontalMove(

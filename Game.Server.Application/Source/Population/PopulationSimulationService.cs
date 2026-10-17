@@ -141,6 +141,10 @@ namespace Game.Server.Application.Population
             public Dictionary<long, long> SpawnPortalByAnchor = new Dictionary<long, long>();
             public Dictionary<long, int> PortalOwnedCounts = new Dictionary<long, int>();
             public ServerCollisionWorld Collision;
+            // Static route certificate: authored edge and one of the three actual
+            // lane offsets (-1,0,+1). Built once per immutable map load.
+            public readonly HashSet<(long From, long To, int Lane)> CertifiedLanes =
+                new HashSet<(long From, long To, int Lane)>();
         }
 
         private sealed class PortalReleaseState
@@ -320,6 +324,7 @@ namespace Game.Server.Application.Population
             _nextSlowWorkDetailAt = now + SlowWorkDetailCooldownSeconds;
             double otherActorMs = Math.Max(0d,
                 _diagnosticActorMs - _diagnosticDistanceMs - _diagnosticMotorCollisionMs -
+                _diagnosticAmbientCollisionMs -
                 _diagnosticActorPublishMs - _diagnosticObserverPresentationMs);
             // One bounded warning for a real slow unit, not one line per actor or
             // an independent timer. Values are durations of measured sub-steps;
@@ -329,6 +334,8 @@ namespace Game.Server.Application.Population
                 $"phase={_diagnosticPhase}, prep={_diagnosticPrepareMs:F3}ms, " +
                 $"actor={_diagnosticActorId}, actorWork={_diagnosticActorMs:F3}ms, distance={_diagnosticDistanceMs:F3}ms, " +
                 $"motorCollision={_diagnosticMotorCollisionMs:F3}ms/{_diagnosticMotorCalls}calls, " +
+                $"ambientSweep={_diagnosticAmbientCollisionMs:F3}ms/{_diagnosticAmbientSamples}samples, " +
+                $"ambientFallbacks={_diagnosticAmbientFallbacks}, " +
                 $"actorPublish={_diagnosticActorPublishMs:F3}ms, " +
                 $"observerPresentation={_diagnosticObserverPresentationMs:F3}ms, " +
                 $"actorOther={otherActorMs:F3}ms, wakeScan={_diagnosticWakeScanMs:F3}ms, wakeAdmission={_diagnosticWakeAdmissionMs:F3}ms, " +
@@ -490,6 +497,9 @@ namespace Game.Server.Application.Population
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
             _diagnosticMotorCalls = 0;
+            _diagnosticAmbientCollisionMs = 0d;
+            _diagnosticAmbientSamples = 0;
+            _diagnosticAmbientFallbacks = 0;
             long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
@@ -552,6 +562,9 @@ namespace Game.Server.Application.Population
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
             _diagnosticMotorCalls = 0;
+            _diagnosticAmbientCollisionMs = 0d;
+            _diagnosticAmbientSamples = 0;
+            _diagnosticAmbientFallbacks = 0;
             _diagnosticDistanceMs = 0d;
             _diagnosticWakeScanMs = 0d;
             _diagnosticWakeAdmissionMs = 0d;
@@ -1195,6 +1208,7 @@ namespace Game.Server.Application.Population
                             nodePortals.Add(portal);
                     }
                 }
+                CertifyBakedRouteLanes(graph);
                 _graphs[key] = graph;
             }
         }
@@ -1465,9 +1479,13 @@ namespace Game.Server.Application.Population
                 return;
             }
 
-            if (pop.ThreatUntil > 0d && (pop.AiState == PopulationAiState.Fleeing || pop.AiState == PopulationAiState.Fighting))
-                pop.SimulationLod = PopulationSimulationLod.Engaged;
-            else if (nearestSq <= EngagedDistance * EngagedDistance)
+            // Combat, fleeing and recovery deserve the expensive engaged cadence.
+            // Peaceful NPCs standing next to a player do not: they use Active
+            // cadence, retaining full combat promotion through NotifyThreat.
+            if (pop.AiState == PopulationAiState.Fighting ||
+                pop.AiState == PopulationAiState.Fleeing ||
+                pop.AiState == PopulationAiState.Recovering ||
+                pop.ThreatUntil > pop.LastSimulationAt)
                 pop.SimulationLod = PopulationSimulationLod.Engaged;
             else if (nearestSq <= ActiveDistance * ActiveDistance)
                 pop.SimulationLod = PopulationSimulationLod.Active;
@@ -1719,6 +1737,12 @@ namespace Game.Server.Application.Population
                 return;
             }
 
+            // Peaceful grounded route followers take the bounded cheap collision
+            // sweep, not the full player-grade motor. If any condition is unsafe,
+            // the untouched motor below remains authoritative immediately.
+            if (TryTickAmbientRouteFast(graph, pop, target, dt, now))
+                return;
+
             float inv = 1f / MathF.Sqrt(Math.Max(0.0001f, distSq));
             bool running = pop.AiState == PopulationAiState.Fleeing;
             var intent = new CharacterMovementIntent(dx * inv, dz * inv, running, false);
@@ -1760,6 +1784,10 @@ namespace Game.Server.Application.Population
             bool onRoute = TryGetFleeRouteTarget(graph, pop, now, out WorldPosition routeTarget);
             if (onRoute)
             {
+                // Normal fleeing still follows the existing authoritative escape
+                // route, but a certified lane needs no repeated static physics.
+                if (TryTickAmbientRouteFast(graph, pop, routeTarget, dt, now, fleeing: true))
+                    return;
                 dx = routeTarget.X - pop.Actor.Position.X;
                 dz = routeTarget.Z - pop.Actor.Position.Z;
                 lenSq = dx * dx + dz * dz;
@@ -2153,15 +2181,13 @@ namespace Game.Server.Application.Population
             if (graph == null || graph.Collision == null || pop == null || pop.Actor == null || portal == null)
                 return false;
 
-            if (!TryValidateBakedPortalPose(
-                    graph,
-                    pop,
-                    portal.exterior,
-                    requireDynamicClearance: true,
-                    out WorldPosition anchor))
-            {
+            // A Population portal's stationary geometry was checked in World Bake.
+            // PortalSpawnClear already performed the LIVE dynamic blocker check for this
+            // admission. Do not repeat static ground/capsule tests in the activation path.
+            WorldPosition anchor = portal.exterior.ToWorldPosition();
+            if (!float.IsFinite(anchor.X) || !float.IsFinite(anchor.Y) ||
+                !float.IsFinite(anchor.Z))
                 return false;
-            }
 
             long joinNode = portal.routeNodeId > 0 && graph.Nodes.ContainsKey(portal.routeNodeId)
                 ? portal.routeNodeId : 0;
@@ -2369,22 +2395,10 @@ namespace Game.Server.Application.Population
             float height = Math.Max(pop.CapsuleHeight, radius * 2f);
             var capsule = new ServerCapsule(radius, height);
 
-            if (!graph.Collision.TryFindGround(
-                    exterior,
-                    radius,
-                    0.25f,
-                    0.35f,
-                    55f,
-                    out ServerGroundHit exteriorGround))
-            {
+            // Baked static clearance is authoritative for this fixed portal anchor.
+            // Dynamic door/prop blockers CAN change, and must still be checked live.
+            if (!graph.Collision.IsDynamicCapsuleClear(exterior, capsule))
                 return false;
-            }
-
-            if (Math.Abs(exteriorGround.Position.Y - exterior.Y) > 0.20f ||
-                !graph.Collision.IsStandingCapsuleClear(exteriorGround.Position, capsule, 55f))
-            {
-                return false;
-            }
 
             // Portal density is a Population control. Do not let unrelated authoritative
             // actors (monsters, NPCs, world helpers, etc.) consume a Population doorway's
@@ -3257,6 +3271,21 @@ namespace Game.Server.Application.Population
         private bool TryResolveSpawn(MapGraph graph, ServerSpawnAnchor anchor, out ServerPose pose)
         {
             pose = anchor.pose;
+            if (anchor.kind == ServerSpawnKind.Population)
+            {
+                // Fixed Population slots are hand-authored and their physical placement
+                // is verified when the map is baked. Portal-owned slots use the SAME
+                // resolved portal pose used for every subsequent wake/respawn.
+                if (anchor.portalId > 0 &&
+                    graph.Portals.TryGetValue(anchor.portalId, out ServerPopulationPortal portal))
+                    pose = portal.exterior;
+
+                return float.IsFinite(pose.x) && float.IsFinite(pose.y) &&
+                       float.IsFinite(pose.z) && float.IsFinite(pose.yaw);
+            }
+
+            // Keep the previous full validation for Monster/NPC and other non-Population
+            // archetypes. This patch changes only the measured ambient Population path.
             if (graph.Collision == null) return true;
             var capsule = new ServerCapsule(anchor.capsuleRadius, anchor.capsuleHeight);
             return graph.Collision.TryValidateSpawn(anchor.pose, capsule, Math.Max(0.05f, anchor.maximumGroundSnap), 55f, out pose, out _);
