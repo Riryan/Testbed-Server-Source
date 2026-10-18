@@ -378,7 +378,7 @@ namespace Game.Server.Application.Population
                 $"wakeCells={_diagnosticWakeCells}, wakeActors={_diagnosticWakeActorChecks}, " +
                 $"origins={_diagnosticWakeOrigins}, candidates={_diagnosticWakeCandidates}, " +
                 $"admitted={_diagnosticWakeAdmitted}, hibernating={_hibernatingCount}, " +
-                $"scheduled={_dueSchedule.Count}.");
+                $"dueQueueEntries={_dueSchedule.Count} (includes stale entries).");
         }
 
         // Ambient Population admission is shared across all portals and observers in an area.
@@ -393,6 +393,9 @@ namespace Game.Server.Application.Population
 
         public float EngagedDistance { get; set; } = 28f;
         public float ActiveDistance { get; set; } = 80f;
+        // <= 0 retains the service default. The host binds this to AOI exit range.
+        // Only peaceful routed civilian Population uses the narrower Active band.
+        public float CivilianActiveDistance { get; set; }
         // Standalone GameServer may wire its existing CombatPresentationRange here.
         // <= 0 keeps legacy behavior by falling back to ActiveDistance.
         // This gate is intentionally FreeRoam-only; routed Population/NPC LOD is unchanged.
@@ -531,6 +534,7 @@ namespace Game.Server.Application.Population
             _diagnosticPartitionRebuildMs = 0d;
             _diagnosticPartitionRebuilt = false;
             _diagnosticPreparedPlayers = players?.Count ?? 0;
+            _diagnosticDistanceMs = 0d;
             _diagnosticMotorCollisionMs = 0d;
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
@@ -593,11 +597,10 @@ namespace Game.Server.Application.Population
                 : _portalAdmissionGeneration + 1u;
 
             // Only refresh the shared observer partitions in this preparation phase.
-            // Do NOT admit Population here: the host measures PrepareBudgetedTick and
-            // TickNextBudgeted together as one 2 ms invocation. A wake may perform
-            // collision/ground checks and would otherwise be charged together with the
-            // next actor motor tick. Activation instead consumes a separate scheduler
-            // work unit from TickNextBudgeted at its own heartbeat cadence.
+            // Do NOT admit Population here. The host uses the existing scheduler
+            // preparation interface, allowing an expensive preparation to yield before
+            // actor work. Activation consumes a separate TickNextBudgeted work unit
+            // at its own heartbeat cadence.
         }
 
         // Allows the host to service genuine due actor work with zero observers,
@@ -654,6 +657,8 @@ namespace Game.Server.Application.Population
             {
                 ReportSlowPopulationWork(now, startedAt, "work");
                 _diagnosticPrepareMs = 0d;
+                _diagnosticPartitionRebuildMs = 0d;
+                _diagnosticPartitionRebuilt = false;
             }
         }
 
@@ -662,9 +667,8 @@ namespace Game.Server.Application.Population
             if (fixedDelta <= 0f || _populationSchedule.Count == 0)
                 return false;
 
-            // First yield the preparation unit to the scheduler. In the existing
-            // host, PrepareBudgetedTick() and this method share one timed invocation:
-            // yielding prevents it from also performing a potentially expensive wake.
+            // Preserve the staged activation handoff for direct service callers too:
+            // preparing proximity never also admits an actor in the same service unit.
             if (_activationHandoffPending)
             {
                 _diagnosticPhase = SlowWorkPhase.Handoff;
@@ -1183,8 +1187,7 @@ namespace Game.Server.Application.Population
 
             if (changed)
             {
-                _actors.PublishChanged(pop.Actor);
-                Changed?.Invoke(pop);
+                PublishPopulationChanged(pop);
             }
             return true;
         }
@@ -1570,6 +1573,19 @@ namespace Game.Server.Application.Population
             }
         }
 
+        private float GetActiveDistance(PopulationActorRuntime pop)
+        {
+            if (CivilianActiveDistance > 0f &&
+                pop.SpawnKind == ServerSpawnKind.Population &&
+                pop.MovementBehavior == SharedAiMovementMode.Route &&
+                pop.Actor.Faction == ActorFaction.Civilian &&
+                pop.NpcType >= PopulationNpcType.Civilian &&
+                pop.NpcType <= PopulationNpcType.Nightlife &&
+                pop.PortalPhase == PopulationPortalSequencePhase.None)
+                return Math.Min(ActiveDistance, CivilianActiveDistance);
+            return ActiveDistance;
+        }
+
         private void UpdateSimulationLod(PopulationActorRuntime pop, float nearestSq)
         {
             if (pop.AiState == PopulationAiState.PortalDormant || !pop.Actor.Alive)
@@ -1586,7 +1602,7 @@ namespace Game.Server.Application.Population
                 pop.AiState == PopulationAiState.Recovering ||
                 pop.ThreatUntil > pop.LastSimulationAt)
                 pop.SimulationLod = PopulationSimulationLod.Engaged;
-            else if (nearestSq <= ActiveDistance * ActiveDistance)
+            else if (nearestSq <= GetActiveDistance(pop) * GetActiveDistance(pop))
                 pop.SimulationLod = PopulationSimulationLod.Active;
             else if (nearestSq <= CoarseDistance * CoarseDistance)
                 pop.SimulationLod = PopulationSimulationLod.CoarseRoute;
@@ -1619,8 +1635,7 @@ namespace Game.Server.Application.Population
 
             if (changed)
             {
-                _actors.PublishChanged(pop.Actor);
-                Changed?.Invoke(pop);
+                PublishPopulationChanged(pop);
             }
         }
 
@@ -1730,8 +1745,7 @@ namespace Game.Server.Application.Population
                 pop.Actor.VelocityX = pop.Actor.Position.X - previous.X;
                 pop.Actor.VelocityY = pop.Actor.Position.Y - previous.Y;
                 pop.Actor.VelocityZ = pop.Actor.Position.Z - previous.Z;
-                _actors.PublishChanged(pop.Actor);
-                Changed?.Invoke(pop);
+                PublishPopulationChanged(pop);
             }
 
             DetectStuck(graph, pop, now);
@@ -1816,8 +1830,7 @@ namespace Game.Server.Application.Population
                 pop.Actor.VelocityX = 0f;
                 pop.Actor.VelocityY = 0f;
                 pop.Actor.VelocityZ = 0f;
-                _actors.PublishChanged(pop.Actor);
-                Changed?.Invoke(pop);
+                PublishPopulationChanged(pop);
             }
         }
 
@@ -2045,6 +2058,11 @@ namespace Game.Server.Application.Population
             pop.Actor.VelocityY = next.Y - previous.Y;
             pop.Actor.VelocityZ = next.Z - previous.Z;
 
+            PublishPopulationChanged(pop);
+        }
+
+        private void PublishPopulationChanged(PopulationActorRuntime pop)
+        {
             // ActorRegistry.PublishChanged owns canonical spatial updates and its
             // existing actor subscribers. Population.Changed is consumed by the
             // GameServer observer-presentation reconciliation/snapshot path.

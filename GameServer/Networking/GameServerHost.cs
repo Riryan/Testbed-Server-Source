@@ -213,16 +213,16 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         public ObserverSnapshotBatch(ClientSession observer) => Observer = observer;
     }
 
-    private sealed class PopulationSimulationSystem : ICoreBudgetedWorkSystem
+    private sealed class PopulationSimulationSystem : ICoreConditionalPreparedBudgetedWorkSystem
     {
         private readonly GameServerHost _owner;
         private readonly List<PopulationPlayerView> _players = new List<PopulationPlayerView>(128);
-        private long _preparedTick = long.MinValue;
         private double _nextActivationCheckAt;
         private bool _lastUnitWasWakePresentation;
 
         public PopulationSimulationSystem(GameServerHost owner) => _owner = owner;
         public string Name => "PopulationAuthority";
+        public bool ShouldPrepare => HasPendingWork;
         public bool HasPendingWork
         {
             get
@@ -259,30 +259,36 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                 return;
             }
             _lastUnitWasWakePresentation = false;
-            if (_preparedTick != context.TickIndex)
-            {
-                _preparedTick = context.TickIndex;
-                _players.Clear();
-                foreach (ClientSession session in _owner._readySessionsByCharacterId.Values)
-                {
-                    if (!_owner.IsCurrent(session) || !session.Ready || session.Entity == null)
-                        continue;
-
-                    ServerPlayerEntity entity = session.Entity;
-                    CharacterLocationState location = entity.Runtime.Location;
-                    _players.Add(new PopulationPlayerView(
-                        entity.Runtime.CharacterId.Value,
-                        location.MapId,
-                        location.InstanceId,
-                        new WorldPosition(entity.X, entity.Y, entity.Z),
-                        !entity.IsDead));
-                }
-
-                _owner._runtime.Population.PrepareBudgetedTick(_players, context.Now);
-                _nextActivationCheckAt = context.Now + Math.Max(0.25d, _owner._runtime.Population.ActivationHeartbeatSeconds);
-            }
 
             _owner._runtime.Population.TickNextBudgeted(context.FixedDelta, context.Now);
+        }
+
+        public void Prepare(in CoreTickContext context)
+        {
+            // A presentation-only drain needs no Population player snapshot.
+            if (!_owner._runtime.Population.HasDueScheduledActorWork(context.Now) &&
+                (_owner._readySessionsByCharacterId.Count == 0 ||
+                 !_owner._runtime.Population.HasDueWork(context.Now)))
+                return;
+
+            _players.Clear();
+            foreach (ClientSession session in _owner._readySessionsByCharacterId.Values)
+            {
+                if (!_owner.IsCurrent(session) || !session.Ready || session.Entity == null)
+                    continue;
+
+                ServerPlayerEntity entity = session.Entity;
+                CharacterLocationState location = entity.Runtime.Location;
+                _players.Add(new PopulationPlayerView(
+                    entity.Runtime.CharacterId.Value,
+                    location.MapId,
+                    location.InstanceId,
+                    new WorldPosition(entity.X, entity.Y, entity.Z),
+                    !entity.IsDead));
+            }
+
+            _owner._runtime.Population.PrepareBudgetedTick(_players, context.Now);
+            _nextActivationCheckAt = context.Now + Math.Max(0.25d, _owner._runtime.Population.ActivationHeartbeatSeconds);
         }
     }
 
@@ -416,6 +422,10 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         _directoryLease = directoryLease ?? throw new ArgumentNullException(nameof(directoryLease));
 
         _runtime.Population.DeadDecaySeconds = _options.PopulationDeadDecaySeconds;
+        // Ordinary routed civilians need full movement cadence through AOI exit.
+        // Keep the larger wake/hibernate lead-in and all combat promotion rules.
+        _runtime.Population.CivilianActiveDistance = Math.Max(1f,
+            _options.AoiRange + _options.AoiExitPadding);
         // Population wakes slightly ahead of replication AOI so doorway exits and route
         // presentation are already coherent when the player reaches observer range.
         _runtime.Population.PlayerActivationDistance = Math.Max(

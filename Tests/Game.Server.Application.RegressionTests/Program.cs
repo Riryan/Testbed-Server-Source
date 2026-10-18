@@ -84,8 +84,22 @@ internal static class Program
         }
     }
 
-    private static async Task Main()
+    private static async Task Main(string[] args)
     {
+        if (Array.IndexOf(args, "--population-audit-v3-workload") >= 0)
+        {
+            AuditWorkload(0f);
+            AuditWorkload(56f);
+            return;
+        }
+        if (Array.IndexOf(args, "--population-audit-v3") >= 0)
+        {
+            RunSync("civilian LOD follows observer exit and preserves combat families", AuditCivilianLod);
+            RunSync("wake/hibernate hysteresis and threat wake remain authoritative", AuditHysteresisAndThreat);
+            RunSync("no observers leaves Population unscheduled", AuditNoObservers);
+            Console.WriteLine("All Population audit V3 regression tests passed.");
+            return;
+        }
         await Run("lost response after commit reconciles as success", CommitThenThrowReconcilesAsSuccess);
         await Run("HttpClient-style timeout after commit reconciles as success", TimeoutAfterCommitReconcilesAsSuccess);
         await Run("stale response reloads authoritative state", StaleResponseReloadsAuthoritativeState);
@@ -157,6 +171,155 @@ internal static class Program
                 "transient id must be inside the reserved high range");
             Require(seen.Add(value), "transient ids must be unique");
         }
+    }
+
+    private static (PopulationSimulationService Service, PopulationActorRuntime Actor) AuditPopulation(
+        string archetype = "civilian.test", ServerSpawnKind kind = ServerSpawnKind.Population)
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.movementTriangles = map.collisionTriangles;
+        map.spawnAnchors[0].archetypeId = archetype;
+        map.spawnAnchors[0].kind = kind;
+        var service = new PopulationSimulationService(new ServerMapCatalog(new[] { map }),
+            new AuthoritativeActorRegistry(), null)
+        {
+            CivilianActiveDistance = 56f,
+            ActiveDistance = 80f,
+            PlayerActivationDistance = 80f,
+            PlayerHibernateDistance = 104f,
+        };
+        return (service, SinglePopulation(service));
+    }
+
+    private static void AuditStep(PopulationSimulationService service,
+        PopulationActorRuntime actor, float distance, double now, string instance = "")
+    {
+        WorldPosition position = actor.Actor.Position;
+        service.PrepareBudgetedTick(new[] { new PopulationPlayerView(1,
+            "population_test", instance,
+            new WorldPosition(position.X, position.Y, position.Z + distance)) }, now);
+        // Consume the existing preparation handoff, bounded wake and due actor work.
+        // A freshly scheduled actor is not due again at this same simulation time.
+        for (int i = 0; i < 16; ++i)
+            if (!service.TickNextBudgeted(0.1f, now)) break;
+    }
+
+    private static void AuditCivilianLod()
+    {
+        foreach (float distance in new[] { 48f, 55f, 56f, 57f, 70f, 79f })
+        {
+            var (service, actor) = AuditPopulation();
+            AuditStep(service, actor, distance, 1d);
+            Require(!actor.IsHibernating, "civilian within activation range should wake");
+            Require(actor.SimulationLod == (distance <= 56f
+                ? PopulationSimulationLod.Active : PopulationSimulationLod.CoarseRoute),
+                "civilian full cadence must end at AOI exit");
+        }
+        foreach (string archetype in new[] { "police", "hunter", "gang", "criminal", "ghoul" })
+        {
+            var (service, actor) = AuditPopulation(archetype);
+            AuditStep(service, actor, 70f, 1d);
+            Require(actor.SimulationLod == PopulationSimulationLod.Active,
+                archetype + " must retain the original Active range");
+        }
+        foreach (ServerSpawnKind kind in new[] { ServerSpawnKind.Npc, ServerSpawnKind.Monster })
+        {
+            var (service, actor) = AuditPopulation(kind: kind);
+            AuditStep(service, actor, 70f, 1d);
+            Require(actor.SimulationLod == PopulationSimulationLod.Active,
+                "authored NPC/Monster must retain the original Active range");
+        }
+    }
+
+    private static void AuditHysteresisAndThreat()
+    {
+        var (service, actor) = AuditPopulation();
+        AuditStep(service, actor, 70f, 1d);
+        foreach (float distance in new[] { 81f, 90f, 103f })
+        {
+            AuditStep(service, actor, distance, distance);
+            Require(!actor.IsHibernating, "awake civilian must stay awake inside hibernate band");
+        }
+        AuditStep(service, actor, 105f, 110d);
+        Require(actor.IsHibernating, "civilian beyond 104m must hibernate");
+        AuditStep(service, actor, 81f, 112d);
+        Require(actor.IsHibernating, "hibernating civilian must not wake outside 80m");
+        AuditStep(service, actor, 79f, 114d);
+        Require(!actor.IsHibernating, "approaching player must wake inside 80m");
+        AuditStep(service, actor, 0f, 116d, "another_instance");
+        Require(actor.IsHibernating, "other-instance player must not keep civilian awake");
+        Require(service.NotifyThreat(actor.Actor.Handle.actorId, actor.Actor.Position, 1f, 117d),
+            "authoritative threat must be accepted");
+        Require(!actor.IsHibernating && actor.SimulationLod == PopulationSimulationLod.Engaged &&
+            service.HasDueScheduledActorWork(117d), "threat must immediately wake and schedule engaged work");
+    }
+
+    private static void AuditWorkload(float civilianActiveDistance)
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
+        map.movementTriangles = map.collisionTriangles;
+        map.populationNodes[1].pose = new ServerPose(20f, 0f, 0f);
+        map.spawnAnchors = new ServerSpawnAnchor[52];
+        for (int i = 0; i < map.spawnAnchors.Length; ++i)
+            map.spawnAnchors[i] = new ServerSpawnAnchor
+            {
+                stableId = 7001 + i,
+                kind = ServerSpawnKind.Population,
+                actorKind = AuthoritativeActorKind.Population,
+                archetypeId = "civilian.test",
+                pose = new ServerPose(0f, 0f, 0f),
+                enabled = true,
+                capsuleRadius = 0.35f,
+                capsuleHeight = 1.8f,
+                routeNodeId = 1001,
+            };
+        var service = new PopulationSimulationService(new ServerMapCatalog(new[] { map }),
+            new AuthoritativeActorRegistry(), null)
+        {
+            CivilianActiveDistance = civilianActiveDistance,
+            PlayerActivationDistance = 80f,
+            PlayerHibernateDistance = 104f,
+            EnableSlowWorkDiagnostics = false,
+        };
+        int changed = 0, units = 0;
+        service.Changed += _ => ++changed;
+        var players = new[] { new PopulationPlayerView(1, "population_test", "",
+            new WorldPosition(10f, 0f, 70f)) };
+        for (int tick = 1; tick <= 600; ++tick)
+        {
+            double now = tick * 0.1d;
+            service.PrepareBudgetedTick(players, now);
+            for (int work = 0; work < 128; ++work)
+            {
+                if (!service.TickNextBudgeted(0.1f, now)) break;
+                ++units;
+            }
+        }
+        int active = 0, coarse = 0;
+        foreach (PopulationActorRuntime actor in service.All)
+        {
+            if (actor.SimulationLod == PopulationSimulationLod.Active) ++active;
+            if (actor.SimulationLod == PopulationSimulationLod.CoarseRoute) ++coarse;
+        }
+        Console.WriteLine($"SYNTHETIC 60s: civilianActiveDistance={civilianActiveDistance}, " +
+            $"actors={service.Count}, active={active}, coarse={coarse}, " +
+            $"successfulWorkUnits={units}, changedCallbacks={changed}");
+        Require(service.Count == 52 && !service.HasDueScheduledActorWork(60d),
+            "workload must retain all actors and drain due work");
+    }
+
+    private static void AuditNoObservers()
+    {
+        var (service, actor) = AuditPopulation();
+        service.PrepareBudgetedTick(Array.Empty<PopulationPlayerView>(), 1d);
+        Require(actor.IsHibernating && !service.HasDueScheduledActorWork(1d),
+            "startup civilian must have no due actor work without observers");
+        AuditStep(service, actor, 0f, 2d);
+        service.PrepareBudgetedTick(Array.Empty<PopulationPlayerView>(), 4d);
+        for (int i = 0; i < 16; ++i)
+            if (!service.TickNextBudgeted(0.1f, 4d)) break;
+        Require(actor.IsHibernating && !service.HasDueScheduledActorWork(100d),
+            "disconnect must return civilian to unscheduled hibernation");
     }
 
     private static void PopulationHibernationCatchesUpOnWake()
