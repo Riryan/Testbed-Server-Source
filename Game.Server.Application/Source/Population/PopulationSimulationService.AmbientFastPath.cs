@@ -68,6 +68,15 @@ namespace Game.Server.Application.Population
             MapGraph graph, PopulationActorRuntime pop, WorldPosition target,
             float dt, double now, bool fleeing = false)
         {
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { return TryTickAmbientRouteFastCore(graph, pop, target, dt, now, fleeing); }
+            finally { _diagnosticRouteTravelMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private bool TryTickAmbientRouteFastCore(
+            MapGraph graph, PopulationActorRuntime pop, WorldPosition target,
+            float dt, double now, bool fleeing)
+        {
             if (fleeing)
                 return TryTickAmbientRouteCertified(graph, pop, dt, now, fleeing: true);
 
@@ -106,19 +115,13 @@ namespace Game.Server.Application.Population
                 (fleeing && pop.AiState != PopulationAiState.Fleeing) ||
                 !float.IsFinite(dt) || dt <= 0f)
                 return false;
-            if (!graph.Outgoing.TryGetValue(pop.CurrentNodeId,
-                    out System.Collections.Generic.List<ServerPopulationRouteEdge> edges))
+            if (!ResolveRouteAssignment(graph, pop))
                 return false;
-            ServerPopulationRouteEdge selected = null;
-            for (int i = 0; i < edges.Count; ++i)
-                if (edges[i] != null && edges[i].toNodeId == pop.NextNodeId && edges[i].validatedClear)
-                { selected = edges[i]; break; }
-            if (selected == null ||
-                !graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode from) ||
-                !graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode to))
+            PopulationRouteSegment segment = pop.AssignedRouteSegment;
+            if (segment == null)
                 return false;
-
-            float standardOffset = Math.Max(0f, selected.width * 0.35f);
+            ServerPopulationRouteNode from = segment.From, to = segment.To;
+            float standardOffset = segment.LaneOffset;
             int lane = 0;
             if (Math.Abs(pop.LaneOffset) > 0.03f)
             {
@@ -127,18 +130,16 @@ namespace Game.Server.Application.Population
                     return false;
                 lane = pop.LaneOffset < 0f ? -1 : 1;
             }
-            if (!graph.CertifiedLanes.Contains((pop.CurrentNodeId, pop.NextNodeId, lane)))
+            if ((segment.CertifiedLaneMask & (1 << (lane + 1))) == 0)
                 return false;
-
-            float dx = to.pose.x - from.pose.x;
-            float dz = to.pose.z - from.pose.z;
-            float edgeSq = dx * dx + dz * dz;
+            float dx = segment.Dx, dz = segment.Dz;
+            float edgeSq = segment.LengthSquared;
             if (!float.IsFinite(edgeSq) || edgeSq <= 0.0001f)
                 return false;
-            float edgeLength = MathF.Sqrt(edgeSq);
+            float edgeLength = segment.Length;
             WorldPosition start = pop.Actor.Position;
-            float sideX = -dz / edgeLength;
-            float sideZ = dx / edgeLength;
+            float sideX = segment.SideX;
+            float sideZ = segment.SideZ;
             float laneX = from.pose.x + sideX * pop.LaneOffset;
             float laneZ = from.pose.z + sideZ * pop.LaneOffset;
             float projected = Math.Clamp(((start.X - laneX) * dx +
@@ -162,7 +163,7 @@ namespace Game.Server.Application.Population
             var next = new WorldPosition(newX, newY, newZ);
 
             // The authored/certified lane is authoritative. No live door/prop query.
-            pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
+            pop.Actor.YawDegrees = segment.Yaw;
             pop.SegmentProgress = progress;
             pop.MotorState.Position = next;
             pop.MotorState.LastSafePosition = next;
@@ -170,12 +171,11 @@ namespace Game.Server.Application.Population
             pop.MotorState.Grounded = true;
             pop.MotorState.Mode = ActorMovementMode.Grounded;
             ApplyMotor(pop);
+            RecordRouteAdvance(pop, now);
             if (progress >= 0.99999f ||
                 Math.Abs(newX - (to.pose.x + sideX * pop.LaneOffset)) +
                 Math.Abs(newZ - (to.pose.z + sideZ * pop.LaneOffset)) <= 0.15f)
                 ArriveNode(graph, pop, now);
-            else
-                DetectStuck(graph, pop, now);
             return true;
         }
     }

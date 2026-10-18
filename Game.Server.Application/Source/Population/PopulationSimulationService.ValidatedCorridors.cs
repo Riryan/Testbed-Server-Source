@@ -39,8 +39,9 @@ namespace Game.Server.Application.Population
                 return false;
 
             if (pop.CurrentNodeId <= 0 || pop.NextNodeId <= 0 ||
-                !graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode to))
+                !ResolveRouteAssignment(graph, pop))
                 return true; // no route target: do not wander through collision geometry
+            ServerPopulationRouteNode to = pop.AssignedRouteTarget;
 
             WorldPosition previous = pop.Actor.Position;
             WorldPosition destination;
@@ -79,32 +80,19 @@ namespace Game.Server.Application.Population
             {
                 // An invalid authored edge must not silently enter the expensive
                 // full player-grade collision motor. Reuse the route recovery.
-                if (!graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode from) ||
-                    !graph.Outgoing.TryGetValue(pop.CurrentNodeId,
-                        out List<ServerPopulationRouteEdge> edges))
-                    return true;
-
-                bool validEdge = false;
-                for (int i = 0; i < edges.Count; ++i)
-                {
-                    ServerPopulationRouteEdge edge = edges[i];
-                    if (edge != null && edge.toNodeId == pop.NextNodeId && edge.validatedClear)
-                    {
-                        validEdge = true;
-                        break;
-                    }
-                }
+                PopulationRouteSegment segment = pop.AssignedRouteSegment;
+                bool validEdge = segment != null;
                 if (!validEdge)
                 {
                     RecoverBlockedRoute(pop, now);
                     return true;
                 }
 
-                WorldPosition a = from.pose.ToWorldPosition();
+                WorldPosition a = segment.From.pose.ToWorldPosition();
                 WorldPosition b = to.pose.ToWorldPosition();
-                float dx = b.X - a.X;
-                float dz = b.Z - a.Z;
-                float lengthSquared = dx * dx + dz * dz;
+                float dx = segment.Dx;
+                float dz = segment.Dz;
+                float lengthSquared = segment.LengthSquared;
                 if (lengthSquared < 0.0025f)
                 {
                     destination = b;
@@ -114,9 +102,23 @@ namespace Game.Server.Application.Population
                 }
                 else
                 {
-                    float length = MathF.Sqrt(lengthSquared);
+                    float length = segment.Length;
                     float projected = ((previous.X - a.X) * dx +
                                        (previous.Z - a.Z) * dz) / lengthSquared;
+                    // Reuse the projection already required for route travel.
+                    // Only a real departure from the authored corridor requests a
+                    // nearest-node rejoin; normal progress needs no stuck polling.
+                    float nearestT = Math.Clamp(projected, 0f, 1f);
+                    float offX = previous.X - (a.X + dx * nearestT);
+                    float offZ = previous.Z - (a.Z + dz * nearestT);
+                    float corridor = Math.Max(0.35f, segment.HalfWidth) + pop.CapsuleRadius;
+                    float routeY = a.Y + (b.Y - a.Y) * nearestT;
+                    if (offX * offX + offZ * offZ > corridor * corridor ||
+                        Math.Abs(previous.Y - routeY) > Math.Max(1f, pop.CapsuleHeight))
+                    {
+                        ReattachToNearestRoute(pop);
+                        return true;
+                    }
                     float startT = Math.Clamp(
                         Math.Max(pop.SegmentProgress, projected), 0f, 1f);
                     float endT = Math.Min(1f, startT + travel / length);
@@ -126,7 +128,8 @@ namespace Game.Server.Application.Population
                         a.X + dx * endT,
                         a.Y + (b.Y - a.Y) * endT,
                         a.Z + dz * endT);
-                    yaw = MathF.Atan2(dx, dz) * (180f / MathF.PI);
+                    yaw = segment.Yaw;
+                    pop.SegmentProgress = endT;
                     reached = endT >= 1f;
                 }
             }
@@ -139,24 +142,11 @@ namespace Game.Server.Application.Population
             pop.MotorState.Grounded = true;
             pop.MotorState.Mode = ActorMovementMode.Grounded;
             ApplyMotor(pop); // preserve canonical spatial/AOI/presentation publication
+            RecordRouteAdvance(pop, now);
 
             if (reached)
             {
                 ArriveNode(graph, pop, now);
-            }
-            else if (pop.CurrentNodeId != pop.NextNodeId &&
-                graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode start))
-            {
-                WorldPosition a = start.pose.ToWorldPosition();
-                WorldPosition b = to.pose.ToWorldPosition();
-                float dx = b.X - a.X;
-                float dz = b.Z - a.Z;
-                float lengthSquared = dx * dx + dz * dz;
-                if (lengthSquared >= 0.0025f)
-                    pop.SegmentProgress = Math.Clamp(
-                        ((destination.X - a.X) * dx + (destination.Z - a.Z) * dz) /
-                        lengthSquared, 0f, 1f);
-                DetectStuck(graph, pop, now);
             }
 
             return true;

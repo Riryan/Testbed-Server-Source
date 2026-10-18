@@ -86,6 +86,24 @@ internal static class Program
 
     private static async Task Main(string[] args)
     {
+        if (Array.IndexOf(args, "--population-route-v4") >= 0)
+        {
+            RunSync("validated slow travel never invokes stuck recovery", RouteSlowTravel);
+            RunSync("segment references persist until an actual transition", RouteAssignmentReuse);
+            RunSync("displaced actor rejoins once without repeating nearest searches", RouteDisplacementRejoin);
+            RunSync("collision recovery path still detects a stationary blocked actor", RoutePhysicalRecovery);
+            return;
+        }
+        if (Array.IndexOf(args, "--population-route-v4-workload") >= 0)
+        {
+            for (int sample = 0; sample < 6; ++sample)
+            {
+                Console.WriteLine("SAMPLE " + sample + (sample == 0 ? " (warmup)" : ""));
+                AuditWorkload(0f, 60000);
+                AuditWorkload(56f, 60000);
+            }
+            return;
+        }
         if (Array.IndexOf(args, "--population-audit-v3-workload") >= 0)
         {
             AuditWorkload(0f);
@@ -254,7 +272,7 @@ internal static class Program
             service.HasDueScheduledActorWork(117d), "threat must immediately wake and schedule engaged work");
     }
 
-    private static void AuditWorkload(float civilianActiveDistance)
+    private static void AuditWorkload(float civilianActiveDistance, int ticks = 600)
     {
         ServerMapSnapshot map = CreatePopulationMap(includePortal: false);
         map.movementTriangles = map.collisionTriangles;
@@ -285,7 +303,9 @@ internal static class Program
         service.Changed += _ => ++changed;
         var players = new[] { new PopulationPlayerView(1, "population_test", "",
             new WorldPosition(10f, 0f, 70f)) };
-        for (int tick = 1; tick <= 600; ++tick)
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        for (int tick = 1; tick <= ticks; ++tick)
         {
             double now = tick * 0.1d;
             service.PrepareBudgetedTick(players, now);
@@ -295,17 +315,111 @@ internal static class Program
                 ++units;
             }
         }
+        watch.Stop();
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
         int active = 0, coarse = 0;
         foreach (PopulationActorRuntime actor in service.All)
         {
             if (actor.SimulationLod == PopulationSimulationLod.Active) ++active;
             if (actor.SimulationLod == PopulationSimulationLod.CoarseRoute) ++coarse;
         }
-        Console.WriteLine($"SYNTHETIC 60s: civilianActiveDistance={civilianActiveDistance}, " +
+        Console.WriteLine($"SYNTHETIC {ticks * 0.1d:F0}s: civilianActiveDistance={civilianActiveDistance}, " +
             $"actors={service.Count}, active={active}, coarse={coarse}, " +
-            $"successfulWorkUnits={units}, changedCallbacks={changed}");
-        Require(service.Count == 52 && !service.HasDueScheduledActorWork(60d),
+            $"successfulWorkUnits={units}, changedCallbacks={changed}, " +
+            $"elapsedMs={watch.Elapsed.TotalMilliseconds:F3}, allocatedBytes={allocated}");
+        Require(service.Count == 52 && !service.HasDueScheduledActorWork(ticks * 0.1d),
             "workload must retain all actors and drain due work");
+    }
+
+    private static object RouteField(object target, string name) =>
+        target.GetType().GetField(name, System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance).GetValue(target);
+
+    private static void SetRouteField(object target, string name, object value) =>
+        target.GetType().GetField(name, System.Reflection.BindingFlags.NonPublic |
+            System.Reflection.BindingFlags.Instance).SetValue(target, value);
+
+    private static (PopulationSimulationService Service, PopulationActorRuntime Actor) RouteFixture()
+    {
+        var fixture = AuditPopulation();
+        fixture.Service.EnableSlowWorkDiagnostics = false;
+        AuditStep(fixture.Service, fixture.Actor, 0f, 1d);
+        fixture.Actor.Actor.Position = new WorldPosition(100f, 0f, 0f);
+        SetRouteField(fixture.Actor, "MotorState",
+            new Game.Server.Application.Movement.CharacterMotorState(fixture.Actor.Actor.Position));
+        SetRouteField(fixture.Actor, "CurrentNodeId", 1001L);
+        SetRouteField(fixture.Actor, "NextNodeId", 1002L);
+        SetRouteField(fixture.Actor, "SegmentProgress", 0.1f);
+        // Force the existing centerline fallback to exercise its route contract.
+        SetRouteField(fixture.Actor, "LaneOffset", 0.17f);
+        return fixture;
+    }
+
+    private static void RouteSlowTravel()
+    {
+        var (service, actor) = RouteFixture();
+        typeof(PopulationActorRuntime).GetProperty("WalkSpeed").SetValue(actor, 0.1f);
+        float previous = actor.Actor.Position.X;
+        for (int tick = 0; tick < 20; ++tick)
+        {
+            SetRouteField(actor, "LaneOffset", 0.17f);
+            AuditStep(service, actor, 0f, 2d + tick * 0.3d);
+            Require(actor.Actor.Position.X >= previous && actor.Actor.Position.X - previous < 0.12f,
+                "slow route movement must remain bounded and forward");
+            Require(actor.CurrentRouteNodeId == 1001 && actor.NextRouteNodeId == 1002 &&
+                actor.RouteReason != PopulationRouteReason.Recovery,
+                "slow but valid progress must not trigger route recovery");
+            previous = actor.Actor.Position.X;
+        }
+    }
+
+    private static void RouteAssignmentReuse()
+    {
+        var (service, actor) = RouteFixture();
+        AuditStep(service, actor, 0f, 2d);
+        object assignment = RouteField(actor, "AssignedRouteSegment");
+        Require(assignment != null, "existing edge must resolve to a compiled segment");
+        AuditStep(service, actor, 0f, 2.3d);
+        Require(ReferenceEquals(assignment, RouteField(actor, "AssignedRouteSegment")),
+            "unchanged assignment must reuse its compiled segment");
+        SetRouteField(actor, "CurrentNodeId", 1002L);
+        SetRouteField(actor, "NextNodeId", 1001L);
+        SetRouteField(actor, "SegmentProgress", 0.9f);
+        AuditStep(service, actor, 0f, 2.6d);
+        Require(!ReferenceEquals(assignment, RouteField(actor, "AssignedRouteSegment")),
+            "reversed edge must invalidate the previous reference");
+        Require(actor.Actor.Position.X < 101f, "reversed travel must preserve location continuity");
+    }
+
+    private static void RouteDisplacementRejoin()
+    {
+        var (service, actor) = RouteFixture();
+        actor.Actor.Position = new WorldPosition(100f, 0f, 20f);
+        SetRouteField(actor, "MotorState",
+            new Game.Server.Application.Movement.CharacterMotorState(actor.Actor.Position));
+        AuditStep(service, actor, 0f, 2d);
+        Require(actor.CurrentRouteNodeId == actor.NextRouteNodeId,
+            "actual corridor departure must assign a nearest-marker rejoin");
+        long join = actor.NextRouteNodeId;
+        WorldPosition before = actor.Actor.Position;
+        AuditStep(service, actor, 0f, 2.3d);
+        Require(actor.NextRouteNodeId == join && actor.Actor.Position.Z < before.Z,
+            "rejoin must make bounded progress without selecting a new nearest marker");
+    }
+
+    private static void RoutePhysicalRecovery()
+    {
+        var (service, actor) = RouteFixture();
+        AuditStep(service, actor, 0f, 2d);
+        SetRouteField(actor, "LastProgressAt", 1d);
+        SetRouteField(actor, "LastProgressPosition", actor.Actor.Position);
+        object graph = RouteField(actor, "AssignedRouteGraph");
+        typeof(PopulationSimulationService).GetMethod("DetectStuck",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Invoke(service, new[] { graph, actor, (object)5d });
+        Require(actor.RouteReason == PopulationRouteReason.Recovery &&
+            actor.CurrentRouteNodeId == actor.NextRouteNodeId,
+            "blocked physical movement must retain route recovery");
     }
 
     private static void AuditNoObservers()

@@ -47,6 +47,14 @@ namespace Game.Server.Application.Population
         Stationary = 2,
     }
 
+    // Compiled once from the existing immutable baked route graph, shared by actors.
+    internal sealed class PopulationRouteSegment
+    {
+        internal ServerPopulationRouteNode From, To;
+        internal float Dx, Dz, LengthSquared, Length, SideX, SideZ, Yaw, LaneOffset, HalfWidth;
+        internal int CertifiedLaneMask;
+    }
+
     public sealed class PopulationActorRuntime
     {
         internal CharacterMotorState MotorState;
@@ -55,6 +63,10 @@ namespace Game.Server.Application.Population
         internal long CurrentNodeId;
         internal long NextNodeId;
         internal float SegmentProgress;
+        internal object AssignedRouteGraph;
+        internal long AssignedFromId, AssignedToId;
+        internal ServerPopulationRouteNode AssignedRouteTarget;
+        internal PopulationRouteSegment AssignedRouteSegment;
         internal float LaneOffset;
         internal double WaitUntil;
         internal double DormantUntil;
@@ -141,6 +153,8 @@ namespace Game.Server.Application.Population
             public Dictionary<long, long> SpawnPortalByAnchor = new Dictionary<long, long>();
             public Dictionary<long, int> PortalOwnedCounts = new Dictionary<long, int>();
             public ServerCollisionWorld Collision;
+            public readonly Dictionary<(long From, long To), PopulationRouteSegment> Segments =
+                new Dictionary<(long From, long To), PopulationRouteSegment>();
             // Static route certificate: authored edge and one of the three actual
             // lane offsets (-1,0,+1). Built once per immutable map load.
             public readonly HashSet<(long From, long To, int Lane)> CertifiedLanes =
@@ -319,6 +333,9 @@ namespace Game.Server.Application.Population
         // and the existing Population.Changed observer-presentation callback.
         // These are passive elapsed-time counters, not a new execution route.
         private double _diagnosticMotorCollisionMs;
+        private double _diagnosticRouteBindMs, _diagnosticRouteTravelMs, _diagnosticRouteArrivalMs;
+        private double _diagnosticRouteRecoveryMs, _diagnosticRouteSelectMs;
+        private int _diagnosticRouteBindings, _diagnosticStuckChecks, _diagnosticRouteReattachments;
         private double _diagnosticActorPublishMs;
         private double _diagnosticObserverPresentationMs;
         private int _diagnosticMotorCalls;
@@ -371,6 +388,9 @@ namespace Game.Server.Application.Population
                 $"ambientFallbacks={_diagnosticAmbientFallbacks}, " +
                 $"actorPublish={_diagnosticActorPublishMs:F3}ms, " +
                 $"observerPresentation={_diagnosticObserverPresentationMs:F3}ms, " +
+                $"routeBind={_diagnosticRouteBindMs:F3}ms/{_diagnosticRouteBindings}binds, " +
+                $"routeSelect={_diagnosticRouteSelectMs:F3}ms, routeTravel={_diagnosticRouteTravelMs:F3}ms, routeArrival={_diagnosticRouteArrivalMs:F3}ms, " +
+                $"routeRecovery={_diagnosticRouteRecoveryMs:F3}ms/{_diagnosticStuckChecks}checks/{_diagnosticRouteReattachments}reattach, " +
                 $"actorOther={otherActorMs:F3}ms, wakeScan={_diagnosticWakeScanMs:F3}ms, wakeAdmission={_diagnosticWakeAdmissionMs:F3}ms, " +
                 $"wakeSpatial={_diagnosticWakeSpatialMs:F3}ms, wakeActorPublish={_diagnosticWakeActorPublishMs:F3}ms, " +
                 $"wakeObserverPublish={_diagnosticWakeObserverPublishMs:F3}ms, wakeSchedule={_diagnosticWakeScheduleMs:F3}ms, " +
@@ -542,6 +562,9 @@ namespace Game.Server.Application.Population
             _diagnosticAmbientCollisionMs = 0d;
             _diagnosticAmbientSamples = 0;
             _diagnosticAmbientFallbacks = 0;
+            _diagnosticRouteBindMs = _diagnosticRouteTravelMs = _diagnosticRouteArrivalMs = 0d;
+            _diagnosticRouteRecoveryMs = _diagnosticRouteSelectMs = 0d;
+            _diagnosticRouteBindings = _diagnosticStuckChecks = _diagnosticRouteReattachments = 0;
             long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
@@ -634,6 +657,9 @@ namespace Game.Server.Application.Population
             _diagnosticAmbientCollisionMs = 0d;
             _diagnosticAmbientSamples = 0;
             _diagnosticAmbientFallbacks = 0;
+            _diagnosticRouteBindMs = _diagnosticRouteTravelMs = _diagnosticRouteArrivalMs = 0d;
+            _diagnosticRouteRecoveryMs = _diagnosticRouteSelectMs = 0d;
+            _diagnosticRouteBindings = _diagnosticStuckChecks = _diagnosticRouteReattachments = 0;
             _diagnosticDistanceMs = 0d;
             _diagnosticWakeScanMs = 0d;
             _diagnosticWakeAdmissionMs = 0d;
@@ -1311,8 +1337,82 @@ namespace Game.Server.Application.Population
                     }
                 }
                 CertifyBakedRouteLanes(graph);
+                CompileRouteSegments(graph);
                 _graphs[key] = graph;
             }
+        }
+
+        private static void CompileRouteSegments(MapGraph graph)
+        {
+            foreach (List<ServerPopulationRouteEdge> edges in graph.Outgoing.Values)
+                for (int i = 0; i < edges.Count; ++i)
+                {
+                    ServerPopulationRouteEdge edge = edges[i];
+                    if (edge == null || !edge.validatedClear ||
+                        graph.Segments.ContainsKey((edge.fromNodeId, edge.toNodeId)) ||
+                        !graph.Nodes.TryGetValue(edge.fromNodeId, out ServerPopulationRouteNode from) ||
+                        !graph.Nodes.TryGetValue(edge.toNodeId, out ServerPopulationRouteNode to))
+                        continue;
+                    float dx = to.pose.x - from.pose.x, dz = to.pose.z - from.pose.z;
+                    float squared = dx * dx + dz * dz;
+                    float length = MathF.Sqrt(squared);
+                    var segment = new PopulationRouteSegment
+                    {
+                        From = from, To = to, Dx = dx, Dz = dz,
+                        LengthSquared = squared, Length = length,
+                        SideX = length > 0.001f ? -dz / length : 0f,
+                        SideZ = length > 0.001f ? dx / length : 0f,
+                        Yaw = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI)),
+                        LaneOffset = Math.Max(0f, edge.width * 0.35f),
+                        HalfWidth = Math.Max(0f, edge.width * 0.5f),
+                    };
+                    for (int lane = -1; lane <= 1; ++lane)
+                        if (graph.CertifiedLanes.Contains((edge.fromNodeId, edge.toNodeId, lane)))
+                            segment.CertifiedLaneMask |= 1 << (lane + 1);
+                    graph.Segments.Add((edge.fromNodeId, edge.toNodeId), segment);
+                }
+            // Certificates now live in the compiled segments, not a second runtime index.
+            graph.CertifiedLanes.Clear();
+            graph.CertifiedLanes.TrimExcess();
+        }
+
+        // Resolve only at assignment/transition. ID changes in combat, portal,
+        // respawn or recovery automatically invalidate the actor's reference.
+        private bool ResolveRouteAssignment(MapGraph graph, PopulationActorRuntime pop)
+        {
+            if (ReferenceEquals(pop.AssignedRouteGraph, graph) &&
+                pop.AssignedFromId == pop.CurrentNodeId && pop.AssignedToId == pop.NextNodeId)
+                return pop.AssignedRouteTarget != null;
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                ++_diagnosticRouteBindings;
+                pop.AssignedRouteGraph = graph;
+                pop.AssignedFromId = pop.CurrentNodeId;
+                pop.AssignedToId = pop.NextNodeId;
+                graph.Nodes.TryGetValue(pop.NextNodeId, out pop.AssignedRouteTarget);
+                graph.Segments.TryGetValue((pop.CurrentNodeId, pop.NextNodeId), out pop.AssignedRouteSegment);
+                return pop.AssignedRouteTarget != null;
+            }
+            finally { _diagnosticRouteBindMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private bool TryGetAssignedGraph(PopulationActorRuntime pop, out MapGraph graph)
+        {
+            graph = pop.AssignedRouteGraph as MapGraph;
+            if (graph != null &&
+                string.Equals(graph.Map.mapId, pop.Actor.MapId, StringComparison.Ordinal) &&
+                string.Equals(graph.Map.instanceId ?? string.Empty, pop.Actor.InstanceId, StringComparison.Ordinal))
+                return true;
+            return TryGetGraph(pop.Actor, out graph);
+        }
+
+        private static void RecordRouteAdvance(PopulationActorRuntime pop, double now)
+        {
+            // Direct validated rail travel cannot physically become stuck. Start
+            // physical recovery accounting afresh if it later leaves this path.
+            pop.LastProgressAt = now;
+            pop.LastProgressPosition = pop.Actor.Position;
         }
 
         private static void AddEdge(MapGraph graph, long nodeId, ServerPopulationRouteEdge edge)
@@ -1571,6 +1671,7 @@ namespace Game.Server.Application.Population
                 pop.Actor.YawDegrees = yaw;
                 pop.MotorState = new CharacterMotorState(position);
             }
+            ResolveRouteAssignment(graph, pop);
         }
 
         private float GetActiveDistance(PopulationActorRuntime pop)
@@ -1802,12 +1903,13 @@ namespace Game.Server.Application.Population
 
         private void TickCoarse(PopulationActorRuntime pop, float dt, double now)
         {
-            if (!TryGetGraph(pop.Actor, out MapGraph graph) || !EnsureNextNode(graph, pop)) return;
-            if (!graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode from) ||
-                !graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode to))
-                return;
-
-            float distance = DistanceXZ(from.pose.ToWorldPosition(), to.pose.ToWorldPosition());
+            if (!TryGetAssignedGraph(pop, out MapGraph graph) || !EnsureNextNode(graph, pop)) return;
+            if (!ResolveRouteAssignment(graph, pop)) return;
+            ServerPopulationRouteNode to = pop.AssignedRouteTarget;
+            PopulationRouteSegment segment = pop.AssignedRouteSegment;
+            if (segment == null && !graph.Nodes.ContainsKey(pop.CurrentNodeId)) return;
+            float distance = segment != null ? segment.Length :
+                DistanceXZ(graph.Nodes[pop.CurrentNodeId].pose.ToWorldPosition(), to.pose.ToWorldPosition());
             if (distance < 0.05f)
             {
                 ArriveNode(graph, pop, now);
@@ -1822,7 +1924,7 @@ namespace Game.Server.Application.Population
                 return;
             }
 
-            if (TryPositionOnEdge(graph, pop.CurrentNodeId, pop.NextNodeId, pop.SegmentProgress, pop.LaneOffset, out WorldPosition position, out float yaw))
+            if (TryPositionOnAssignedSegment(graph, pop, out WorldPosition position, out float yaw))
             {
                 pop.Actor.Position = position;
                 pop.Actor.YawDegrees = yaw;
@@ -1836,8 +1938,9 @@ namespace Game.Server.Application.Population
 
         private void TickActive(PopulationActorRuntime pop, float dt, double now)
         {
-            if (!TryGetGraph(pop.Actor, out MapGraph graph) || graph.Collision == null || !EnsureNextNode(graph, pop)) return;
-            if (!graph.Nodes.TryGetValue(pop.NextNodeId, out ServerPopulationRouteNode targetNode)) return;
+            if (!TryGetAssignedGraph(pop, out MapGraph graph) || graph.Collision == null || !EnsureNextNode(graph, pop)) return;
+            if (!ResolveRouteAssignment(graph, pop)) return;
+            ServerPopulationRouteNode targetNode = pop.AssignedRouteTarget;
 
             WorldPosition target = OffsetTargetForLane(graph, pop, targetNode.pose.ToWorldPosition());
             float dx = target.X - pop.Actor.Position.X;
@@ -2091,6 +2194,14 @@ namespace Game.Server.Application.Population
 
         private void DetectStuck(MapGraph graph, PopulationActorRuntime pop, double now)
         {
+            ++_diagnosticStuckChecks;
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { DetectStuckCore(graph, pop, now); }
+            finally { _diagnosticRouteRecoveryMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private void DetectStuckCore(MapGraph graph, PopulationActorRuntime pop, double now)
+        {
             if (pop.LastProgressAt <= 0d)
             {
                 pop.LastProgressAt = now;
@@ -2131,6 +2242,14 @@ namespace Game.Server.Application.Population
 
         private void ReattachToNearestRoute(PopulationActorRuntime pop)
         {
+            ++_diagnosticRouteReattachments;
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { ReattachToNearestRouteCore(pop); }
+            finally { _diagnosticRouteRecoveryMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private void ReattachToNearestRouteCore(PopulationActorRuntime pop)
+        {
             if (pop == null || pop.MovementBehavior != SharedAiMovementMode.Route)
             {
                 if (pop != null)
@@ -2145,7 +2264,9 @@ namespace Game.Server.Application.Population
             long node = FindNearestNode(graph, pop.Actor.Position);
             if (node <= 0) return;
             pop.CurrentNodeId = node;
-            pop.NextNodeId = 0;
+            // Rejoin this marker once before choosing another edge. This prevents
+            // repeated nearest-node searches while still physically off the route.
+            pop.NextNodeId = node;
             pop.SegmentProgress = 0f;
             pop.AiState = PopulationAiState.FollowingRoute;
             pop.RouteReason = PopulationRouteReason.Recovery;
@@ -2153,6 +2274,13 @@ namespace Game.Server.Application.Population
         }
 
         private void ArriveNode(MapGraph graph, PopulationActorRuntime pop, double now)
+        {
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { ArriveNodeCore(graph, pop, now); }
+            finally { _diagnosticRouteArrivalMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private void ArriveNodeCore(MapGraph graph, PopulationActorRuntime pop, double now)
         {
             long fromNodeId = pop.CurrentNodeId;
             long reachedNodeId = pop.NextNodeId;
@@ -2348,6 +2476,8 @@ namespace Game.Server.Application.Population
             pop.BlockedRouteUntil = 0d;
             pop.CurrentNodeId = joinNode;
             pop.NextNodeId = pop.MovementBehavior == SharedAiMovementMode.Route ? joinNode : 0;
+            if (pop.MovementBehavior == SharedAiMovementMode.Route)
+                ResolveRouteAssignment(graph, pop);
             pop.SegmentProgress = 0f;
             pop.HomePosition = anchor;
             pop.HasRoamTarget = false;
@@ -2785,7 +2915,14 @@ namespace Game.Server.Application.Population
 
         private bool EnsureNextNode(MapGraph graph, PopulationActorRuntime pop)
         {
-            if (pop.NextNodeId > 0 && graph.Nodes.ContainsKey(pop.NextNodeId)) return true;
+            if (pop.NextNodeId > 0 && ResolveRouteAssignment(graph, pop)) return true;
+            long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { return SelectNextNode(graph, pop); }
+            finally { _diagnosticRouteSelectMs += ElapsedDiagnosticMilliseconds(startedAt); }
+        }
+
+        private bool SelectNextNode(MapGraph graph, PopulationActorRuntime pop)
+        {
             if (pop.CurrentNodeId <= 0 || !graph.Nodes.ContainsKey(pop.CurrentNodeId))
                 pop.CurrentNodeId = FindNearestNode(graph, pop.Actor.Position);
             long blockedDestination = BlockedDestinationFor(pop, pop.CurrentNodeId, pop.LastSimulationAt);
@@ -2795,6 +2932,7 @@ namespace Game.Server.Application.Population
             pop.NextNodeId = edge.toNodeId;
             pop.SegmentProgress = 0f;
             pop.LaneOffset = ChooseLaneOffset(edge.width, pop.Random);
+            ResolveRouteAssignment(graph, pop);
             return true;
         }
 
@@ -3368,6 +3506,22 @@ namespace Game.Server.Application.Population
             return false;
         }
 
+        private static bool TryPositionOnAssignedSegment(MapGraph graph, PopulationActorRuntime pop,
+            out WorldPosition position, out float yaw)
+        {
+            PopulationRouteSegment segment = pop.AssignedRouteSegment;
+            if (segment == null)
+                return TryPositionOnEdge(graph, pop.CurrentNodeId, pop.NextNodeId,
+                    pop.SegmentProgress, pop.LaneOffset, out position, out yaw);
+            float t = Math.Clamp(pop.SegmentProgress, 0f, 1f);
+            position = new WorldPosition(
+                segment.From.pose.x + segment.Dx * t + segment.SideX * pop.LaneOffset,
+                segment.From.pose.y + (segment.To.pose.y - segment.From.pose.y) * t,
+                segment.From.pose.z + segment.Dz * t + segment.SideZ * pop.LaneOffset);
+            yaw = segment.Yaw;
+            return true;
+        }
+
         private static bool TryPositionOnEdge(MapGraph graph, long fromId, long toId, float progress, float laneOffset, out WorldPosition position, out float yaw)
         {
             position = default;
@@ -3390,6 +3544,12 @@ namespace Game.Server.Application.Population
 
         private static WorldPosition OffsetTargetForLane(MapGraph graph, PopulationActorRuntime pop, WorldPosition target)
         {
+            PopulationRouteSegment segment = pop.AssignedRouteSegment;
+            if (ReferenceEquals(pop.AssignedRouteGraph, graph) &&
+                pop.AssignedFromId == pop.CurrentNodeId && pop.AssignedToId == pop.NextNodeId &&
+                segment != null)
+                return new WorldPosition(target.X + segment.SideX * pop.LaneOffset,
+                    target.Y, target.Z + segment.SideZ * pop.LaneOffset);
             if (!graph.Nodes.TryGetValue(pop.CurrentNodeId, out ServerPopulationRouteNode from)) return target;
             float dx = target.X - from.pose.x;
             float dz = target.Z - from.pose.z;
