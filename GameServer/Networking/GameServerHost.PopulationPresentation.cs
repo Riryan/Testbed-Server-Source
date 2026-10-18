@@ -32,6 +32,12 @@ internal sealed partial class GameServerHost
             new Dictionary<ClientSession, double>();
         public PopulationPublicInteractionFlags PublicInteractionFlags { get; private set; }
         public uint AppearanceSequence { get; private set; } = 1u;
+        // Track dormant -> presentable transitions; only an existing actor's
+        // first AOI wake is deferred. Other state updates retain their ordering.
+        public bool WasPresentable { get; set; }
+        // Immutable appearance serialization is created once, before clients join.
+        // Invalidated only if a real public appearance/interaction flag changes.
+        public byte[] CachedAppearanceBytes { get; set; }
 
         public PopulationPresentationState(
             ServerPopulationPresentationEntity entity,
@@ -46,6 +52,7 @@ internal sealed partial class GameServerHost
             if (PublicInteractionFlags == value)
                 return false;
             PublicInteractionFlags = value;
+            CachedAppearanceBytes = null;
             AppearanceSequence++;
             if (AppearanceSequence == 0u)
                 AppearanceSequence = 1u;
@@ -61,6 +68,91 @@ internal sealed partial class GameServerHost
     private readonly List<long> _populationActorIdScratch = new List<long>(128);
     private readonly List<AuthoritativeActorRuntime> _populationActorScratch =
         new List<AuthoritativeActorRuntime>(128);
+
+    // Reuse the existing PopulationAuthority cooperative work units for first
+    // visibility after hibernation. No new tick, manager, message or network path.
+    // One observer-spawn send per work unit; never block the actor wake on fan-out.
+    private readonly Queue<long> _populationWakePresentationQueue = new Queue<long>();
+    private readonly HashSet<long> _populationWakePresentationQueued = new HashSet<long>();
+    private readonly List<ClientSession> _populationWakePresentationObservers = new List<ClientSession>(32);
+    private long _populationWakePresentationCurrentActorId;
+    private int _populationWakePresentationObserverCursor;
+
+    private bool HasPendingPopulationWakePresentation =>
+        _populationWakePresentationCurrentActorId > 0 ||
+        _populationWakePresentationQueue.Count > 0;
+
+    private void EnqueuePopulationWakePresentation(PopulationPresentationState state)
+    {
+        long id = state.Entity.Population.Actor.Handle.actorId;
+        if (_populationWakePresentationQueued.Add(id))
+            _populationWakePresentationQueue.Enqueue(id);
+    }
+
+    // Called ONLY from the already-registered PopulationAuthority work system.
+    // Returning true consumes one scheduler work unit. The scheduler can check
+    // budgets before invoking the following unit; normal observer eligibility,
+    // spawn wire, existing snapshot cadence and AOI deduplication are unchanged.
+    private bool ExecuteOnePopulationWakePresentationWorkUnit()
+    {
+        if (_populationWakePresentationCurrentActorId == 0)
+        {
+            while (_populationWakePresentationQueue.Count > 0)
+            {
+                long id = _populationWakePresentationQueue.Dequeue();
+                if (!_populationWakePresentationQueued.Contains(id))
+                    continue;
+                if (!_populationPresentations.TryGetValue(id, out PopulationPresentationState state) ||
+                    !CanPresentPopulation(state))
+                {
+                    _populationWakePresentationQueued.Remove(id);
+                    continue;
+                }
+
+                AuthoritativeActorRuntime actor = state.Entity.Population.Actor;
+                _populationWakePresentationCurrentActorId = id;
+                _populationWakePresentationObserverCursor = 0;
+                _worldInterest.CollectSessionsNear(
+                    actor.MapId, actor.InstanceId, actor.Position.X, actor.Position.Z,
+                    Math.Max(1f, _options.AoiRange), _populationWakePresentationObservers);
+                if (_populationWakePresentationObservers.Count == 0)
+                    CompletePopulationWakePresentation();
+                return true; // Existing spatial-AOI lookup, separate budgeted unit.
+            }
+            return false;
+        }
+
+        long currentId = _populationWakePresentationCurrentActorId;
+        if (_populationPresentations.TryGetValue(currentId, out PopulationPresentationState active) &&
+            CanPresentPopulation(active) &&
+            _populationWakePresentationObserverCursor < _populationWakePresentationObservers.Count)
+        {
+            ClientSession observer = _populationWakePresentationObservers[_populationWakePresentationObserverCursor++];
+            // Validates the observer again and deduplicates against any parallel
+            // player-AOI visibility reconciliation that already spawned this NPC.
+            // Player may have moved since the first AOI discovery unit.
+            if (IsPopulationInObserverPartition(observer, active.Entity.Population.Actor) &&
+                PopulationDistanceSquared(observer, active.Entity.Population.Actor) <=
+                    Math.Max(1f, _options.AoiRange) * Math.Max(1f, _options.AoiRange))
+                AddPopulationVisibility(observer, active);
+        }
+        else
+        {
+            CompletePopulationWakePresentation();
+            return true;
+        }
+        if (_populationWakePresentationObserverCursor >= _populationWakePresentationObservers.Count)
+            CompletePopulationWakePresentation();
+        return true;
+    }
+
+    private void CompletePopulationWakePresentation()
+    {
+        _populationWakePresentationQueued.Remove(_populationWakePresentationCurrentActorId);
+        _populationWakePresentationCurrentActorId = 0;
+        _populationWakePresentationObserverCursor = 0;
+        _populationWakePresentationObservers.Clear();
+    }
 
     private void InitializePopulationPresentation()
     {
@@ -85,6 +177,11 @@ internal sealed partial class GameServerHost
         _populationObserverScratch.Clear();
         _populationActorIdScratch.Clear();
         _populationActorScratch.Clear();
+        _populationWakePresentationQueue.Clear();
+        _populationWakePresentationQueued.Clear();
+        _populationWakePresentationObservers.Clear();
+        _populationWakePresentationCurrentActorId = 0;
+        _populationWakePresentationObserverCursor = 0;
     }
 
     private PopulationPresentationState EnsurePopulationPresentation(PopulationActorRuntime population)
@@ -100,6 +197,9 @@ internal sealed partial class GameServerHost
             new ServerPopulationPresentationEntity(NextObjectId(), population),
             ResolvePopulationPublicInteractionFlags(population));
         _populationPresentations.Add(actorId, state);
+        state.WasPresentable = CanPresentPopulation(state);
+        // Populate cache on startup for pre-created NPCs, not during AOI wake.
+        CachePopulationAppearance(state);
         return state;
     }
 
@@ -119,6 +219,21 @@ internal sealed partial class GameServerHost
         if (state.SetPublicInteractionFlags(ResolvePopulationPublicInteractionFlags(population)))
             BroadcastPopulationAppearanceDelta(state);
 
+        bool presentable = CanPresentPopulation(state);
+        bool resumedFromHibernation = !state.WasPresentable && presentable;
+        state.WasPresentable = presentable;
+        if (resumedFromHibernation)
+        {
+            EnqueuePopulationWakePresentation(state);
+            return; // AOI publication executes via existing budgeted work units.
+        }
+        // While wake publication is queued, the next spawn includes the latest
+        // position and appearance state. Avoid an accidental eager fan-out.
+        if (presentable && !state.Entity.IsDead &&
+            _populationWakePresentationQueued.Contains(population.Actor.Handle.actorId))
+            return;
+        // Lethal state is urgent: do not delay a death snapshot for an
+        // observer who has already received the queued spawn.
         bool forceSnapshot = state.Entity.IsDead;
         ReconcilePopulationPresentation(state, queueSnapshot: true, forceSnapshot: forceSnapshot);
     }
@@ -160,6 +275,9 @@ internal sealed partial class GameServerHost
         long actorId = population.Actor.Handle.actorId;
         if (!_populationPresentations.TryGetValue(actorId, out PopulationPresentationState state))
             return;
+        _populationWakePresentationQueued.Remove(actorId);
+        if (_populationWakePresentationCurrentActorId == actorId)
+            CompletePopulationWakePresentation();
 
         _populationObserverScratch.Clear();
         foreach (ClientSession observer in state.Observers)
@@ -489,6 +607,26 @@ internal sealed partial class GameServerHost
     }
 
     private static void WritePopulationAppearance(
+        LiteNetLib.Utils.NetDataWriter writer,
+        PopulationPresentationState state)
+    {
+        if (state.CachedAppearanceBytes == null)
+            CachePopulationAppearance(state);
+        // Same exact existing appearance payload and protocol, without repeated
+        // recipe creation and serialization for each new observer.
+        writer.Put(state.CachedAppearanceBytes.AsSpan());
+    }
+
+    private static void CachePopulationAppearance(PopulationPresentationState state)
+    {
+        var cacheWriter = new LiteNetLib.Utils.NetDataWriter();
+        WriteUncachedPopulationAppearance(cacheWriter, state);
+        byte[] data = new byte[cacheWriter.Length];
+        Buffer.BlockCopy(cacheWriter.Data, 0, data, 0, data.Length);
+        state.CachedAppearanceBytes = data;
+    }
+
+    private static void WriteUncachedPopulationAppearance(
         LiteNetLib.Utils.NetDataWriter writer,
         PopulationPresentationState state)
     {

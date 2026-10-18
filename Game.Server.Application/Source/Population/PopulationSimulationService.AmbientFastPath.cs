@@ -58,8 +58,6 @@ namespace Game.Server.Application.Population
                     }
                 }
             }
-            Console.WriteLine($"[PopulationRoute] static lane certification map={graph.Map.mapId} " +
-                              $"instance={graph.Map.instanceId} valid={accepted} invalid={rejected}");
         }
 
         // Authored route travel does not examine dynamic doors or props each step.

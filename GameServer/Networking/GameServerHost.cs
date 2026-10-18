@@ -219,6 +219,7 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         private readonly List<PopulationPlayerView> _players = new List<PopulationPlayerView>(128);
         private long _preparedTick = long.MinValue;
         private double _nextActivationCheckAt;
+        private bool _lastUnitWasWakePresentation;
 
         public PopulationSimulationSystem(GameServerHost owner) => _owner = owner;
         public string Name => "PopulationAuthority";
@@ -226,7 +227,15 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         {
             get
             {
+                // Drain pending Population wake presentation through this SAME
+                // cooperative scheduler system; never open another timer/channel.
+                if (_owner.HasPendingPopulationWakePresentation)
+                    return true;
                 double now = _owner._scheduler.ServerTime;
+                // With no admitted players, dormant ambient Population has no
+                // activation work. Genuine scheduled actor work is still serviced.
+                if (_owner._readySessionsByCharacterId.Count == 0)
+                    return _owner._runtime.Population.HasDueScheduledActorWork(now);
                 if (_owner._runtime.Population.HasDueWork(now))
                     return true;
                 return _owner._runtime.Population.HibernatingCount > 0 &&
@@ -237,6 +246,19 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
 
         public void ExecuteOneWorkUnit(in CoreTickContext context)
         {
+            // A wake has already restored gameplay/spatial authority. Fan out its
+            // visual spawn separately, one existing-AOI observer per work unit,
+            // so a synchronous spawn cannot compound with another NPC wake.
+            // Alternate with actor simulation when actual due work exists.
+            // When no actor is due, drain queued visual work without no-op ticks.
+            bool actorDue = _owner._runtime.Population.HasDueScheduledActorWork(context.Now);
+            if ((!_lastUnitWasWakePresentation || !actorDue) &&
+                _owner.ExecuteOnePopulationWakePresentationWorkUnit())
+            {
+                _lastUnitWasWakePresentation = true;
+                return;
+            }
+            _lastUnitWasWakePresentation = false;
             if (_preparedTick != context.TickIndex)
             {
                 _preparedTick = context.TickIndex;
@@ -511,9 +533,7 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         StartCharacterLeaseRenewalLoop(cancellationToken);
         ScheduleReplicationDiagnostics();
         StartBackendEventStream(cancellationToken);
-        Console.WriteLine($"GameServer listening on LiteNetLib UDP 0.0.0.0:{_options.Port}");
-        Console.WriteLine($"Backend internal API: {_runtime.Backend.BaseUrl}");
-        Console.WriteLine($"Protocol: packet={PacketVersion}, player={PlayerEntityProtocol.Version}, tick={_options.TickRate} Hz");
+        Console.WriteLine("SERVER START UP COMPLETED.");
 
         try
         {

@@ -27,7 +27,7 @@ internal static class ServerMapDataLoader
         {
             if (required)
                 throw new DirectoryNotFoundException($"Required server-map directory was not found: {fullPath}");
-            Console.WriteLine($"Server map data: no directory at {fullPath}; legacy flat movement compatibility remains active.");
+            Console.Error.WriteLine($"Server map data directory missing: {fullPath}; legacy movement compatibility active.");
             return Array.Empty<ServerMapSnapshot>();
         }
 
@@ -60,14 +60,13 @@ internal static class ServerMapDataLoader
         if (required && maps.Count == 0)
             throw new InvalidOperationException($"No *.servermap.json files were found in required map directory: {fullPath}");
 
-        Console.WriteLine($"Server map data: loaded {maps.Count} baked map partition(s) from {fullPath}");
         return maps;
     }
 
 
     private sealed class RouteLayerFile
     {
-        public int formatVersion;
+        public int formatVersion = 0;
         public string mapId = string.Empty;
         public string instanceId = string.Empty;
         public string coreContentHash = string.Empty;
@@ -78,7 +77,7 @@ internal static class ServerMapDataLoader
 
     private sealed class SpawnLayerFile
     {
-        public int formatVersion;
+        public int formatVersion = 0;
         public string mapId = string.Empty;
         public string instanceId = string.Empty;
         public string coreContentHash = string.Empty;
@@ -122,10 +121,8 @@ internal static class ServerMapDataLoader
             snapshot.populationNodes = Array.Empty<ServerPopulationRouteNode>();
             snapshot.populationEdges = Array.Empty<ServerPopulationRouteEdge>();
             snapshot.populationPortals = Array.Empty<ServerPopulationPortal>();
-            Console.WriteLine($"World route layer absent for map '{snapshot.mapId}'; no baked Population routes loaded.");
+            Console.Error.WriteLine($"World route layer absent for map '{snapshot.mapId}'; no baked Population routes loaded.");
         }
-        Console.WriteLine($"World layers: map='{snapshot.mapId}', spawns={snapshot.spawnAnchors.Length}, " +
-            $"nodes={snapshot.populationNodes.Length}, edges={snapshot.populationEdges.Length}");
     }
 
     private static void ValidateLayer(
@@ -223,12 +220,7 @@ internal static class ServerMapDataLoader
                 $"Shared world hash mismatch for map '{snapshot.mapId}'. Re-bake the Unity scene.");
         }
 
-        Console.WriteLine(
-            $"Shared world: map='{snapshot.mapId}', format={info.formatVersion}, file={fileName}, hash={ShortHash(actualHash)}");
     }
-
-    private static string ShortHash(string value) =>
-        string.IsNullOrWhiteSpace(value) ? string.Empty : value[..Math.Min(12, value.Length)];
 
     private static void ValidateNavMesh(
         string mapDirectory,
@@ -283,11 +275,6 @@ internal static class ServerMapDataLoader
             throw new InvalidDataException(
                 $"Server NavMesh for map '{snapshot.mapId}' contains no populated tiles.");
 
-        Console.WriteLine(
-            $"Server NavMesh: map='{snapshot.mapId}', tiles={tiles}, " +
-            $"agent={info.agentRadius:0.###}r/{info.agentHeight:0.###}h, " +
-            $"climb={info.agentMaxClimb:0.###}, slope={info.agentMaxSlope:0.#}°, " +
-            $"file={fileName}");
     }
 
     private static string Sha256(string path)

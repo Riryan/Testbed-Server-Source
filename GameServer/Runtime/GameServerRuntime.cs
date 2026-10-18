@@ -248,8 +248,6 @@ internal sealed class GameServerRuntime : IDisposable
         // is enabled, so zero active maps here means "not authoritative", not "missing bake".
         if (Maps.Count == 0)
         {
-            Console.WriteLine(
-                "First spawn readiness: this GameServer currently owns no authoritative maps; character creation is handled by the assigned map owner.");
             return;
         }
 
@@ -274,8 +272,6 @@ internal sealed class GameServerRuntime : IDisposable
 
         if (!Maps.TryGet(requested.MapId, requested.InstanceId, out _))
         {
-            Console.WriteLine(
-                $"First spawn readiness: map '{requested.MapId}' instance '{DisplayInstance(requested.InstanceId)}' is not owned by this GameServer; validation is delegated to its authoritative owner.");
             return;
         }
 
@@ -285,9 +281,6 @@ internal sealed class GameServerRuntime : IDisposable
                 $"Canonical first-spawn readiness failed for map '{requested.MapId}' instance '{DisplayInstance(requested.InstanceId)}': {detail}");
         }
 
-        Console.WriteLine(
-            $"First spawn ready: map='{resolved.MapId}', instance='{DisplayInstance(resolved.InstanceId)}', " +
-            $"position=({resolved.Position.X:0.###},{resolved.Position.Y:0.###},{resolved.Position.Z:0.###}), yaw={resolved.YawDegrees:0.###}°");
     }
 
     private static string DisplayInstance(string value) =>

@@ -205,6 +205,23 @@ namespace Game.Server.Application.Population
                 Players.Add(player);
                 if (player.CharacterId > 0)
                     ByCharacterId[player.CharacterId] = player;
+
+                // The existing small-party proximity paths scan Players directly.
+                // Do not rebuild a secondary cell index for 1..8 players. If a
+                // partition grows to 9, index its existing 8 players exactly once.
+                if (Players.Count <= 8)
+                    return;
+                if (Players.Count == 9)
+                {
+                    for (int i = 0; i < Players.Count; ++i)
+                        AddPlayerToCell(Players[i]);
+                    return;
+                }
+                AddPlayerToCell(player);
+            }
+
+            private void AddPlayerToCell(PopulationPlayerView player)
+            {
                 int x = ToPlayerCell(player.Position.X);
                 int z = ToPlayerCell(player.Position.Z);
                 long key = PackPlayerCell(x, z);
@@ -219,6 +236,10 @@ namespace Game.Server.Application.Population
 
         private readonly Dictionary<string, PlayerSpatialPartition> _playersByPartition =
             new Dictionary<string, PlayerSpatialPartition>(StringComparer.Ordinal);
+        // One reusable copy of the last exact player view snapshot. Do not rebuild
+        // partitions when no player position, map, identity or alive flag changed.
+        private readonly List<PopulationPlayerView> _lastPreparedPlayerViews =
+            new List<PopulationPlayerView>(128);
         private readonly Dictionary<string, Dictionary<long, List<PopulationActorRuntime>>> _hibernatedByPartition =
             new Dictionary<string, Dictionary<long, List<PopulationActorRuntime>>>(StringComparer.Ordinal);
         private readonly HashSet<PopulationActorRuntime> _activationScratch = new HashSet<PopulationActorRuntime>();
@@ -255,7 +276,10 @@ namespace Game.Server.Application.Population
         // a dense hibernated crowd; the next AI heartbeat resumes the same spatial cell.
         private const int MaxWakeCellsPerPass = 16;
         private const int MaxWakeActorsCheckedPerPass = 32;
-        private const int MaxWakeActionsPerPass = 1;
+        // Two candidate resumes at most per scan, with an elapsed-time guard below.
+        // Genuine portal releases retain all existing admission/clearance limits.
+        private const int MaxWakeActionsPerPass = 2;
+        private const double MaxWakeResumeWorkMillisecondsPerPass = 1.50d;
         private const int MaxStaleSchedulePrunesPerCall = 32;
         private readonly List<AuthoritativeActorRuntime> _nearbyScratch = new List<AuthoritativeActorRuntime>();
         private readonly Dictionary<long, PortalReleaseState> _portalReleaseStates =
@@ -287,6 +311,9 @@ namespace Game.Server.Application.Population
         private SlowWorkPhase _diagnosticPhase;
         private long _diagnosticActorId;
         private double _diagnosticPrepareMs;
+        private double _diagnosticPartitionRebuildMs;
+        private int _diagnosticPreparedPlayers;
+        private bool _diagnosticPartitionRebuilt;
         private double _diagnosticActorMs;
         // Separate the movement/collision runtime from actor spatial publication
         // and the existing Population.Changed observer-presentation callback.
@@ -298,6 +325,10 @@ namespace Game.Server.Application.Population
         private double _diagnosticDistanceMs;
         private double _diagnosticWakeScanMs;
         private double _diagnosticWakeAdmissionMs;
+        private double _diagnosticWakeSpatialMs;
+        private double _diagnosticWakeActorPublishMs;
+        private double _diagnosticWakeObserverPublishMs;
+        private double _diagnosticWakeScheduleMs;
         private double _diagnosticPortalMs;
         private double _diagnosticCatchUpMs;
         private int _diagnosticCatchUpHops;
@@ -332,6 +363,8 @@ namespace Game.Server.Application.Population
             Console.Error.WriteLine(
                 $"[PopulationAuthority] Slow-work detail: unit={operation}, total={totalMs:F3}ms, " +
                 $"phase={_diagnosticPhase}, prep={_diagnosticPrepareMs:F3}ms, " +
+                $"prepPartition={_diagnosticPartitionRebuildMs:F3}ms, prepPlayers={_diagnosticPreparedPlayers}, " +
+                $"prepRebuilt={_diagnosticPartitionRebuilt}, " +
                 $"actor={_diagnosticActorId}, actorWork={_diagnosticActorMs:F3}ms, distance={_diagnosticDistanceMs:F3}ms, " +
                 $"motorCollision={_diagnosticMotorCollisionMs:F3}ms/{_diagnosticMotorCalls}calls, " +
                 $"ambientSweep={_diagnosticAmbientCollisionMs:F3}ms/{_diagnosticAmbientSamples}samples, " +
@@ -339,6 +372,8 @@ namespace Game.Server.Application.Population
                 $"actorPublish={_diagnosticActorPublishMs:F3}ms, " +
                 $"observerPresentation={_diagnosticObserverPresentationMs:F3}ms, " +
                 $"actorOther={otherActorMs:F3}ms, wakeScan={_diagnosticWakeScanMs:F3}ms, wakeAdmission={_diagnosticWakeAdmissionMs:F3}ms, " +
+                $"wakeSpatial={_diagnosticWakeSpatialMs:F3}ms, wakeActorPublish={_diagnosticWakeActorPublishMs:F3}ms, " +
+                $"wakeObserverPublish={_diagnosticWakeObserverPublishMs:F3}ms, wakeSchedule={_diagnosticWakeScheduleMs:F3}ms, " +
                 $"portal={_diagnosticPortalMs:F3}ms, catchUp={_diagnosticCatchUpMs:F3}ms/{_diagnosticCatchUpHops}hops, " +
                 $"wakeCells={_diagnosticWakeCells}, wakeActors={_diagnosticWakeActorChecks}, " +
                 $"origins={_diagnosticWakeOrigins}, candidates={_diagnosticWakeCandidates}, " +
@@ -493,6 +528,9 @@ namespace Game.Server.Application.Population
             // left behind by the preceding actor work unit.
             _diagnosticActorId = 0;
             _diagnosticActorMs = 0d;
+            _diagnosticPartitionRebuildMs = 0d;
+            _diagnosticPartitionRebuilt = false;
+            _diagnosticPreparedPlayers = players?.Count ?? 0;
             _diagnosticMotorCollisionMs = 0d;
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
@@ -515,16 +553,37 @@ namespace Game.Server.Application.Population
 
         private void PrepareBudgetedTickCore(IReadOnlyList<PopulationPlayerView> players, double now)
         {
-            // Reuse partitions across the handoff to keep the wake invocation
-            // independent from the player-partition rebuild. A full disconnect
-            // invalidates that snapshot immediately, preventing phantom wakes.
-            if (!_activationHandoffReady || players == null || players.Count == 0)
-                BuildPlayerPartitions(players);
-            if (_hibernatingCount <= 0)
-                _activationHandoffPending = _activationHandoffReady = false;
-            else if (now + 0.000001d >= _nextActivationHeartbeatAt &&
-                     !_activationHandoffPending && !_activationHandoffReady)
-                _activationHandoffPending = true;
+            // No observer => no partition bookkeeping or activation handoff.
+            // Scheduled death/decay upkeep remains independent of this snapshot.
+            if (players == null || players.Count == 0)
+            {
+                if (_playersByPartition.Count > 0)
+                    _playersByPartition.Clear();
+                if (_lastPreparedPlayerViews.Count > 0)
+                    _lastPreparedPlayerViews.Clear();
+                _activationHandoffPending = false;
+                _activationHandoffReady = false;
+            }
+            else
+            {
+                // Preserve the previous partition across an in-flight handoff.
+                // In ordinary ticks rebuild ONLY when the exact observer snapshot
+                // has changed; never hide real player movement behind a tolerance.
+                if (!_activationHandoffReady &&
+                    (_playersByPartition.Count == 0 || PlayerViewsChanged(players)))
+                {
+                    long partitionStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                    BuildPlayerPartitions(players);
+                    CachePreparedPlayerViews(players);
+                    _diagnosticPartitionRebuildMs = ElapsedDiagnosticMilliseconds(partitionStartedAt);
+                    _diagnosticPartitionRebuilt = true;
+                }
+                if (_hibernatingCount <= 0)
+                    _activationHandoffPending = _activationHandoffReady = false;
+                else if (now + 0.000001d >= _nextActivationHeartbeatAt &&
+                         !_activationHandoffPending && !_activationHandoffReady)
+                    _activationHandoffPending = true;
+            }
             _ambientAdmissionsThisTick = 0;
             _ambientAttemptsThisTick = 0;
             _ambientActiveCountSnapshot = -1;
@@ -541,10 +600,17 @@ namespace Game.Server.Application.Population
             // work unit from TickNextBudgeted at its own heartbeat cadence.
         }
 
-        public bool HasDueWork(double now)
+        // Allows the host to service genuine due actor work with zero observers,
+        // without running the dormant AOI activation heartbeat.
+        public bool HasDueScheduledActorWork(double now)
         {
             PruneStaleScheduleHeads();
-            if (_dueSchedule.TryPeek(out _, out double due) && due <= now + 0.000001d)
+            return _dueSchedule.TryPeek(out _, out double due) && due <= now + 0.000001d;
+        }
+
+        public bool HasDueWork(double now)
+        {
+            if (HasDueScheduledActorWork(now))
                 return true;
 
             // One lightweight shared heartbeat is enough to discover player proximity for all
@@ -568,6 +634,10 @@ namespace Game.Server.Application.Population
             _diagnosticDistanceMs = 0d;
             _diagnosticWakeScanMs = 0d;
             _diagnosticWakeAdmissionMs = 0d;
+            _diagnosticWakeSpatialMs = 0d;
+            _diagnosticWakeActorPublishMs = 0d;
+            _diagnosticWakeObserverPublishMs = 0d;
+            _diagnosticWakeScheduleMs = 0d;
             _diagnosticPortalMs = 0d;
             _diagnosticCatchUpMs = 0d;
             _diagnosticCatchUpHops = 0;
@@ -613,10 +683,10 @@ namespace Game.Server.Application.Population
                 if (_hibernatingCount > 0 && now + 0.000001d >= _nextActivationHeartbeatAt)
                 {
                     WakeHibernatedNearPlayers(now);
-                    // Continue a dense scan at most twice per second; otherwise
-                    // preserve the existing one-second activation heartbeat.
+                    // Briefly accelerate only while candidates are being resumed
+                    // or there is an incomplete scan. No new heartbeat or timer.
                     _nextActivationHeartbeatAt = now + (_wakeScanPending
-                        ? 0.50d
+                        ? 0.20d
                         : Math.Max(0.25d, ActivationHeartbeatSeconds));
                 }
                 return true;
@@ -838,6 +908,35 @@ namespace Game.Server.Application.Population
             }
         }
 
+        private bool PlayerViewsChanged(IReadOnlyList<PopulationPlayerView> players)
+        {
+            if (_lastPreparedPlayerViews.Count != players.Count)
+                return true;
+            // Order changes trigger a safe rebuild. Nothing is inferred: no
+            // position rounding, no position prediction, no stale AOI locations.
+            for (int i = 0; i < players.Count; ++i)
+            {
+                PopulationPlayerView current = players[i];
+                PopulationPlayerView previous = _lastPreparedPlayerViews[i];
+                if (current.CharacterId != previous.CharacterId ||
+                    current.Alive != previous.Alive ||
+                    !string.Equals(current.MapId, previous.MapId, StringComparison.Ordinal) ||
+                    !string.Equals(current.InstanceId, previous.InstanceId, StringComparison.Ordinal) ||
+                    current.Position.X != previous.Position.X ||
+                    current.Position.Y != previous.Position.Y ||
+                    current.Position.Z != previous.Position.Z)
+                    return true;
+            }
+            return false;
+        }
+
+        private void CachePreparedPlayerViews(IReadOnlyList<PopulationPlayerView> players)
+        {
+            _lastPreparedPlayerViews.Clear();
+            for (int i = 0; i < players.Count; ++i)
+                _lastPreparedPlayerViews.Add(players[i]);
+        }
+
         private void BuildPlayerPartitions(IReadOnlyList<PopulationPlayerView> players)
         {
             foreach (PlayerSpatialPartition partition in _playersByPartition.Values)
@@ -1009,7 +1108,7 @@ namespace Game.Server.Application.Population
                 return false;
 
             if (pop.AwaitingPlayerActivation)
-                WakeImmediately(pop, now, catchUp: true);
+                WakeImmediately(pop, now, catchUp: false);
 
             severity = Math.Clamp(severity, 0f, 1f);
             pop.ThreatPosition = threatPosition;
@@ -2944,28 +3043,30 @@ namespace Game.Server.Application.Population
             _diagnosticWakeScanMs = ElapsedDiagnosticMilliseconds(wakeStartedAt);
             long admissionStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            // No temporary array allocation. Wake callbacks can modify the hibernation
-            // index, but not this independent HashSet. Portal rate/density/clearance checks
-            // and canonical wake/catch-up behavior remain owned by existing methods.
+            // An already-created, already-positioned civilian resumes from its
+            // existing route state. This is NOT a new portal spawn and must NOT
+            // consume portal/density admission slots or global spawn cooldowns.
+            // One expensive reactivation cannot multiply into a long batch spike.
             foreach (PopulationActorRuntime pop in _activationScratch)
             {
+                if (_diagnosticWakeAdmitted > 0 &&
+                    ElapsedDiagnosticMilliseconds(admissionStartedAt) >= MaxWakeResumeWorkMillisecondsPerPass)
+                    break;
                 if (pop == null || !pop.AwaitingPlayerActivation)
                     continue;
                 if (pop.AiState == PopulationAiState.PortalDormant)
                 {
+                    // TRUE portal release: preserve authored cadence, live clearance,
+                    // density and global admission throttles unchanged.
                     long portalStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
                     WakePortalDormantImmediately(pop, now);
                     _diagnosticPortalMs += ElapsedDiagnosticMilliseconds(portalStartedAt);
                 }
                 else
                 {
-                    // The cap is shared across every player/spawner, not per player.
-                    WorldPosition wakePosition = pop.HibernationPosition;
-                    if (!CanAdmitAmbient(pop, wakePosition, now))
-                        continue;
-                    WakeImmediately(pop, now, catchUp: true);
-                    if (!pop.AwaitingPlayerActivation && pop.Actor.Alive)
-                        RecordAmbientAdmission(pop, wakePosition, now);
+                    // Precreated or previously active NPC: spatial re-entry only.
+                    // AOI observers still receive the canonical PlayerEntity spawn.
+                    WakeImmediately(pop, now, catchUp: false);
                 }
                 if (!pop.AwaitingPlayerActivation)
                     ++_diagnosticWakeAdmitted;
@@ -2973,7 +3074,8 @@ namespace Game.Server.Application.Population
             _diagnosticWakeAdmissionMs = ElapsedDiagnosticMilliseconds(admissionStartedAt);
             _activationScratch.Clear();
 
-            _wakeScanPending = cellChecks >= MaxWakeCellsPerPass ||
+            _wakeScanPending = _diagnosticWakeAdmitted > 0 ||
+                               cellChecks >= MaxWakeCellsPerPass ||
                                actorChecks >= MaxWakeActorsCheckedPerPass ||
                                completedPlayers < _wakeSearchPlayers.Count;
         }
@@ -3070,10 +3172,20 @@ namespace Game.Server.Application.Population
                 return;
             }
 
+            // Wake profiling is included only in the existing severe-work warning.
+            // It measures the previously opaque synchronous presentation callbacks.
+            long stage = System.Diagnostics.Stopwatch.GetTimestamp();
             _actors.ResumeSpatial(pop.Actor);
+            _diagnosticWakeSpatialMs += ElapsedDiagnosticMilliseconds(stage);
+            stage = System.Diagnostics.Stopwatch.GetTimestamp();
             _actors.PublishChanged(pop.Actor);
+            _diagnosticWakeActorPublishMs += ElapsedDiagnosticMilliseconds(stage);
+            stage = System.Diagnostics.Stopwatch.GetTimestamp();
             Changed?.Invoke(pop);
+            _diagnosticWakeObserverPublishMs += ElapsedDiagnosticMilliseconds(stage);
+            stage = System.Diagnostics.Stopwatch.GetTimestamp();
             ScheduleNow(pop, now);
+            _diagnosticWakeScheduleMs += ElapsedDiagnosticMilliseconds(stage);
         }
 
         private void AdvanceLogicalElapsed(PopulationActorRuntime pop, double now)

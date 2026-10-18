@@ -20,7 +20,6 @@ internal static class StaffAuthorizationLoader
             Environment.CurrentDirectory);
         if (!File.Exists(fullPath))
         {
-            Console.WriteLine($"Staff authorization: no file at {fullPath}; no accounts receive staff authority.");
             return Array.Empty<StaffAuthorizationSnapshot>();
         }
 
@@ -33,7 +32,6 @@ internal static class StaffAuthorizationLoader
                 continue;
             valid.Add(entry);
         }
-        Console.WriteLine($"Staff authorization: loaded {valid.Count} server-authorized account(s) from {fullPath}");
         return valid;
     }
 }
