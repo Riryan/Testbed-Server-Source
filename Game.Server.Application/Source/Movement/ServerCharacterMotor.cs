@@ -62,6 +62,11 @@ namespace Game.Server.Application.Movement
         private readonly CharacterMotorSettings _settings;
         private readonly ServerCapsule _capsule;
 
+        public double LastTickPreparationMs { get; private set; }
+        public double LastTickHorizontalCollisionMs { get; private set; }
+        public double LastTickPostCollisionMs { get; private set; }
+        public double LastTickOtherMs { get; private set; }
+
         public ServerCharacterMotor(CharacterMotorSettings settings = null)
         {
             _settings = settings ?? new CharacterMotorSettings();
@@ -86,13 +91,23 @@ namespace Game.Server.Application.Movement
             bool allowWallSlide,
             out bool blocked)
         {
+            long tickStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            long stageStartedAt = tickStartedAt;
+            LastTickPreparationMs = 0d;
+            LastTickHorizontalCollisionMs = 0d;
+            LastTickPostCollisionMs = 0d;
+            LastTickOtherMs = 0d;
             blocked = false;
             if (state == null || fixedDelta <= 0f || float.IsNaN(fixedDelta) || float.IsInfinity(fixedDelta))
+            {
+                LastTickOtherMs = ElapsedMillisecondsSince(tickStartedAt);
                 return;
+            }
 
             if (state.Mode == ActorMovementMode.Dead || state.Mode == ActorMovementMode.InteractionLocked ||
                 state.Mode == ActorMovementMode.Vaulting || state.Mode == ActorMovementMode.Ladder || state.Mode == ActorMovementMode.Mounted)
             {
+                LastTickOtherMs = ElapsedMillisecondsSince(tickStartedAt);
                 return;
             }
 
@@ -110,6 +125,7 @@ namespace Game.Server.Application.Movement
             float speed = intent.Sprint ? _settings.SprintSpeed : _settings.WalkSpeed;
             float dx = x * speed * fixedDelta;
             float dz = z * speed * fixedDelta;
+            LastTickPreparationMs = ElapsedMillisecondsSince(stageStartedAt);
 
             if (collisionWorld == null)
             {
@@ -118,9 +134,12 @@ namespace Game.Server.Application.Movement
                 state.Grounded = true;
                 state.Mode = ActorMovementMode.Grounded;
                 state.VerticalVelocity = 0f;
+                LastTickPostCollisionMs = ElapsedMillisecondsSince(tickStartedAt) - LastTickPreparationMs;
                 return;
             }
 
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            WorldPosition previousPosition = state.Position;
             WorldPosition moved = collisionWorld.ResolveHorizontalMove(
                 state.Position,
                 dx,
@@ -132,8 +151,11 @@ namespace Game.Server.Application.Movement
                 state.Grounded,
                 allowWallSlide,
                 out blocked);
+            LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
 
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             bool canJump = state.Grounded && state.Mode == ActorMovementMode.Grounded;
+            bool groundedPoseValidated = false;
             if (intent.Jump && canJump)
             {
                 state.Grounded = false;
@@ -150,6 +172,11 @@ namespace Game.Server.Application.Movement
                     _settings.MaximumSlopeDegrees,
                     out ServerGroundHit ground))
             {
+                // ResolveHorizontalMove validates each accepted grounded pose against
+                // the live dynamic blockers and standing capsule clearance. The support
+                // query below confirms the final walk surface, so a second full collision
+                // scan at the same pose is redundant for this branch.
+                groundedPoseValidated = true;
                 // Keep the elevated feet through a small stair/curb edge when the
                 // downward settle would intersect the outgoing riser. Once the full
                 // capsule can descend, the same query lands it on real baked ground.
@@ -220,9 +247,32 @@ namespace Game.Server.Application.Movement
             }
 
             state.Position = moved;
-            if (state.Grounded && collisionWorld.IsCapsuleClear(state.Position, _capsule))
-                state.LastSafePosition = state.Position;
+            if (state.Grounded)
+            {
+                if (groundedPoseValidated)
+                {
+                    // A stationary or fully blocked actor remains at its previous safe
+                    // position. Only advance the recovery point after a changed pose was
+                    // accepted by the grounded resolver above.
+                    if ((Math.Abs(dx) > 0.000001f || Math.Abs(dz) > 0.000001f) &&
+                        moved != previousPosition)
+                        state.LastSafePosition = state.Position;
+                }
+                else if (collisionWorld.IsCapsuleClear(state.Position, _capsule))
+                {
+                    // Falling/landing paths have not gone through grounded horizontal
+                    // clearance and retain the full physical validation.
+                    state.LastSafePosition = state.Position;
+                }
+            }
+            LastTickPostCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
+            LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
+                LastTickPreparationMs - LastTickHorizontalCollisionMs - LastTickPostCollisionMs);
         }
+
+        private static double ElapsedMillisecondsSince(long startedAt) =>
+            (System.Diagnostics.Stopwatch.GetTimestamp() - startedAt) *
+            (1000d / System.Diagnostics.Stopwatch.Frequency);
 
         private bool CanSettleGroundHeight(
             ServerCollisionWorld world, WorldPosition current, float supportY)

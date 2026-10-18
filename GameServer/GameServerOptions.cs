@@ -22,7 +22,7 @@ internal sealed class GameServerOptions
     public double PassiveResourceHz { get; private set; } = 1.0;
     public bool CombatWireDiagnostics { get; private set; }
     public bool CombatTestDummy { get; private set; }
-    public float AoiRange { get; private set; } = 48f;
+    public float AoiRange { get; private set; } = 36f;
     public float CombatPresentationRange { get; private set; } = 36f;
     public float AoiExitPadding { get; private set; } = 8f;
     public float AoiCellSize { get; private set; } = 32f;

@@ -27,6 +27,38 @@ namespace Game.Shared.World
             if (string.IsNullOrWhiteSpace(value))
                 return string.Empty;
 
+            // Map IDs stored in runtime locations and baked catalogs are already in this
+            // canonical form. Preserve the original string so hot dictionary lookups do
+            // not allocate a temporary char array and replacement string on every query.
+            bool previousUnderscore = false;
+            bool alreadyCanonical = true;
+            for (int i = 0; i < value.Length; ++i)
+            {
+                char c = value[i];
+                if (c == '_')
+                {
+                    if (i == 0 || i == value.Length - 1 || previousUnderscore)
+                    {
+                        alreadyCanonical = false;
+                        break;
+                    }
+                    previousUnderscore = true;
+                    continue;
+                }
+
+                previousUnderscore = false;
+                if (!((c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') ||
+                      c == '-'))
+                {
+                    alreadyCanonical = false;
+                    break;
+                }
+            }
+
+            if (alreadyCanonical)
+                return value;
+
             value = value.Trim().ToLowerInvariant();
             char[] buffer = new char[value.Length];
             int length = 0;

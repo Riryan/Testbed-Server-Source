@@ -281,6 +281,17 @@ namespace LiteNetLibManager
     }
 
     /// <summary>
+    /// Optional context added to an existing budget-overrun warning. Implementations
+    /// should keep these getters cheap; the scheduler reads them only when it emits a
+    /// warning, never on the normal work path.
+    /// </summary>
+    public interface ICoreBudgetedWorkDiagnosticContext
+    {
+        string PrepareDiagnosticContext { get; }
+        string WorkUnitDiagnosticContext { get; }
+    }
+
+    /// <summary>
     /// Optional preparation hook for budgeted systems that need to snapshot or reset their
     /// work cursor once per scheduler tick before HasPendingWork is evaluated.
     /// </summary>
@@ -1048,7 +1059,7 @@ namespace LiteNetLibManager
                 {
                     double elapsed = ElapsedMilliseconds(prepareStart);
                     prepareOverran = elapsed >= entry.InvocationLimitMilliseconds;
-                    RecordInvocation(entry, elapsed, channel, prepareFailed);
+                    RecordInvocation(entry, elapsed, channel, prepareFailed, "prepare");
                 }
 
                 // Preparation is a cooperative work unit too. Do not compound an
@@ -1079,7 +1090,7 @@ namespace LiteNetLibManager
                 {
                     double elapsed = ElapsedMilliseconds(start);
                     workUnitOverran = elapsed >= entry.InvocationLimitMilliseconds;
-                    RecordInvocation(entry, elapsed, channel, failed);
+                    RecordInvocation(entry, elapsed, channel, failed, "workUnit", units + 1);
                 }
 
                 units++;
@@ -1091,7 +1102,13 @@ namespace LiteNetLibManager
             }
         }
 
-        private void RecordInvocation(Entry entry, double elapsedMilliseconds, Channel channel, bool failed)
+        private void RecordInvocation(
+            Entry entry,
+            double elapsedMilliseconds,
+            Channel channel,
+            bool failed,
+            string invocation = null,
+            int workUnitIndex = 0)
         {
             entry.LastInvocationMilliseconds = elapsedMilliseconds;
             if (elapsedMilliseconds > entry.MaximumInvocationMilliseconds)
@@ -1117,9 +1134,10 @@ namespace LiteNetLibManager
 
                 if (_settings.logStartupGraceOverruns && _serverTime >= entry.NextWarningTime)
                 {
+                    string diagnosticContext = GetBudgetedWorkDiagnosticContext(entry, invocation, workUnitIndex);
                     CoreRuntimeSchedulerLog.Info(
                         $"[CoreRuntimeScheduler] Startup grace: system '{entry.Name}' in channel '{channel.Config.name}' " +
-                        $"took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
+                        $"{diagnosticContext}took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
                         $"Measured, no strike. Grace remaining {StartupGraceRemainingSeconds:F2}s.");
                     entry.NextWarningTime = _serverTime + _settings.warningCooldownSeconds;
                 }
@@ -1136,9 +1154,10 @@ namespace LiteNetLibManager
             {
                 if (_serverTime >= entry.NextWarningTime)
                 {
+                    string diagnosticContext = GetBudgetedWorkDiagnosticContext(entry, invocation, workUnitIndex);
                     CoreRuntimeSchedulerLog.Warning(
                         $"[CoreRuntimeScheduler] Budgeted system '{entry.Name}' in channel '{channel.Config.name}' " +
-                        $"took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
+                        $"{diagnosticContext}took {elapsedMilliseconds:F3} ms (limit {entry.InvocationLimitMilliseconds:F3} ms). " +
                         "Further work deferred; no quarantine strike for a successful work unit.");
                     entry.NextWarningTime = _serverTime + _settings.warningCooldownSeconds;
                 }
@@ -1168,6 +1187,28 @@ namespace LiteNetLibManager
 
             CoreRuntimeSchedulerLog.Error(
                 $"[CoreRuntimeScheduler] Quarantined system '{entry.Name}' in channel '{channel.Config.name}' for {duration:F1}s after repeated overruns.");
+        }
+
+        private static string GetBudgetedWorkDiagnosticContext(Entry entry, string invocation, int workUnitIndex)
+        {
+            if (string.IsNullOrEmpty(invocation))
+                return string.Empty;
+
+            string detail = string.Empty;
+            if (entry.WorkSystem is ICoreBudgetedWorkDiagnosticContext diagnostic)
+            {
+                detail = invocation == "prepare"
+                    ? diagnostic.PrepareDiagnosticContext
+                    : diagnostic.WorkUnitDiagnosticContext;
+            }
+
+            string invocationDetail = invocation == "workUnit"
+                ? $"workUnit={workUnitIndex}"
+                : invocation;
+
+            return string.IsNullOrWhiteSpace(detail)
+                ? $"invocation={invocationDetail} "
+                : $"invocation={invocationDetail}, {detail} ";
         }
 
         private void HandleSystemException(Entry entry, Exception ex)

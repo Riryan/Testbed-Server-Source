@@ -82,6 +82,10 @@ namespace Game.Server.Application.Population
         internal int PortalRespawnAttempts;
         internal double LastSimulationAt;
         internal double NextSimulationAt;
+        // Reuse actor map/instance keys across scheduled work; refresh only on change.
+        internal string CachedPartitionMapId;
+        internal string CachedPartitionInstanceId;
+        internal string CachedPartitionKey;
         internal double DeadDecayAt;
         internal uint ScheduleVersion;
         internal bool AwaitingPlayerActivation;
@@ -90,10 +94,6 @@ namespace Game.Server.Application.Population
         internal long HibernationCellKey;
         internal WorldPosition HibernationPosition;
         internal long PreviousNodeId;
-        // Small server-only per-journey state; no replication or per-actor timers.
-        internal long JourneyOriginPortalId;
-        internal float JourneyDistance;
-        internal int JourneyHops;
         internal WorldPosition HomePosition;
         internal WorldPosition RoamTarget;
         internal bool HasRoamTarget;
@@ -155,6 +155,12 @@ namespace Game.Server.Application.Population
             public ServerCollisionWorld Collision;
             public readonly Dictionary<(long From, long To), PopulationRouteSegment> Segments =
                 new Dictionary<(long From, long To), PopulationRouteSegment>();
+            // Compiled once from the baked edge order. Ambient civilians follow a stable
+            // successor instead of rescanning/weighting the graph or drawing a new route
+            // at every node arrival.
+            public readonly Dictionary<(long Node, long Previous, PopulationNpcType Type), ServerPopulationRouteEdge>
+                AmbientRouteSuccessors =
+                    new Dictionary<(long Node, long Previous, PopulationNpcType Type), ServerPopulationRouteEdge>();
             // Static route certificate: authored edge and one of the three actual
             // lane offsets (-1,0,+1). Built once per immutable map load.
             public readonly HashSet<(long From, long To, int Lane)> CertifiedLanes =
@@ -329,10 +335,31 @@ namespace Game.Server.Application.Population
         private int _diagnosticPreparedPlayers;
         private bool _diagnosticPartitionRebuilt;
         private double _diagnosticActorMs;
+        private double _diagnosticGcPauseMs;
+        private long _diagnosticActorAllocatedBytes;
+        private int _diagnosticGcGen0Collections;
+        private int _diagnosticGcGen1Collections;
+        private int _diagnosticGcGen2Collections;
+        private double _diagnosticDueQueueMs;
+        private int _diagnosticDueQueueChecks;
+        private double _diagnosticActorSetupMs;
+        private double _diagnosticRescheduleMs;
+        private int _diagnosticStaleScheduleHeadsPruned;
         // Separate the movement/collision runtime from actor spatial publication
         // and the existing Population.Changed observer-presentation callback.
         // These are passive elapsed-time counters, not a new execution route.
         private double _diagnosticMotorCollisionMs;
+        private double _diagnosticActiveGraphMs;
+        private double _diagnosticActiveEnsureNodeMs;
+        private double _diagnosticActiveRouteSetupMs;
+        private double _diagnosticActiveTargetMs;
+        private double _diagnosticActiveAmbientMs;
+        private double _diagnosticActiveFallbackMs;
+        private double _diagnosticDormantGraphMs;
+        private double _diagnosticDormantProximityMs;
+        private double _diagnosticDormantAdmissionMs;
+        private double _diagnosticDormantSpawnClearMs;
+        private double _diagnosticDormantActivateMs;
         private double _diagnosticRouteBindMs, _diagnosticRouteTravelMs, _diagnosticRouteArrivalMs;
         private double _diagnosticRouteRecoveryMs, _diagnosticRouteSelectMs;
         private int _diagnosticRouteBindings, _diagnosticStuckChecks, _diagnosticRouteReattachments;
@@ -370,10 +397,22 @@ namespace Game.Server.Application.Population
                 return;
 
             _nextSlowWorkDetailAt = now + SlowWorkDetailCooldownSeconds;
-            double otherActorMs = Math.Max(0d,
-                _diagnosticActorMs - _diagnosticDistanceMs - _diagnosticMotorCollisionMs -
-                _diagnosticAmbientCollisionMs -
-                _diagnosticActorPublishMs - _diagnosticObserverPresentationMs);
+            double otherActorMs = _diagnosticPhase == SlowWorkPhase.ActiveMotor
+                ? Math.Max(0d, _diagnosticActorMs - _diagnosticDistanceMs -
+                    _diagnosticActiveGraphMs - _diagnosticActiveEnsureNodeMs -
+                    _diagnosticActiveRouteSetupMs - _diagnosticActiveTargetMs -
+                    _diagnosticActiveAmbientMs - _diagnosticActiveFallbackMs)
+                : _diagnosticPhase == SlowWorkPhase.ActorDormant
+                ? Math.Max(0d, _diagnosticActorMs - _diagnosticDormantGraphMs -
+                    _diagnosticDormantProximityMs - _diagnosticDormantAdmissionMs -
+                    _diagnosticDormantSpawnClearMs - _diagnosticDormantActivateMs)
+                : Math.Max(0d, _diagnosticActorMs - _diagnosticDistanceMs -
+                    _diagnosticMotorCollisionMs - _diagnosticAmbientCollisionMs -
+                    _diagnosticActorPublishMs - _diagnosticObserverPresentationMs);
+            double outsideActorStagesMs = _diagnosticActorId == 0
+                ? 0d
+                : Math.Max(0d, totalMs - _diagnosticDueQueueMs - _diagnosticActorSetupMs -
+                    _diagnosticActorMs - _diagnosticRescheduleMs);
             // One bounded warning for a real slow unit, not one line per actor or
             // an independent timer. Values are durations of measured sub-steps;
             // they are not guaranteed to add up to the total wall-clock time.
@@ -383,6 +422,11 @@ namespace Game.Server.Application.Population
                 $"prepPartition={_diagnosticPartitionRebuildMs:F3}ms, prepPlayers={_diagnosticPreparedPlayers}, " +
                 $"prepRebuilt={_diagnosticPartitionRebuilt}, " +
                 $"actor={_diagnosticActorId}, actorWork={_diagnosticActorMs:F3}ms, distance={_diagnosticDistanceMs:F3}ms, " +
+                $"actorGcPause={_diagnosticGcPauseMs:F3}ms, actorAllocated={_diagnosticActorAllocatedBytes}B, " +
+                $"gcCollections={_diagnosticGcGen0Collections}/{_diagnosticGcGen1Collections}/{_diagnosticGcGen2Collections}, " +
+                $"dueQueueWork={_diagnosticDueQueueMs:F3}ms/{_diagnosticDueQueueChecks}checks/{_diagnosticStaleScheduleHeadsPruned}stalePruned, " +
+                $"actorSetup={_diagnosticActorSetupMs:F3}ms, actorReschedule={_diagnosticRescheduleMs:F3}ms, " +
+                $"outsideActorStages={outsideActorStagesMs:F3}ms, " +
                 $"motorCollision={_diagnosticMotorCollisionMs:F3}ms/{_diagnosticMotorCalls}calls, " +
                 $"ambientSweep={_diagnosticAmbientCollisionMs:F3}ms/{_diagnosticAmbientSamples}samples, " +
                 $"ambientFallbacks={_diagnosticAmbientFallbacks}, " +
@@ -391,6 +435,12 @@ namespace Game.Server.Application.Population
                 $"routeBind={_diagnosticRouteBindMs:F3}ms/{_diagnosticRouteBindings}binds, " +
                 $"routeSelect={_diagnosticRouteSelectMs:F3}ms, routeTravel={_diagnosticRouteTravelMs:F3}ms, routeArrival={_diagnosticRouteArrivalMs:F3}ms, " +
                 $"routeRecovery={_diagnosticRouteRecoveryMs:F3}ms/{_diagnosticStuckChecks}checks/{_diagnosticRouteReattachments}reattach, " +
+                $"activeGraph={_diagnosticActiveGraphMs:F3}ms, activeEnsureNode={_diagnosticActiveEnsureNodeMs:F3}ms, " +
+                $"activeRouteSetup={_diagnosticActiveRouteSetupMs:F3}ms, activeTarget={_diagnosticActiveTargetMs:F3}ms, " +
+                $"activeAmbient={_diagnosticActiveAmbientMs:F3}ms, activeFallback={_diagnosticActiveFallbackMs:F3}ms, " +
+                $"dormantGraph={_diagnosticDormantGraphMs:F3}ms, dormantProximity={_diagnosticDormantProximityMs:F3}ms, " +
+                $"dormantAdmission={_diagnosticDormantAdmissionMs:F3}ms, dormantSpawnClear={_diagnosticDormantSpawnClearMs:F3}ms, " +
+                $"dormantActivate={_diagnosticDormantActivateMs:F3}ms, " +
                 $"actorOther={otherActorMs:F3}ms, wakeScan={_diagnosticWakeScanMs:F3}ms, wakeAdmission={_diagnosticWakeAdmissionMs:F3}ms, " +
                 $"wakeSpatial={_diagnosticWakeSpatialMs:F3}ms, wakeActorPublish={_diagnosticWakeActorPublishMs:F3}ms, " +
                 $"wakeObserverPublish={_diagnosticWakeObserverPublishMs:F3}ms, wakeSchedule={_diagnosticWakeScheduleMs:F3}ms, " +
@@ -400,16 +450,6 @@ namespace Game.Server.Application.Population
                 $"admitted={_diagnosticWakeAdmitted}, hibernating={_hibernatingCount}, " +
                 $"dueQueueEntries={_dueSchedule.Count} (includes stale entries).");
         }
-
-        // Ambient Population admission is shared across all portals and observers in an area.
-        // Source portals are opportunities, not a request to keep every authored actor awake.
-        private const float AmbientAdmissionCellSize = 128f;
-        private readonly Dictionary<string, Dictionary<long, double>> _ambientNextAdmission =
-            new Dictionary<string, Dictionary<long, double>>(StringComparer.Ordinal);
-        private int _ambientAdmissionsThisTick;
-        private int _ambientAttemptsThisTick;
-        private int _ambientActiveCountSnapshot = -1;
-        private double _nextGlobalAmbientAdmissionAt;
 
         public float EngagedDistance { get; set; } = 28f;
         public float ActiveDistance { get; set; } = 80f;
@@ -424,23 +464,7 @@ namespace Game.Server.Application.Population
         public float VisibilitySuppressionDistance { get; set; } = 35f;
         public int MaximumPortalRespawnsPerTick { get; set; } = 8;
 
-        // These defaults are conservative admission safety limits for the first runtime test,
-        // NOT measured server capacity. They do not apply to monsters, combat NPCs, or forced
-        // authoritative combat activations. Raise them only after profiling.
-        public int MaximumActiveAmbientPopulation { get; set; } = 256;
-        public int MaximumAmbientPopulationNearby { get; set; } = 12;
-        public float AmbientDensityRadius { get; set; } = 96f;
-        public int MaximumAmbientAdmissionsPerAiTick { get; set; } = 1;
-        public int MaximumAmbientAttemptsPerAiTick { get; set; } = 1;
         public int MaximumAmbientWakeCatchUpHops { get; set; } = 24;
-        public double AmbientAreaAdmissionIntervalSeconds { get; set; } = 0.75d;
-        public double AmbientGlobalAdmissionIntervalSeconds { get; set; } = 0.60d;
-        // Network travel, not radial distance from origin. Ordinary trips must cover
-        // several links before a portal can end them. Same-origin fallback is longer.
-        public float MinimumPortalJourneyDistance { get; set; } = 60f;
-        public int MinimumPortalJourneyHops { get; set; } = 4;
-        public float OriginPortalFallbackDistance { get; set; } = 180f;
-        public int OriginPortalFallbackHops { get; set; } = 12;
         // True simulation LOD cadence. Far/logical civilians are scheduled by next-due
         // time instead of being revisited every AI tick. A short 2s logical ceiling keeps
         // promotion latency bounded when a player approaches.
@@ -551,11 +575,27 @@ namespace Game.Server.Application.Population
             // left behind by the preceding actor work unit.
             _diagnosticActorId = 0;
             _diagnosticActorMs = 0d;
+            _diagnosticGcPauseMs = 0d;
+            _diagnosticActorAllocatedBytes = 0L;
+            _diagnosticGcGen0Collections = 0;
+            _diagnosticGcGen1Collections = 0;
+            _diagnosticGcGen2Collections = 0;
+            _diagnosticDueQueueMs = 0d;
+            _diagnosticDueQueueChecks = 0;
+            _diagnosticActorSetupMs = 0d;
+            _diagnosticRescheduleMs = 0d;
+            _diagnosticStaleScheduleHeadsPruned = 0;
             _diagnosticPartitionRebuildMs = 0d;
             _diagnosticPartitionRebuilt = false;
             _diagnosticPreparedPlayers = players?.Count ?? 0;
             _diagnosticDistanceMs = 0d;
             _diagnosticMotorCollisionMs = 0d;
+            _diagnosticActiveGraphMs = _diagnosticActiveEnsureNodeMs = 0d;
+            _diagnosticActiveRouteSetupMs = _diagnosticActiveTargetMs = 0d;
+            _diagnosticActiveAmbientMs = _diagnosticActiveFallbackMs = 0d;
+            _diagnosticDormantGraphMs = _diagnosticDormantProximityMs = 0d;
+            _diagnosticDormantAdmissionMs = _diagnosticDormantSpawnClearMs = 0d;
+            _diagnosticDormantActivateMs = 0d;
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
             _diagnosticMotorCalls = 0;
@@ -599,11 +639,14 @@ namespace Game.Server.Application.Population
                 if (!_activationHandoffReady &&
                     (_playersByPartition.Count == 0 || PlayerViewsChanged(players)))
                 {
-                    long partitionStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-                    BuildPlayerPartitions(players);
-                    CachePreparedPlayerViews(players);
-                    _diagnosticPartitionRebuildMs = ElapsedDiagnosticMilliseconds(partitionStartedAt);
-                    _diagnosticPartitionRebuilt = true;
+                    if (!TryRefreshSmallPlayerPartition(players))
+                    {
+                        long partitionStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                        BuildPlayerPartitions(players);
+                        CachePreparedPlayerViews(players);
+                        _diagnosticPartitionRebuildMs = ElapsedDiagnosticMilliseconds(partitionStartedAt);
+                        _diagnosticPartitionRebuilt = true;
+                    }
                 }
                 if (_hibernatingCount <= 0)
                     _activationHandoffPending = _activationHandoffReady = false;
@@ -611,9 +654,6 @@ namespace Game.Server.Application.Population
                          !_activationHandoffPending && !_activationHandoffReady)
                     _activationHandoffPending = true;
             }
-            _ambientAdmissionsThisTick = 0;
-            _ambientAttemptsThisTick = 0;
-            _ambientActiveCountSnapshot = -1;
             _portalRespawnsThisTick = 0;
             _portalAdmissionGeneration = _portalAdmissionGeneration == uint.MaxValue
                 ? 1u
@@ -650,7 +690,23 @@ namespace Game.Server.Application.Population
             _diagnosticPhase = SlowWorkPhase.None;
             _diagnosticActorId = 0;
             _diagnosticActorMs = 0d;
+            _diagnosticGcPauseMs = 0d;
+            _diagnosticActorAllocatedBytes = 0L;
+            _diagnosticGcGen0Collections = 0;
+            _diagnosticGcGen1Collections = 0;
+            _diagnosticGcGen2Collections = 0;
+            _diagnosticDueQueueMs = 0d;
+            _diagnosticDueQueueChecks = 0;
+            _diagnosticActorSetupMs = 0d;
+            _diagnosticRescheduleMs = 0d;
+            _diagnosticStaleScheduleHeadsPruned = 0;
             _diagnosticMotorCollisionMs = 0d;
+            _diagnosticActiveGraphMs = _diagnosticActiveEnsureNodeMs = 0d;
+            _diagnosticActiveRouteSetupMs = _diagnosticActiveTargetMs = 0d;
+            _diagnosticActiveAmbientMs = _diagnosticActiveFallbackMs = 0d;
+            _diagnosticDormantGraphMs = _diagnosticDormantProximityMs = 0d;
+            _diagnosticDormantAdmissionMs = _diagnosticDormantSpawnClearMs = 0d;
+            _diagnosticDormantActivateMs = 0d;
             _diagnosticActorPublishMs = 0d;
             _diagnosticObserverPresentationMs = 0d;
             _diagnosticMotorCalls = 0;
@@ -723,13 +779,20 @@ namespace Game.Server.Application.Population
             }
 
             _diagnosticPhase = SlowWorkPhase.DueQueue;
-            PruneStaleScheduleHeads();
+            long dueQueueStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            int staleHeadsPruned = PruneStaleScheduleHeads();
+            _diagnosticStaleScheduleHeadsPruned += staleHeadsPruned;
+            _diagnosticDueQueueChecks++;
             if (!_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out double due) ||
                 due > now + 0.000001d)
+            {
+                _diagnosticDueQueueMs += ElapsedDiagnosticMilliseconds(dueQueueStartedAt);
                 return false;
+            }
 
             _dueSchedule.Dequeue();
             PopulationActorRuntime pop = scheduled.Actor;
+            _diagnosticDueQueueMs += ElapsedDiagnosticMilliseconds(dueQueueStartedAt);
             if (pop == null || pop.Actor == null || scheduled.Version != pop.ScheduleVersion)
                 return true;
 
@@ -742,49 +805,75 @@ namespace Game.Server.Application.Population
                 return true;
             }
 
+            long actorSetupStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             float actorDelta = fixedDelta;
             if (pop.LastSimulationAt > 0d && now > pop.LastSimulationAt)
                 actorDelta = (float)Math.Min(2d, Math.Max(fixedDelta, now - pop.LastSimulationAt));
             pop.LastSimulationAt = now;
 
-            IReadOnlyList<PopulationPlayerView> partitionPlayers = GetPartitionPlayers(pop.Actor);
+            IReadOnlyList<PopulationPlayerView> partitionPlayers = GetPartitionPlayers(pop);
             _diagnosticActorId = pop.Actor.Handle.actorId;
+            _diagnosticActorSetupMs = ElapsedDiagnosticMilliseconds(actorSetupStartedAt);
+            TimeSpan gcPauseBeforeActor = GC.GetTotalPauseDuration();
+            long allocatedBeforeActor = GC.GetTotalAllocatedBytes(precise: false);
+            int gen0BeforeActor = GC.CollectionCount(0);
+            int gen1BeforeActor = GC.CollectionCount(1);
+            int gen2BeforeActor = GC.CollectionCount(2);
             long actorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             TickActor(pop, actorDelta, now, partitionPlayers);
             _diagnosticActorMs = ElapsedDiagnosticMilliseconds(actorStartedAt);
+            _diagnosticGcPauseMs = Math.Max(0d,
+                (GC.GetTotalPauseDuration() - gcPauseBeforeActor).TotalMilliseconds);
+            _diagnosticActorAllocatedBytes = Math.Max(0L,
+                GC.GetTotalAllocatedBytes(precise: false) - allocatedBeforeActor);
+            _diagnosticGcGen0Collections = Math.Max(0,
+                GC.CollectionCount(0) - gen0BeforeActor);
+            _diagnosticGcGen1Collections = Math.Max(0,
+                GC.CollectionCount(1) - gen1BeforeActor);
+            _diagnosticGcGen2Collections = Math.Max(0,
+                GC.CollectionCount(2) - gen2BeforeActor);
 
             if (pop.AwaitingPlayerActivation)
                 return true;
 
-            if (!pop.Actor.Alive || pop.AiState == PopulationAiState.Dead)
+            long rescheduleStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
             {
-                if (pop.DeadDecayAt <= 0d)
-                    pop.DeadDecayAt = now + Math.Max(1d, DeadDecaySeconds);
-                Schedule(pop, pop.DeadDecayAt);
+                if (!pop.Actor.Alive || pop.AiState == PopulationAiState.Dead)
+                {
+                    if (pop.DeadDecayAt <= 0d)
+                        pop.DeadDecayAt = now + Math.Max(1d, DeadDecaySeconds);
+                    Schedule(pop, pop.DeadDecayAt);
+                }
+                else if (pop.AiState == PopulationAiState.PortalDormant && pop.DormantUntil > now)
+                {
+                    Schedule(pop, pop.DormantUntil);
+                }
+                else
+                {
+                    Schedule(pop, now + GetSimulationCadence(pop));
+                }
             }
-            else if (pop.AiState == PopulationAiState.PortalDormant && pop.DormantUntil > now)
+            finally
             {
-                Schedule(pop, pop.DormantUntil);
-            }
-            else
-            {
-                Schedule(pop, now + GetSimulationCadence(pop));
+                _diagnosticRescheduleMs = ElapsedDiagnosticMilliseconds(rescheduleStartedAt);
             }
             return true;
         }
 
-        private void PruneStaleScheduleHeads()
+        private int PruneStaleScheduleHeads()
         {
             int removed = 0;
             while (_dueSchedule.TryPeek(out PopulationScheduleEntry scheduled, out _))
             {
                 PopulationActorRuntime pop = scheduled.Actor;
                 if (pop != null && pop.Actor != null && scheduled.Version == pop.ScheduleVersion)
-                    return;
+                    return removed;
                 _dueSchedule.Dequeue();
                 if (++removed >= MaxStaleSchedulePrunesPerCall)
                     break;
             }
+            return removed;
         }
 
         private void Schedule(PopulationActorRuntime pop, double dueAt)
@@ -820,7 +909,7 @@ namespace Game.Server.Application.Population
             long distanceStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             float nearestPlayerSq = pop.Actor.Alive &&
                 pop.AiState != PopulationAiState.PortalDormant
-                    ? GetNearestPlayerDistanceSquared(pop.Actor, players)
+                    ? GetNearestPlayerDistanceSquared(pop, players)
                     : float.PositiveInfinity;
             UpdateSimulationLod(pop, nearestPlayerSq);
             _diagnosticDistanceMs = ElapsedDiagnosticMilliseconds(distanceStartedAt);
@@ -960,6 +1049,48 @@ namespace Game.Server.Application.Population
             return false;
         }
 
+        // For one small partition, movement-only snapshots can refresh exact values
+        // in place. Structural changes and indexed/crowded partitions still rebuild.
+        private bool TryRefreshSmallPlayerPartition(IReadOnlyList<PopulationPlayerView> players)
+        {
+            if (players == null || players.Count == 0 || players.Count > 8 ||
+                players.Count != _lastPreparedPlayerViews.Count)
+                return false;
+
+            PlayerSpatialPartition partition = null;
+            foreach (PlayerSpatialPartition candidate in _playersByPartition.Values)
+            {
+                if (partition != null)
+                    return false;
+                partition = candidate;
+            }
+
+            if (partition == null || partition.Players.Count != players.Count ||
+                partition.ByCharacterId.Count != players.Count || partition.Cells.Count != 0)
+                return false;
+
+            for (int i = 0; i < players.Count; ++i)
+            {
+                PopulationPlayerView current = players[i];
+                PopulationPlayerView previous = _lastPreparedPlayerViews[i];
+                if (current.CharacterId <= 0 || current.CharacterId != previous.CharacterId ||
+                    !string.Equals(current.MapId, previous.MapId, StringComparison.Ordinal) ||
+                    !string.Equals(current.InstanceId, previous.InstanceId, StringComparison.Ordinal) ||
+                    partition.Players[i].CharacterId != current.CharacterId ||
+                    !partition.ByCharacterId.ContainsKey(current.CharacterId))
+                    return false;
+            }
+
+            for (int i = 0; i < players.Count; ++i)
+            {
+                PopulationPlayerView current = players[i];
+                partition.Players[i] = current;
+                partition.ByCharacterId[current.CharacterId] = current;
+                _lastPreparedPlayerViews[i] = current;
+            }
+            return true;
+        }
+
         private void CachePreparedPlayerViews(IReadOnlyList<PopulationPlayerView> players)
         {
             _lastPreparedPlayerViews.Clear();
@@ -988,11 +1119,12 @@ namespace Game.Server.Application.Population
             }
         }
 
-        private IReadOnlyList<PopulationPlayerView> GetPartitionPlayers(AuthoritativeActorRuntime actor)
+        private IReadOnlyList<PopulationPlayerView> GetPartitionPlayers(PopulationActorRuntime pop)
         {
+            AuthoritativeActorRuntime actor = pop?.Actor;
             if (actor != null &&
                 _playersByPartition.TryGetValue(
-                    MapKey(actor.MapId, actor.InstanceId),
+                    GetCachedPartitionKey(pop),
                     out PlayerSpatialPartition partition))
             {
                 return partition.Players;
@@ -1001,9 +1133,10 @@ namespace Game.Server.Application.Population
         }
 
         private float GetNearestPlayerDistanceSquared(
-            AuthoritativeActorRuntime actor,
+            PopulationActorRuntime pop,
             IReadOnlyList<PopulationPlayerView> players)
         {
+            AuthoritativeActorRuntime actor = pop?.Actor;
             if (actor == null || players == null || players.Count == 0)
                 return float.PositiveInfinity;
 
@@ -1035,7 +1168,7 @@ namespace Game.Server.Application.Population
 
             // Larger crowds still use the canonical per-map player-cell index.
             if (!_playersByPartition.TryGetValue(
-                    MapKey(actor.MapId, actor.InstanceId),
+                    GetCachedPartitionKey(pop),
                     out PlayerSpatialPartition partition))
                 return float.PositiveInfinity;
 
@@ -1307,39 +1440,94 @@ namespace Game.Server.Application.Population
                     if (portal == null || portal.stableId <= 0) continue;
                     graph.Portals[portal.stableId] = portal;
 
-                    // Include the primary connection even for old map files with no array.
-                    // New baked maps also carry every validated nearby route connection.
-                    long[] portalNodes = portal.routeNodeIds ?? Array.Empty<long>();
-                    for (int n = -1; n < portalNodes.Length; ++n)
+                    // routeNodeId is the portal's authored primary arrival/despawn
+                    // marker. routeNodeIds are alternate nearby route-entry links
+                    // used when joining the route; treating those as exits made an
+                    // actor disappear at incidental sidewalk intersections.
+                    long nodeId = portal.routeNodeId;
+                    if (nodeId <= 0 || !graph.Nodes.ContainsKey(nodeId))
+                        continue;
+
+                    if (!graph.PortalsByRouteNode.TryGetValue(nodeId, out List<ServerPopulationPortal> nodePortals))
                     {
-                        long nodeId = n < 0 ? portal.routeNodeId : portalNodes[n];
-                        if (nodeId <= 0 || !graph.Nodes.ContainsKey(nodeId))
-                            continue;
-
-                        if (!graph.PortalsByRouteNode.TryGetValue(nodeId, out List<ServerPopulationPortal> nodePortals))
-                        {
-                            nodePortals = new List<ServerPopulationPortal>(2);
-                            graph.PortalsByRouteNode.Add(nodeId, nodePortals);
-                        }
-
-                        bool duplicate = false;
-                        for (int p = 0; p < nodePortals.Count; ++p)
-                        {
-                            if (nodePortals[p].stableId == portal.stableId)
-                            {
-                                duplicate = true;
-                                break;
-                            }
-                        }
-
-                        if (!duplicate)
-                            nodePortals.Add(portal);
+                        nodePortals = new List<ServerPopulationPortal>(2);
+                        graph.PortalsByRouteNode.Add(nodeId, nodePortals);
                     }
+                    nodePortals.Add(portal);
                 }
+                CompileAmbientRouteSuccessors(graph);
                 CertifyBakedRouteLanes(graph);
                 CompileRouteSegments(graph);
                 _graphs[key] = graph;
             }
+        }
+
+        private static void CompileAmbientRouteSuccessors(MapGraph graph)
+        {
+            if (graph == null)
+                return;
+
+            var incoming = new Dictionary<long, HashSet<long>>();
+            foreach (KeyValuePair<long, List<ServerPopulationRouteEdge>> pair in graph.Outgoing)
+            {
+                List<ServerPopulationRouteEdge> edges = pair.Value;
+                for (int i = 0; i < edges.Count; ++i)
+                {
+                    ServerPopulationRouteEdge edge = edges[i];
+                    if (edge == null)
+                        continue;
+                    if (!incoming.TryGetValue(edge.toNodeId, out HashSet<long> previousNodes))
+                    {
+                        previousNodes = new HashSet<long>();
+                        incoming.Add(edge.toNodeId, previousNodes);
+                    }
+                    previousNodes.Add(edge.fromNodeId);
+                }
+            }
+
+            Array npcTypes = Enum.GetValues(typeof(PopulationNpcType));
+            foreach (long nodeId in graph.Outgoing.Keys)
+            {
+                var previousNodes = new HashSet<long> { 0, nodeId };
+                if (incoming.TryGetValue(nodeId, out HashSet<long> parents))
+                    previousNodes.UnionWith(parents);
+
+                foreach (long previousNodeId in previousNodes)
+                    foreach (PopulationNpcType npcType in npcTypes)
+                    {
+                        ServerPopulationRouteEdge selected = SelectDeterministicAmbientSuccessor(
+                            graph, nodeId, previousNodeId, npcType);
+                        if (selected != null)
+                            graph.AmbientRouteSuccessors[(nodeId, previousNodeId, npcType)] = selected;
+                    }
+            }
+        }
+
+        private static ServerPopulationRouteEdge SelectDeterministicAmbientSuccessor(
+            MapGraph graph, long nodeId, long previousNodeId, PopulationNpcType npcType)
+        {
+            if (!graph.Outgoing.TryGetValue(nodeId, out List<ServerPopulationRouteEdge> edges))
+                return null;
+
+            ServerPopulationRouteEdge firstAllowed = null;
+            ServerPopulationRouteEdge firstForward = null;
+            for (int i = 0; i < edges.Count; ++i)
+            {
+                ServerPopulationRouteEdge edge = edges[i];
+                if (!EdgeAllows(graph, edge, npcType))
+                    continue;
+                firstAllowed ??= edge;
+                if (edge.toNodeId != previousNodeId)
+                {
+                    firstForward = edge;
+                    break;
+                }
+            }
+
+            // Keep the established no-immediate-U-turn rule at intersections.
+            // Baked edge order is stable and the ambient successor is selected once
+            // at map load; the per-actor arrival path only performs a dictionary read.
+            return firstForward ?? firstAllowed;
         }
 
         private static void CompileRouteSegments(MapGraph graph)
@@ -1938,14 +2126,28 @@ namespace Game.Server.Application.Population
 
         private void TickActive(PopulationActorRuntime pop, float dt, double now)
         {
-            if (!TryGetAssignedGraph(pop, out MapGraph graph) || graph.Collision == null || !EnsureNextNode(graph, pop)) return;
-            if (!ResolveRouteAssignment(graph, pop)) return;
+            long stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool graphReady = TryGetAssignedGraph(pop, out MapGraph graph) && graph.Collision != null;
+            _diagnosticActiveGraphMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!graphReady) return;
+
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool hasNextNode = EnsureNextNode(graph, pop);
+            _diagnosticActiveEnsureNodeMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!hasNextNode) return;
+
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool routeResolved = ResolveRouteAssignment(graph, pop);
+            _diagnosticActiveRouteSetupMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!routeResolved) return;
             ServerPopulationRouteNode targetNode = pop.AssignedRouteTarget;
 
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             WorldPosition target = OffsetTargetForLane(graph, pop, targetNode.pose.ToWorldPosition());
             float dx = target.X - pop.Actor.Position.X;
             float dz = target.Z - pop.Actor.Position.Z;
             float distSq = dx * dx + dz * dz;
+            _diagnosticActiveTargetMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
             if (distSq <= 0.35f * 0.35f)
             {
                 ArriveNode(graph, pop, now);
@@ -1955,30 +2157,41 @@ namespace Game.Server.Application.Population
             // Peaceful grounded route followers take the bounded cheap collision
             // sweep, not the full player-grade motor. If any condition is unsafe,
             // the untouched motor below remains authoritative immediately.
-            if (TryTickAmbientRouteFast(graph, pop, target, dt, now))
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool ambientRouteHandled = TryTickAmbientRouteFast(graph, pop, target, dt, now);
+            _diagnosticActiveAmbientMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (ambientRouteHandled)
                 return;
 
-            float inv = 1f / MathF.Sqrt(Math.Max(0.0001f, distSq));
-            bool running = pop.AiState == PopulationAiState.Fleeing;
-            var intent = new CharacterMovementIntent(dx * inv, dz * inv, running, false);
-            pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
-            bool blocked = false;
-            long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
-                    allowWallSlide: false, out blocked);
+                float inv = 1f / MathF.Sqrt(Math.Max(0.0001f, distSq));
+                bool running = pop.AiState == PopulationAiState.Fleeing;
+                var intent = new CharacterMovementIntent(dx * inv, dz * inv, running, false);
+                pop.Actor.YawDegrees = NormalizeYaw(MathF.Atan2(dx, dz) * (180f / MathF.PI));
+                bool blocked = false;
+                long motorStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                try
+                {
+                    pop.Motor.Tick(pop.MotorState, intent, dt, graph.Collision,
+                        allowWallSlide: false, out blocked);
+                }
+                finally
+                {
+                    _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
+                    ++_diagnosticMotorCalls;
+                }
+                ApplyMotor(pop);
+                if (blocked)
+                    RecoverBlockedRoute(pop, now);
+                else
+                    DetectStuck(graph, pop, now);
             }
             finally
             {
-                _diagnosticMotorCollisionMs += ElapsedDiagnosticMilliseconds(motorStartedAt);
-                ++_diagnosticMotorCalls;
+                _diagnosticActiveFallbackMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
             }
-            ApplyMotor(pop);
-            if (blocked)
-                RecoverBlockedRoute(pop, now);
-            else
-                DetectStuck(graph, pop, now);
         }
 
         private void TickThreat(PopulationActorRuntime pop, float dt, double now)
@@ -2284,16 +2497,6 @@ namespace Game.Server.Application.Population
         {
             long fromNodeId = pop.CurrentNodeId;
             long reachedNodeId = pop.NextNodeId;
-            // Current==Next is the working spawner-to-first-marker handoff,
-            // not a traversed route segment.
-            if (fromNodeId != reachedNodeId &&
-                graph.Nodes.TryGetValue(fromNodeId, out ServerPopulationRouteNode fromJourney) &&
-                graph.Nodes.TryGetValue(reachedNodeId, out ServerPopulationRouteNode toJourney))
-            {
-                pop.JourneyDistance += DistanceXZ(fromJourney.pose.ToWorldPosition(), toJourney.pose.ToWorldPosition());
-                if (pop.JourneyHops < int.MaxValue)
-                    pop.JourneyHops++;
-            }
             pop.PreviousNodeId = fromNodeId;
             pop.CurrentNodeId = reachedNodeId;
             pop.NextNodeId = 0;
@@ -2306,10 +2509,8 @@ namespace Game.Server.Application.Population
                     pop.WaitUntil = now + minWait + (maxWait - minWait) * pop.Random.NextDouble();
             }
 
-            // Portal activation physically moves from the portal anchor to its first
-            // route node with CurrentNodeId == NextNodeId. Do not interpret that initial
-            // handoff as arrival at a destination portal, especially when neighboring
-            // portals share the same sidewalk marker.
+            // Portal activation's Current==Next handoff is not a traversed edge.
+            // Only a portal's primary baked routeNodeId is registered as an arrival.
             if (pop.PreviousNodeId != pop.CurrentNodeId &&
                 graph.PortalsByRouteNode.TryGetValue(
                     pop.CurrentNodeId,
@@ -2318,13 +2519,7 @@ namespace Game.Server.Application.Population
                 for (int i = 0; i < nodePortals.Count; ++i)
                 {
                     ServerPopulationPortal portal = nodePortals[i];
-                    bool origin = portal != null && portal.stableId == pop.JourneyOriginPortalId;
-                    bool journeyReady = pop.JourneyHops >= Math.Max(1, MinimumPortalJourneyHops) &&
-                        pop.JourneyDistance >= Math.Max(1f, MinimumPortalJourneyDistance);
-                    bool originFallbackReady = pop.JourneyHops >= Math.Max(MinimumPortalJourneyHops, OriginPortalFallbackHops) &&
-                        pop.JourneyDistance >= Math.Max(MinimumPortalJourneyDistance, OriginPortalFallbackDistance);
-                    if (portal == null || !journeyReady ||
-                        (origin && (!originFallbackReady || portal.requireDifferentDestination)) ||
+                    if (portal == null ||
                         !PortalAllows(portal, pop.NpcType) ||
                         (portal.mode != PopulationPortalMode.DespawnOnly &&
                          portal.mode != PopulationPortalMode.SpawnAndDespawn))
@@ -2345,15 +2540,10 @@ namespace Game.Server.Application.Population
             pop.AwaitingPlayerActivation = false;
             pop.AiState = PopulationAiState.PortalDormant;
             pop.SimulationLod = PopulationSimulationLod.Dormant;
-            // A destination is an exit, not a new owner of the traveller's spawn slot.
-            // Return owned identities to their existing origin spawner for future journeys.
-            long nextSourcePortalId = portal.stableId;
-            if (TryGetGraph(pop.Actor, out MapGraph homeGraph) &&
-                homeGraph.SpawnPortalByAnchor.TryGetValue(pop.SpawnAnchorId, out long homeId) &&
-                homeGraph.Portals.TryGetValue(homeId, out ServerPopulationPortal homePortal) &&
-                homePortal.mode != PopulationPortalMode.DespawnOnly)
-                nextSourcePortalId = homeId;
-            pop.LastPortalId = nextSourcePortalId;
+            // The destination portal controls this actor's authored wait and next
+            // appearance. SpawnAnchorId remains unchanged, so only the original
+            // spawner owns capacity and death replacement.
+            pop.LastPortalId = portal.stableId;
             pop.NextNodeId = 0;
             pop.PortalPhase = PopulationPortalSequencePhase.None;
             double min = Math.Max(0.1, portal.minimumRespawnDelay);
@@ -2367,53 +2557,63 @@ namespace Game.Server.Application.Population
         private void TickDormant(PopulationActorRuntime pop, double now, IReadOnlyList<PopulationPlayerView> players)
         {
             if (now < pop.DormantUntil || _portalRespawnsThisTick >= Math.Max(1, MaximumPortalRespawnsPerTick)) return;
-            if (!TryGetGraph(pop.Actor, out MapGraph graph) || !graph.Portals.TryGetValue(pop.LastPortalId, out ServerPopulationPortal portal))
+            long stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            ServerPopulationPortal portal = null;
+            bool hasPortal = TryGetGraph(pop.Actor, out MapGraph graph) &&
+                graph.Portals.TryGetValue(pop.LastPortalId, out portal);
+            _diagnosticDormantGraphMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!hasPortal)
             {
                 pop.AiState = PopulationAiState.Recovering;
                 ReattachToNearestRoute(pop);
                 return;
             }
-            if (portal.mode == PopulationPortalMode.DespawnOnly)
-            {
-                // Sink-only portals remain off-world until a future schedule/destination service
-                // assigns another source portal. Do not poll them while nobody can observe them.
-                ParkForPlayerActivation(pop, portal.exterior.ToWorldPosition(), now);
-                return;
-            }
-
-            if (!HasPlayerWithin(pop.Actor, portal.exterior.ToWorldPosition(), players, PlayerActivationDistance))
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool playerNearby = HasPlayerWithin(
+                pop.Actor, portal.exterior.ToWorldPosition(), players, PlayerActivationDistance);
+            _diagnosticDormantProximityMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!playerNearby)
             {
                 ParkForPlayerActivation(pop, portal.exterior.ToWorldPosition(), now);
                 return;
             }
 
-            if (!PortalCadenceAllows(portal, now, out double nextPortalReleaseAt))
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (portal.mode != PopulationPortalMode.DespawnOnly)
             {
-                pop.DormantUntil = Math.Max(now + 0.05d, nextPortalReleaseAt);
-                return;
-            }
-
-            WorldPosition entrance = portal.exterior.ToWorldPosition();
-            if (!CanAdmitAmbient(pop, entrance, now))
-            {
-                // Preserve this dormant identity and try later; no collision work or spawn.
-                pop.DormantUntil = now + Math.Max(0.25d, AmbientAreaAdmissionIntervalSeconds);
-                return;
-            }
-            if (!PortalSpawnClear(graph, portal, pop, players))
-            {
-                pop.PortalRespawnAttempts++;
-                pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
-                return;
-            }
-
-            if (!ActivatePortalSpawn(graph, pop, portal, now, scheduleImmediately: false))
-            {
-                pop.PortalRespawnAttempts++;
-                pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
+                bool cadenceAllows = PortalCadenceAllows(portal, now, out double nextPortalReleaseAt);
+                _diagnosticDormantAdmissionMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+                if (!cadenceAllows)
+                {
+                    pop.DormantUntil = Math.Max(now + 0.05d, nextPortalReleaseAt);
+                    return;
+                }
             }
             else
-                RecordAmbientAdmission(pop, entrance, now);
+            {
+                // A DespawnOnly portal is a destination, not a population source.
+                // Its authored respawn delay is the only wait before this actor resumes.
+                _diagnosticDormantAdmissionMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            }
+
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool spawnClear = PortalSpawnClear(graph, portal, pop, players);
+            _diagnosticDormantSpawnClearMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!spawnClear)
+            {
+                pop.PortalRespawnAttempts++;
+                pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
+                return;
+            }
+
+            stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool activated = ActivatePortalSpawn(graph, pop, portal, now, scheduleImmediately: false);
+            _diagnosticDormantActivateMs += ElapsedDiagnosticMilliseconds(stageStartedAt);
+            if (!activated)
+            {
+                pop.PortalRespawnAttempts++;
+                pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
+            }
         }
 
         private bool ActivatePortalSpawn(
@@ -2423,12 +2623,13 @@ namespace Game.Server.Application.Population
             double now,
             bool scheduleImmediately)
         {
-            if (graph == null || graph.Collision == null || pop == null || pop.Actor == null || portal == null)
+            if (graph == null || pop == null || pop.Actor == null || portal == null ||
+                (graph.Collision == null && pop.SpawnKind != ServerSpawnKind.Population))
                 return false;
 
             // A Population portal's stationary geometry was checked in World Bake.
-            // PortalSpawnClear already performed the LIVE dynamic blocker check for this
-            // admission. Do not repeat static ground/capsule tests in the activation path.
+            // Ambient civilian activation does not rerun world collision tests here.
+            // Combat-capable NPCs retain the live clearance checks in PortalSpawnClear.
             WorldPosition anchor = portal.exterior.ToWorldPosition();
             if (!float.IsFinite(anchor.X) || !float.IsFinite(anchor.Y) ||
                 !float.IsFinite(anchor.Z))
@@ -2451,11 +2652,9 @@ namespace Game.Server.Application.Population
                 return false;
 
             _portalRespawnsThisTick++;
-            RecordPortalRelease(portal, pop, now);
+            if (portal.mode != PopulationPortalMode.DespawnOnly)
+                RecordPortalRelease(portal, pop, now);
             pop.PortalRespawnAttempts = 0;
-            pop.JourneyOriginPortalId = portal.stableId;
-            pop.JourneyDistance = 0f;
-            pop.JourneyHops = 0;
 
             // Portal presentation is now a single authoritative anchor. Normal Population AI
             // owns movement immediately after spawn. For route actors, the associated/nearest
@@ -2558,92 +2757,28 @@ namespace Game.Server.Application.Population
             }
         }
 
-        // A player is a demand signal, not an independent allocation of civilians. Density
-        // is measured against ALL spatially active ambient Pops, independent of who sees them.
-        // QueryRadius reuses the authoritative actor spatial index (no full actor scan).
-        private bool CanAdmitAmbient(PopulationActorRuntime pop, WorldPosition where, double now)
-        {
-            if (pop == null || pop.Actor == null)
-                return false;
-            if (pop.SpawnKind != ServerSpawnKind.Population)
-                return true; // Do not throttle authored monster / combat-NPC gameplay.
-
-            if (_ambientAdmissionsThisTick >= Math.Max(1, MaximumAmbientAdmissionsPerAiTick) ||
-                _ambientAttemptsThisTick >= Math.Max(1, MaximumAmbientAttemptsPerAiTick))
-                return false;
-            if (now < _nextGlobalAmbientAdmissionAt)
-                return false;
-
-            if (_ambientActiveCountSnapshot < 0)
-                _ambientActiveCountSnapshot = ActiveAmbientCount;
-            if (_ambientActiveCountSnapshot >= Math.Max(1, MaximumActiveAmbientPopulation))
-                return false;
-
-            string key = MapKey(pop.Actor.MapId, pop.Actor.InstanceId);
-            long cellId = PackPlayerCell(
-                (int)MathF.Floor(where.X / AmbientAdmissionCellSize),
-                (int)MathF.Floor(where.Z / AmbientAdmissionCellSize));
-            if (_ambientNextAdmission.TryGetValue(key, out Dictionary<long, double> deadlines) &&
-                deadlines.TryGetValue(cellId, out double nextAt) && now < nextAt)
-                return false;
-
-            _actors.QueryRadius(pop.Actor.MapId, pop.Actor.InstanceId, where,
-                Math.Max(1f, AmbientDensityRadius), _nearbyScratch);
-            int nearby = 0;
-            for (int i = 0; i < _nearbyScratch.Count; ++i)
-            {
-                AuthoritativeActorRuntime actor = _nearbyScratch[i];
-                if (actor == null || !actor.Alive ||
-                    actor.Handle.actorId == pop.Actor.Handle.actorId ||
-                    actor.Handle.kind != AuthoritativeActorKind.Population)
-                    continue;
-                if (_population.TryGetValue(actor.Handle.actorId, out PopulationActorRuntime other) &&
-                    IsActiveAmbient(other) &&
-                    ++nearby >= Math.Max(1, MaximumAmbientPopulationNearby))
-                    return false;
-            }
-            // One admission attempt may involve expensive ground, collision and spawn
-            // clearance checks. Even a failed candidate consumes the shared time slot.
-            // This avoids an invalid portal causing repeated per-tick CPU spikes.
-            ++_ambientAttemptsThisTick;
-            _nextGlobalAmbientAdmissionAt = now + Math.Max(0.05d, AmbientGlobalAdmissionIntervalSeconds);
-            return true;
-        }
-
-        private void RecordAmbientAdmission(PopulationActorRuntime pop, WorldPosition where, double now)
-        {
-            if (pop?.Actor == null || pop.SpawnKind != ServerSpawnKind.Population)
-                return;
-            ++_ambientAdmissionsThisTick;
-            _nextGlobalAmbientAdmissionAt = now + Math.Max(0.05d, AmbientGlobalAdmissionIntervalSeconds);
-            if (_ambientActiveCountSnapshot >= 0)
-                ++_ambientActiveCountSnapshot;
-
-            string key = MapKey(pop.Actor.MapId, pop.Actor.InstanceId);
-            if (!_ambientNextAdmission.TryGetValue(key, out Dictionary<long, double> deadlines))
-            {
-                deadlines = new Dictionary<long, double>();
-                _ambientNextAdmission.Add(key, deadlines);
-            }
-            long cellId = PackPlayerCell(
-                (int)MathF.Floor(where.X / AmbientAdmissionCellSize),
-                (int)MathF.Floor(where.Z / AmbientAdmissionCellSize));
-            // A fixed number of authored cells bounds this map. No timer per NPC/spawner.
-            deadlines[cellId] = now + Math.Max(0.05d, AmbientAreaAdmissionIntervalSeconds);
-        }
-
         private bool PortalSpawnClear(MapGraph graph, ServerPopulationPortal portal, PopulationActorRuntime pop, IReadOnlyList<PopulationPlayerView> players)
         {
-            if (graph == null || graph.Collision == null || portal == null || pop == null || pop.Actor == null)
+            if (graph == null || portal == null || pop == null || pop.Actor == null)
                 return false;
 
             WorldPosition exterior = portal.exterior.ToWorldPosition();
+            if (pop.SpawnKind == ServerSpawnKind.Population)
+            {
+                // Authored civilian portals are validated and capacity-limited by the baked
+                // spawn anchors. No live world-blocker, Population-density, or player-LOS
+                // admission query is needed for these non-colliding ambient actors.
+                return float.IsFinite(exterior.X) && float.IsFinite(exterior.Y) &&
+                       float.IsFinite(exterior.Z);
+            }
+
+            if (graph.Collision == null)
+                return false;
             float radius = Math.Max(Math.Max(0.2f, portal.exitClearanceRadius), pop.CapsuleRadius);
             float height = Math.Max(pop.CapsuleHeight, radius * 2f);
             var capsule = new ServerCapsule(radius, height);
 
-            // Baked static clearance is authoritative for this fixed portal anchor.
-            // Dynamic door/prop blockers CAN change, and must still be checked live.
+            // Combat-capable NPC portals retain live clearance and density protection.
             if (!graph.Collision.IsDynamicCapsuleClear(exterior, capsule))
                 return false;
 
@@ -2925,9 +3060,21 @@ namespace Game.Server.Application.Population
         {
             if (pop.CurrentNodeId <= 0 || !graph.Nodes.ContainsKey(pop.CurrentNodeId))
                 pop.CurrentNodeId = FindNearestNode(graph, pop.Actor.Position);
-            long blockedDestination = BlockedDestinationFor(pop, pop.CurrentNodeId, pop.LastSimulationAt);
-            ServerPopulationRouteEdge edge = ChooseEdge(graph, pop.CurrentNodeId, pop.PreviousNodeId,
-                pop.NpcType, pop.Random, blockedDestination);
+            ServerPopulationRouteEdge edge;
+            if (pop.SpawnKind == ServerSpawnKind.Population)
+            {
+                graph.AmbientRouteSuccessors.TryGetValue(
+                    (pop.CurrentNodeId, pop.PreviousNodeId, pop.NpcType), out edge);
+                if (edge == null)
+                    graph.AmbientRouteSuccessors.TryGetValue(
+                        (pop.CurrentNodeId, 0, pop.NpcType), out edge);
+            }
+            else
+            {
+                long blockedDestination = BlockedDestinationFor(pop, pop.CurrentNodeId, pop.LastSimulationAt);
+                edge = ChooseEdge(graph, pop.CurrentNodeId, pop.PreviousNodeId,
+                    pop.NpcType, pop.Random, blockedDestination);
+            }
             if (edge == null) return false;
             pop.NextNodeId = edge.toNodeId;
             pop.SegmentProgress = 0f;
@@ -3239,8 +3386,8 @@ namespace Game.Server.Application.Population
         /// <summary>
         /// Portal-backed Population is admitted directly from the shared AOI activation pass.
         /// This avoids funneling a whole dormant portal queue through one-per-actor scheduler
-        /// wakeups. Admission is still bounded by MaximumPortalRespawnsPerTick and the authored
-        /// portal density/clearance rules, so a large authored population remains cheap.
+        /// wakeups. The per-pass release ceiling bounds scheduler work; authored portal slots
+        /// remain the source of civilian population capacity.
         /// </summary>
         private void WakePortalDormantImmediately(PopulationActorRuntime pop, double now)
         {
@@ -3259,28 +3406,16 @@ namespace Game.Server.Application.Population
             if (!TryGetGraph(pop.Actor, out MapGraph graph) ||
                 !graph.Portals.TryGetValue(pop.LastPortalId, out ServerPopulationPortal portal))
             {
-                if (CanAdmitAmbient(pop, pop.HibernationPosition, now))
-                {
-                    WorldPosition activation = pop.HibernationPosition;
-                    WakeImmediately(pop, now, catchUp: false);
-                    if (!pop.AwaitingPlayerActivation && pop.Actor.Alive)
-                        RecordAmbientAdmission(pop, activation, now);
-                }
+                WakeImmediately(pop, now, catchUp: false);
                 return;
             }
 
-            if (portal.mode == PopulationPortalMode.DespawnOnly)
-                return;
-
-            IReadOnlyList<PopulationPlayerView> players = GetPartitionPlayers(pop.Actor);
+            IReadOnlyList<PopulationPlayerView> players = GetPartitionPlayers(pop);
             if (!HasPlayerWithin(pop.Actor, portal.exterior.ToWorldPosition(), players, PlayerActivationDistance))
                 return;
 
-            if (!PortalCadenceAllows(portal, now, out _))
-                return;
-
-            WorldPosition entrance = portal.exterior.ToWorldPosition();
-            if (!CanAdmitAmbient(pop, entrance, now))
+            if (portal.mode != PopulationPortalMode.DespawnOnly &&
+                !PortalCadenceAllows(portal, now, out _))
                 return;
 
             if (!PortalSpawnClear(graph, portal, pop, players))
@@ -3295,8 +3430,6 @@ namespace Game.Server.Application.Population
                 pop.PortalRespawnAttempts++;
                 pop.DormantUntil = now + Math.Max(0.25f, portal.blockedRetryDelay);
             }
-            else
-                RecordAmbientAdmission(pop, entrance, now);
         }
 
         private void WakeImmediately(PopulationActorRuntime pop, double now, bool catchUp)
@@ -3601,6 +3734,35 @@ namespace Game.Server.Application.Population
         private static bool SamePartition(AuthoritativeActorRuntime actor, PopulationPlayerView player) =>
             string.Equals(actor.MapId, player.MapId, StringComparison.Ordinal) &&
             string.Equals(actor.InstanceId, player.InstanceId, StringComparison.Ordinal);
+
+        private static string GetCachedPartitionKey(PopulationActorRuntime pop)
+        {
+            AuthoritativeActorRuntime actor = pop?.Actor;
+            if (actor == null)
+                return string.Empty;
+
+            string mapId = actor.MapId ?? string.Empty;
+            string instanceId = actor.InstanceId ?? string.Empty;
+            if (pop.CachedPartitionKey != null)
+            {
+                if (ReferenceEquals(pop.CachedPartitionMapId, mapId) &&
+                    ReferenceEquals(pop.CachedPartitionInstanceId, instanceId))
+                    return pop.CachedPartitionKey;
+
+                if (string.Equals(pop.CachedPartitionMapId, mapId, StringComparison.Ordinal) &&
+                    string.Equals(pop.CachedPartitionInstanceId, instanceId, StringComparison.Ordinal))
+                {
+                    pop.CachedPartitionMapId = mapId;
+                    pop.CachedPartitionInstanceId = instanceId;
+                    return pop.CachedPartitionKey;
+                }
+            }
+
+            pop.CachedPartitionMapId = mapId;
+            pop.CachedPartitionInstanceId = instanceId;
+            pop.CachedPartitionKey = MapKey(mapId, instanceId);
+            return pop.CachedPartitionKey;
+        }
 
         private static string MapKey(string mapId, string instanceId) => (mapId ?? string.Empty) + "\n" + (instanceId ?? string.Empty);
         private static float DistanceXZ(WorldPosition a, WorldPosition b)

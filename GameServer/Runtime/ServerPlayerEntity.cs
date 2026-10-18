@@ -68,6 +68,18 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     private bool _forceSnapshot;
     private double _nextHeartbeatAt;
 
+    internal double LastTickStatusReadMs { get; private set; }
+    internal double LastTickInputMs { get; private set; }
+    internal double LastTickMotorMs { get; private set; }
+    internal double LastTickCollisionWorldLookupMs { get; private set; }
+    internal double LastTickMotorPreparationMs { get; private set; }
+    internal double LastTickHorizontalCollisionMs { get; private set; }
+    internal double LastTickPostCollisionMs { get; private set; }
+    internal double LastTickMotorOtherMs { get; private set; }
+    internal double LastTickSnapshotDecisionMs { get; private set; }
+    internal double LastTickLocationUpdateMs { get; private set; }
+    internal double LastTickUnattributedMs { get; private set; }
+
     public uint ObjectId { get; }
     public ushort Generation { get; }
     public long ConnectionId { get; }
@@ -282,6 +294,13 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     /// </summary>
     public bool Tick(float fixedDelta, double nowSeconds, long nowMilliseconds, out float moveSpeed, out byte flags, out byte moveState, out ServerPlayerSnapshotReason reason)
     {
+        long tickStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        long stageStartedAt = tickStartedAt;
+        LastTickCollisionWorldLookupMs = 0d;
+        LastTickMotorPreparationMs = 0d;
+        LastTickHorizontalCollisionMs = 0d;
+        LastTickPostCollisionMs = 0d;
+        LastTickMotorOtherMs = 0d;
         bool dead = IsDead;
         if (dead)
             ClearMovementIntent();
@@ -289,6 +308,9 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         CharacterStatusEffectsState statusState = Runtime.CaptureStatusEffects();
         bool stunned = statusState.HasControl(ControlEffectType.Stun);
         bool rooted = stunned || statusState.HasControl(ControlEffectType.Root);
+        LastTickStatusReadMs = ElapsedMillisecondsSince(stageStartedAt);
+
+        stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         bool timedOut = dead || !_hasCommand || nowMilliseconds - _lastCommandTimestampMs > CommandTimeoutMilliseconds;
         float x = timedOut || rooted ? 0f : _inputX * InputPrecision;
         float z = timedOut || rooted ? 0f : _inputZ * InputPrecision;
@@ -315,7 +337,9 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
 
         if (!timedOut && !stunned)
             YawDegrees = DequantizeYaw(_commandYaw);
+        LastTickInputMs = ElapsedMillisecondsSince(stageStartedAt);
 
+        stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         if (dead)
         {
             _motorState.Mode = Game.Shared.Actors.ActorMovementMode.Dead;
@@ -328,17 +352,25 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
                 _motorState.Mode = Game.Shared.Actors.ActorMovementMode.Grounded;
 
             ServerCollisionWorld collision = null;
+            long collisionLookupStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             _maps?.TryGetCollisionWorld(Runtime.Location.MapId, Runtime.Location.InstanceId, out collision);
+            LastTickCollisionWorldLookupMs = ElapsedMillisecondsSince(collisionLookupStartedAt);
             _motor.Tick(
                 _motorState,
                 new CharacterMovementIntent(x, z, sprint, jump),
                 fixedDelta,
                 collision);
+            LastTickMotorPreparationMs = _motor.LastTickPreparationMs;
+            LastTickHorizontalCollisionMs = _motor.LastTickHorizontalCollisionMs;
+            LastTickPostCollisionMs = _motor.LastTickPostCollisionMs;
+            LastTickMotorOtherMs = _motor.LastTickOtherMs;
             X = _motorState.Position.X;
             Y = _motorState.Position.Y;
             Z = _motorState.Position.Z;
         }
+        LastTickMotorMs = ElapsedMillisecondsSince(stageStartedAt);
 
+        stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         flags = 0;
         if (_motorState.Grounded || dead)
             flags |= 0x01; // Grounded
@@ -381,7 +413,13 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
             reason |= ServerPlayerSnapshotReason.Heartbeat;
 
         if (reason == ServerPlayerSnapshotReason.None)
+        {
+            LastTickSnapshotDecisionMs = ElapsedMillisecondsSince(stageStartedAt);
+            LastTickLocationUpdateMs = 0d;
+            LastTickUnattributedMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
+                LastTickStatusReadMs - LastTickInputMs - LastTickMotorMs - LastTickSnapshotDecisionMs);
             return false;
+        }
 
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
@@ -392,15 +430,25 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _lastSnapshotDead = dead;
         _nextHeartbeatAt = nowSeconds + HeartbeatSeconds;
         _forceSnapshot = false;
+        LastTickSnapshotDecisionMs = ElapsedMillisecondsSince(stageStartedAt);
 
+        stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         CharacterLocationState prior = Runtime.Location;
         Runtime.UpdateLocation(new CharacterLocationState(
             prior.MapId,
             prior.InstanceId,
             new WorldPosition(X, Y, Z),
             YawDegrees));
+        LastTickLocationUpdateMs = ElapsedMillisecondsSince(stageStartedAt);
+        LastTickUnattributedMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
+            LastTickStatusReadMs - LastTickInputMs - LastTickMotorMs -
+            LastTickSnapshotDecisionMs - LastTickLocationUpdateMs);
         return true;
     }
+
+    private static double ElapsedMillisecondsSince(long startedAt) =>
+        (System.Diagnostics.Stopwatch.GetTimestamp() - startedAt) *
+        (1000d / System.Diagnostics.Stopwatch.Frequency);
 
     /// <summary>Server-authoritative teleport used by lifecycle/world services.</summary>
     public void Warp(CharacterLocationState location)

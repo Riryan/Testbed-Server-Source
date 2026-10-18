@@ -213,15 +213,31 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         public ObserverSnapshotBatch(ClientSession observer) => Observer = observer;
     }
 
-    private sealed class PopulationSimulationSystem : ICoreConditionalPreparedBudgetedWorkSystem
+    private sealed class PopulationSimulationSystem :
+        ICoreConditionalPreparedBudgetedWorkSystem,
+        ICoreBudgetedWorkDiagnosticContext
     {
         private readonly GameServerHost _owner;
         private readonly List<PopulationPlayerView> _players = new List<PopulationPlayerView>(128);
         private double _nextActivationCheckAt;
         private bool _lastUnitWasWakePresentation;
+        private string _lastWorkKind = "none";
+        private double _lastWorkUnitTotalMs;
+        private double _lastActorDueCheckMs;
+        private double _lastWakePresentationMs;
+        private double _lastPopulationServiceMs;
+        private double _lastOutsideWorkMs;
 
         public PopulationSimulationSystem(GameServerHost owner) => _owner = owner;
         public string Name => "PopulationAuthority";
+        public string PrepareDiagnosticContext =>
+            $"readyPlayers={_owner._readySessionsByCharacterId.Count}, populationActors={_owner._runtime.Population.Count}, " +
+            $"hibernating={_owner._runtime.Population.HibernatingCount}, " +
+            $"wakePresentationPending={_owner.HasPendingPopulationWakePresentation}";
+        public string WorkUnitDiagnosticContext =>
+            $"workKind={_lastWorkKind}, unitTotal={_lastWorkUnitTotalMs:F3}ms, " +
+            $"actorDueCheck={_lastActorDueCheckMs:F3}ms, wakePresentation={_lastWakePresentationMs:F3}ms, " +
+            $"populationService={_lastPopulationServiceMs:F3}ms, outsideStages={_lastOutsideWorkMs:F3}ms";
         public bool ShouldPrepare => HasPendingWork;
         public bool HasPendingWork
         {
@@ -246,21 +262,45 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
 
         public void ExecuteOneWorkUnit(in CoreTickContext context)
         {
-            // A wake has already restored gameplay/spatial authority. Fan out its
-            // visual spawn separately, one existing-AOI observer per work unit,
-            // so a synchronous spawn cannot compound with another NPC wake.
-            // Alternate with actor simulation when actual due work exists.
-            // When no actor is due, drain queued visual work without no-op ticks.
-            bool actorDue = _owner._runtime.Population.HasDueScheduledActorWork(context.Now);
-            if ((!_lastUnitWasWakePresentation || !actorDue) &&
-                _owner.ExecuteOnePopulationWakePresentationWorkUnit())
+            long workStartedAt = Stopwatch.GetTimestamp();
+            _lastWorkKind = "none";
+            _lastActorDueCheckMs = 0d;
+            _lastWakePresentationMs = 0d;
+            _lastPopulationServiceMs = 0d;
+            _lastOutsideWorkMs = 0d;
+            try
             {
-                _lastUnitWasWakePresentation = true;
-                return;
-            }
-            _lastUnitWasWakePresentation = false;
+                // A wake has already restored gameplay/spatial authority. Fan out its
+                // visual spawn separately, one existing-AOI observer per work unit,
+                // so a synchronous spawn cannot compound with another NPC wake.
+                // Alternate with actor simulation when actual due work exists.
+                // When no actor is due, drain queued visual work without no-op ticks.
+                long stageStartedAt = Stopwatch.GetTimestamp();
+                bool actorDue = _owner._runtime.Population.HasDueScheduledActorWork(context.Now);
+                _lastActorDueCheckMs = ElapsedMillisecondsSince(stageStartedAt);
+                stageStartedAt = Stopwatch.GetTimestamp();
+                if ((!_lastUnitWasWakePresentation || !actorDue) &&
+                    _owner.ExecuteOnePopulationWakePresentationWorkUnit())
+                {
+                    _lastWakePresentationMs = ElapsedMillisecondsSince(stageStartedAt);
+                    _lastWorkKind = "wakePresentation";
+                    _lastUnitWasWakePresentation = true;
+                    return;
+                }
+                _lastWakePresentationMs = ElapsedMillisecondsSince(stageStartedAt);
+                _lastUnitWasWakePresentation = false;
 
-            _owner._runtime.Population.TickNextBudgeted(context.FixedDelta, context.Now);
+                stageStartedAt = Stopwatch.GetTimestamp();
+                _lastWorkKind = "populationActor";
+                _owner._runtime.Population.TickNextBudgeted(context.FixedDelta, context.Now);
+                _lastPopulationServiceMs = ElapsedMillisecondsSince(stageStartedAt);
+            }
+            finally
+            {
+                _lastWorkUnitTotalMs = ElapsedMillisecondsSince(workStartedAt);
+                _lastOutsideWorkMs = Math.Max(0d, _lastWorkUnitTotalMs - _lastActorDueCheckMs -
+                    _lastWakePresentationMs - _lastPopulationServiceMs);
+            }
         }
 
         public void Prepare(in CoreTickContext context)
@@ -331,13 +371,64 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
             Math.Max(1, (candidateBudget + CandidatesPerWorkUnit - 1) / CandidatesPerWorkUnit);
     }
 
-    private sealed class PlayerSimulationBatchSystem : ICoreConditionalPreparedBudgetedWorkSystem
+    private sealed class PlayerSimulationBatchSystem :
+        ICoreConditionalPreparedBudgetedWorkSystem,
+        ICoreBudgetedWorkDiagnosticContext
     {
         private readonly GameServerHost _owner;
         private int _cursor;
+        private uint _lastWorkPlayerObjectId;
+        private int _lastWorkIndex;
+        private double _lastWorkTotalMs;
+        private double _lastEntityTickMs;
+        private double _lastRecoveryCheckMs;
+        private double _lastSnapshotAoiMs;
+        private double _lastSnapshotPlayerInterestMs;
+        private double _lastSnapshotPopulationMs;
+        private double _lastSnapshotWorldItemsMs;
+        private double _lastSnapshotFanoutMs;
+        private double _lastCleanupMs;
+        private double _lastOutsideStagesMs;
+        private double _lastEntityStatusReadMs;
+        private double _lastEntityInputMs;
+        private double _lastEntityMotorMs;
+        private double _lastEntityCollisionWorldLookupMs;
+        private double _lastEntityMotorPreparationMs;
+        private double _lastEntityHorizontalCollisionMs;
+        private double _lastEntityPostCollisionMs;
+        private double _lastEntityMotorOtherMs;
+        private double _lastEntitySnapshotDecisionMs;
+        private double _lastEntityLocationUpdateMs;
+        private double _lastEntityUnattributedMs;
+        private double _lastEntityGcPauseMs;
+        private long _lastEntityAllocatedBytes;
+        private int _lastEntityGcGen0Collections;
+        private int _lastEntityGcGen1Collections;
+        private int _lastEntityGcGen2Collections;
 
         public PlayerSimulationBatchSystem(GameServerHost owner) => _owner = owner;
         public string Name => "PlayerEntityAuthorityBatch";
+        public string PrepareDiagnosticContext =>
+            $"activeSessions={_owner._activeSimulationSessions.Count}, eligiblePlayers={_owner._simulationWorkSessions.Count}";
+        public string WorkUnitDiagnosticContext
+        {
+            get
+            {
+                return $"playerObjectId={_lastWorkPlayerObjectId}, playerIndex={_lastWorkIndex}, eligiblePlayers={_owner._simulationWorkSessions.Count}, " +
+                       $"unitTotal={_lastWorkTotalMs:F3}ms, entityTick={_lastEntityTickMs:F3}ms, " +
+                       $"entityStages=status:{_lastEntityStatusReadMs:F3}, input:{_lastEntityInputMs:F3}, " +
+                       $"motor:{_lastEntityMotorMs:F3}(map:{_lastEntityCollisionWorldLookupMs:F3}, prep:{_lastEntityMotorPreparationMs:F3}, " +
+                       $"horizontalCollision:{_lastEntityHorizontalCollisionMs:F3}, postCollision:{_lastEntityPostCollisionMs:F3}, other:{_lastEntityMotorOtherMs:F3}), " +
+                       $"snapshot:{_lastEntitySnapshotDecisionMs:F3}, " +
+                       $"locationPublish:{_lastEntityLocationUpdateMs:F3}, other:{_lastEntityUnattributedMs:F3}ms, " +
+                       $"gcPause={_lastEntityGcPauseMs:F3}ms, allocated={_lastEntityAllocatedBytes}B, " +
+                       $"gcCollections={_lastEntityGcGen0Collections}/{_lastEntityGcGen1Collections}/{_lastEntityGcGen2Collections}, " +
+                       $"recoveryCheck={_lastRecoveryCheckMs:F3}ms, snapshotAoi={_lastSnapshotAoiMs:F3}ms(" +
+                       $"playerInterest:{_lastSnapshotPlayerInterestMs:F3}, population:{_lastSnapshotPopulationMs:F3}, " +
+                       $"worldItems:{_lastSnapshotWorldItemsMs:F3}, fanout:{_lastSnapshotFanoutMs:F3}), " +
+                       $"cleanup={_lastCleanupMs:F3}ms, outsideStages={_lastOutsideStagesMs:F3}ms";
+            }
+        }
         public bool ShouldPrepare => _owner._activeSimulationSessions.Count > 0;
         public bool HasPendingWork => _cursor < _owner._simulationWorkSessions.Count;
 
@@ -356,13 +447,37 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
 
         public void ExecuteOneWorkUnit(in CoreTickContext context)
         {
+            long workStartedAt = Stopwatch.GetTimestamp();
+            _lastEntityTickMs = 0d;
+            _lastRecoveryCheckMs = 0d;
+            _lastSnapshotAoiMs = 0d;
+            _lastSnapshotPlayerInterestMs = 0d;
+            _lastSnapshotPopulationMs = 0d;
+            _lastSnapshotWorldItemsMs = 0d;
+            _lastSnapshotFanoutMs = 0d;
+            _lastCleanupMs = 0d;
+            _lastOutsideStagesMs = 0d;
+            _lastEntityStatusReadMs = _lastEntityInputMs = _lastEntityMotorMs = 0d;
+            _lastEntityCollisionWorldLookupMs = _lastEntityMotorPreparationMs = 0d;
+            _lastEntityHorizontalCollisionMs = _lastEntityPostCollisionMs = _lastEntityMotorOtherMs = 0d;
+            _lastEntitySnapshotDecisionMs = _lastEntityLocationUpdateMs = 0d;
+            _lastEntityUnattributedMs = _lastEntityGcPauseMs = 0d;
+            _lastEntityAllocatedBytes = 0L;
+            _lastEntityGcGen0Collections = _lastEntityGcGen1Collections = _lastEntityGcGen2Collections = 0;
             if (_cursor >= _owner._simulationWorkSessions.Count)
+            {
+                _lastWorkTotalMs = ElapsedMillisecondsSince(workStartedAt);
                 return;
+            }
 
             ClientSession session = _owner._simulationWorkSessions[_cursor++];
+            _lastWorkPlayerObjectId = session?.Entity?.ObjectId ?? 0u;
+            _lastWorkIndex = _cursor;
             if (!_owner.IsCurrent(session) || !session.Ready || session.Entity == null)
             {
                 _owner.RemoveActiveSimulationSession(session);
+                _lastWorkTotalMs = ElapsedMillisecondsSince(workStartedAt);
+                _lastOutsideStagesMs = _lastWorkTotalMs;
                 return;
             }
 
@@ -370,6 +485,12 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
             // SimulationDirty again while this unit is executing, keeping the entity active.
             session.SimulationDirty = false;
             long nowMilliseconds = Environment.TickCount64;
+            TimeSpan gcPauseBeforeEntityTick = GC.GetTotalPauseDuration();
+            long allocatedBeforeEntityTick = GC.GetTotalAllocatedBytes(precise: false);
+            int gen0BeforeEntityTick = GC.CollectionCount(0);
+            int gen1BeforeEntityTick = GC.CollectionCount(1);
+            int gen2BeforeEntityTick = GC.CollectionCount(2);
+            long stageStartedAt = Stopwatch.GetTimestamp();
             bool shouldBroadcast = session.Entity.Tick(
                 context.FixedDelta,
                 context.Now,
@@ -378,7 +499,30 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                 out byte flags,
                 out byte moveState,
                 out ServerPlayerSnapshotReason reason);
+            _lastEntityTickMs = ElapsedMillisecondsSince(stageStartedAt);
+            _lastEntityStatusReadMs = session.Entity.LastTickStatusReadMs;
+            _lastEntityInputMs = session.Entity.LastTickInputMs;
+            _lastEntityMotorMs = session.Entity.LastTickMotorMs;
+            _lastEntityCollisionWorldLookupMs = session.Entity.LastTickCollisionWorldLookupMs;
+            _lastEntityMotorPreparationMs = session.Entity.LastTickMotorPreparationMs;
+            _lastEntityHorizontalCollisionMs = session.Entity.LastTickHorizontalCollisionMs;
+            _lastEntityPostCollisionMs = session.Entity.LastTickPostCollisionMs;
+            _lastEntityMotorOtherMs = session.Entity.LastTickMotorOtherMs;
+            _lastEntitySnapshotDecisionMs = session.Entity.LastTickSnapshotDecisionMs;
+            _lastEntityLocationUpdateMs = session.Entity.LastTickLocationUpdateMs;
+            _lastEntityUnattributedMs = session.Entity.LastTickUnattributedMs;
+            _lastEntityGcPauseMs = Math.Max(0d,
+                (GC.GetTotalPauseDuration() - gcPauseBeforeEntityTick).TotalMilliseconds);
+            _lastEntityAllocatedBytes = Math.Max(0L,
+                GC.GetTotalAllocatedBytes(precise: false) - allocatedBeforeEntityTick);
+            _lastEntityGcGen0Collections = Math.Max(0,
+                GC.CollectionCount(0) - gen0BeforeEntityTick);
+            _lastEntityGcGen1Collections = Math.Max(0,
+                GC.CollectionCount(1) - gen1BeforeEntityTick);
+            _lastEntityGcGen2Collections = Math.Max(0,
+                GC.CollectionCount(2) - gen2BeforeEntityTick);
 
+            stageStartedAt = Stopwatch.GetTimestamp();
             CharacterLocationState currentLocation = session.Entity.CaptureLocation();
             if (_owner._runtime.Spawns.IsOutsideRecoveryBounds(currentLocation, out string boundsDetail))
             {
@@ -403,13 +547,37 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                         $"Player world recovery failed: peer={session.Peer.Id}, {boundsDetail}; {recoveryDetail}");
                 }
             }
+            _lastRecoveryCheckMs = ElapsedMillisecondsSince(stageStartedAt);
 
+            stageStartedAt = Stopwatch.GetTimestamp();
             if (shouldBroadcast)
-                _owner.BroadcastSnapshot(session, speed, flags, moveState, reason);
+            {
+                SnapshotAoiTiming aoiTiming = _owner.BroadcastSnapshot(
+                    session, speed, flags, moveState, reason, captureAoiTiming: true);
+                _lastSnapshotPlayerInterestMs = aoiTiming.PlayerInterestMs;
+                _lastSnapshotPopulationMs = aoiTiming.PopulationMs;
+                _lastSnapshotWorldItemsMs = aoiTiming.WorldItemsMs;
+                _lastSnapshotFanoutMs = aoiTiming.FanoutMs;
+            }
+            _lastSnapshotAoiMs = ElapsedMillisecondsSince(stageStartedAt);
 
+            stageStartedAt = Stopwatch.GetTimestamp();
             if (!session.SimulationDirty && !session.Entity.RequiresContinuousSimulation(nowMilliseconds))
                 _owner.RemoveActiveSimulationSession(session);
+            _lastCleanupMs = ElapsedMillisecondsSince(stageStartedAt);
+
+            _lastWorkTotalMs = ElapsedMillisecondsSince(workStartedAt);
+            _lastOutsideStagesMs = Math.Max(0d, _lastWorkTotalMs - _lastEntityTickMs -
+                _lastRecoveryCheckMs - _lastSnapshotAoiMs - _lastCleanupMs);
         }
+    }
+
+    private readonly struct SnapshotAoiTiming
+    {
+        public double PlayerInterestMs { get; init; }
+        public double PopulationMs { get; init; }
+        public double WorldItemsMs { get; init; }
+        public double FanoutMs { get; init; }
     }
 
     public GameServerHost(
@@ -766,17 +934,23 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         _serverTick = candidate == 0 ? 1u : candidate;
     }
 
-    private void BroadcastSnapshot(
+    private SnapshotAoiTiming BroadcastSnapshot(
         ClientSession targetSession,
         float speed,
         byte flags,
         byte moveState,
         ServerPlayerSnapshotReason reason,
         byte actionState = (byte)PlayerEntityActionState.None,
-        byte actionId = 0)
+        byte actionId = 0,
+        bool captureAoiTiming = false)
     {
         if (!IsCurrent(targetSession) || !targetSession.Ready || targetSession.Entity == null)
-            return;
+            return default;
+
+        double playerInterestMs = 0d;
+        double populationMs = 0d;
+        double worldItemsMs = 0d;
+        double fanoutMs = 0d;
 
         // Persistent interaction presentation is authoritative state for the lifetime of the
         // interaction, not a one-shot pulse. Overlay it once per source broadcast so ordinary
@@ -799,14 +973,35 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         // reach serialization or LiteNetLib Send().
         if ((reason & (ServerPlayerSnapshotReason.Position | ServerPlayerSnapshotReason.Forced)) != 0)
         {
+            long stageStartedAt = captureAoiTiming ? Stopwatch.GetTimestamp() : 0L;
             ApplyInterestChanges(_worldInterest.ReconcileMoved(targetSession));
-            ReconcilePopulationObserver(targetSession);
+            if (captureAoiTiming)
+                playerInterestMs = ElapsedMillisecondsSince(stageStartedAt);
 
+            stageStartedAt = captureAoiTiming ? Stopwatch.GetTimestamp() : 0L;
+            ReconcilePopulationObserver(targetSession);
+            if (captureAoiTiming)
+                populationMs = ElapsedMillisecondsSince(stageStartedAt);
+
+            stageStartedAt = captureAoiTiming ? Stopwatch.GetTimestamp() : 0L;
             TryReconcileWorldItemInterestMoved(targetSession);
+            if (captureAoiTiming)
+                worldItemsMs = ElapsedMillisecondsSince(stageStartedAt);
         }
 
+        long fanoutStartedAt = captureAoiTiming ? Stopwatch.GetTimestamp() : 0L;
         if (!_worldInterest.TryGetObservers(targetSession, out HashSet<ClientSession> observers))
-            return;
+        {
+            if (captureAoiTiming)
+                fanoutMs = ElapsedMillisecondsSince(fanoutStartedAt);
+            return new SnapshotAoiTiming
+            {
+                PlayerInterestMs = playerInterestMs,
+                PopulationMs = populationMs,
+                WorldItemsMs = worldItemsMs,
+                FanoutMs = fanoutMs,
+            };
+        }
 
         bool forceImmediate =
             (reason & (ServerPlayerSnapshotReason.Forced |
@@ -848,6 +1043,16 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
                 actionState,
                 actionId);
         }
+
+        if (captureAoiTiming)
+            fanoutMs = ElapsedMillisecondsSince(fanoutStartedAt);
+        return new SnapshotAoiTiming
+        {
+            PlayerInterestMs = playerInterestMs,
+            PopulationMs = populationMs,
+            WorldItemsMs = worldItemsMs,
+            FanoutMs = fanoutMs,
+        };
     }
 
     private static CoreRuntimeSchedulerSettings CreateSchedulerSettings(int tickRate, int maxConnections)

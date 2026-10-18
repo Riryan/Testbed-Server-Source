@@ -114,6 +114,8 @@ internal static class Program
         {
             RunSync("civilian LOD follows observer exit and preserves combat families", AuditCivilianLod);
             RunSync("wake/hibernate hysteresis and threat wake remain authoritative", AuditHysteresisAndThreat);
+            RunSync("small player partition refresh keeps exact moving-player positions", AuditSmallPlayerPartitionRefresh);
+            RunSync("actor partition key follows map and instance changes", AuditActorPartitionKeyInvalidation);
             RunSync("no observers leaves Population unscheduled", AuditNoObservers);
             Console.WriteLine("All Population audit V3 regression tests passed.");
             return;
@@ -126,6 +128,7 @@ internal static class Program
         RunSync("Population portal spawn remains dormant until a player activates it", PopulationPortalActivationUsesExistingPortal);
         RunSync("Population portal can release multiple active Pops from one authored spawn", PopulationPortalAllowsMultipleActive);
         RunSync("Population portal staggers release cadence without per-Pop timers", PopulationPortalStaggersReleaseCadence);
+        RunSync("Population portal cycle uses primary baked endpoints and resumes at destination", PopulationPortalCycleUsesPrimaryNodes);
         RunSync("Monster free roam uses shared actor runtime without route nodes", MonsterFreeRoamUsesSharedRuntime);
         RunSync("Monster free roam idles beyond configured free-roam distance", MonsterFreeRoamIdlesAtFarRange);
         RunSync("NPC route movement uses shared actor runtime", NpcRouteMovementUsesSharedRuntime);
@@ -270,6 +273,27 @@ internal static class Program
             "authoritative threat must be accepted");
         Require(!actor.IsHibernating && actor.SimulationLod == PopulationSimulationLod.Engaged &&
             service.HasDueScheduledActorWork(117d), "threat must immediately wake and schedule engaged work");
+    }
+
+    private static void AuditSmallPlayerPartitionRefresh()
+    {
+        var (service, actor) = AuditPopulation();
+        AuditStep(service, actor, 0f, 1d);
+        Require(actor.SimulationLod == PopulationSimulationLod.Active,
+            "player at actor must put civilian into Active LOD");
+        AuditStep(service, actor, 70f, 2d);
+        Require(actor.SimulationLod == PopulationSimulationLod.CoarseRoute,
+            "small-partition refresh must use exact current player position");
+    }
+
+    private static void AuditActorPartitionKeyInvalidation()
+    {
+        var (service, actor) = AuditPopulation();
+        AuditStep(service, actor, 0f, 1d);
+        actor.Actor.InstanceId = "population_test_instance_2";
+        AuditStep(service, actor, 0f, 2d, "population_test_instance_2");
+        Require(actor.SimulationLod == PopulationSimulationLod.Active,
+            "partition key must refresh after actor instance change");
     }
 
     private static void AuditWorkload(float civilianActiveDistance, int ticks = 600)
@@ -500,8 +524,8 @@ internal static class Program
 
         Require(!pop.IsHibernating, "portal-spawned Population should become spatially active");
         Require(pop.AiState == PopulationAiState.FollowingRoute, "portal-spawned Population should enter its route state");
-        Require(pop.PortalSequencePhase == PopulationPortalSequencePhase.Interior,
-            "portal-spawned Population should begin the authored interior-to-exterior sequence");
+        Require(pop.PortalSequencePhase == PopulationPortalSequencePhase.None,
+            "portal-spawned Population should begin normal route movement from its single baked exterior anchor");
         Require(!actors.IsSpatiallySuspended(pop.Actor), "portal-spawned Population should resume authoritative spatial presence");
     }
 
@@ -509,7 +533,10 @@ internal static class Program
     private static void PopulationPortalAllowsMultipleActive()
     {
         ServerMapSnapshot map = CreatePopulationMap(includePortal: true);
-        map.populationPortals[0].maximumActiveNearby = 17;
+        // Ambient civilian count is set by this spawner's authored slots/capacity;
+        // nearby-density throttles must not reject its own baked actors.
+        map.populationPortals[0].maximumActiveNearby = 1;
+        map.populationPortals[0].maximumActiveInWorld = 17;
         map.populationPortals[0].minimumSpawnInterval = 0f;
         map.populationPortals[0].maximumSpawnInterval = 0f;
         map.populationPortals[0].spawnBurstLimit = 17;
@@ -660,6 +687,76 @@ internal static class Program
                 active++;
         }
         return active;
+    }
+
+    private static void PopulationPortalCycleUsesPrimaryNodes()
+    {
+        ServerMapSnapshot map = CreatePopulationMap(includePortal: true);
+        map.populationNodes[1].pose = new ServerPose(1f, 0f, 0f);
+        map.populationPortals[0].routeNodeIds = new[] { 1001L, 1002L };
+        map.populationPortals[0].minimumRespawnDelay = 0f;
+        map.populationPortals[0].maximumRespawnDelay = 0f;
+        map.populationPortals = new[]
+        {
+            map.populationPortals[0],
+            new ServerPopulationPortal
+            {
+                stableId = 5002,
+                label = "Despawn B",
+                mode = PopulationPortalMode.DespawnOnly,
+                allowedNpcTypes = PopulationNpcTypeMask.All,
+                routeNodeId = 1002,
+                exterior = new ServerPose(1f, 0f, 0f),
+                minimumRespawnDelay = 0f,
+                maximumRespawnDelay = 0f,
+            },
+        };
+
+        var population = new PopulationSimulationService(
+            new ServerMapCatalog(new[] { map }), new AuthoritativeActorRegistry(), null)
+        {
+            PlayerActivationDistance = 96f,
+            PlayerHibernateDistance = 128f,
+            ActiveDistance = 96f,
+            MaximumPortalRespawnsPerTick = 8,
+        };
+        PopulationActorRuntime pop = SinglePopulation(population);
+        var players = new[]
+        {
+            new PopulationPlayerView(99, "population_test", string.Empty, new WorldPosition(0f, 0f, 0f)),
+        };
+
+        double now = 1d;
+        bool reachedDestination = false;
+        for (int i = 0; i < 80; ++i)
+        {
+            population.TickBudgeted(0.25f, now, players, 1);
+            now += 0.25d;
+            if (pop.AiState == PopulationAiState.PortalDormant && pop.CurrentPortalId == 5002)
+            {
+                reachedDestination = true;
+                break;
+            }
+        }
+        Require(reachedDestination,
+            "actor should arrive at the DespawnOnly portal's primary route node instead of treating the source portal's alternate join node as an exit");
+        Require(pop.SpawnAnchorId == 7001,
+            "destination arrival must preserve the original authored spawn-slot owner");
+
+        bool resumedAtDestination = false;
+        for (int i = 0; i < 80; ++i)
+        {
+            population.TickBudgeted(0.25f, now, players, 1);
+            now += 0.25d;
+            if (!pop.IsHibernating && pop.CurrentPortalId == 5002 &&
+                pop.CurrentRouteNodeId == 1002)
+            {
+                resumedAtDestination = true;
+                break;
+            }
+        }
+        Require(resumedAtDestination,
+            "DespawnOnly destination should resume the existing actor from its authored endpoint after the wait");
     }
 
     private static void MonsterFreeRoamUsesSharedRuntime()

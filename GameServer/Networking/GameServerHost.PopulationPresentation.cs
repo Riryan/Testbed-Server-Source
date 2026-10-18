@@ -24,6 +24,27 @@ namespace Game.GameServer.Networking;
 /// </summary>
 internal sealed partial class GameServerHost
 {
+    private const int MaxPopulationActorsPerObserver = 30;
+
+    private sealed class PopulationActorDistanceComparer : IComparer<AuthoritativeActorRuntime>
+    {
+        public float ObserverX { get; set; }
+        public float ObserverZ { get; set; }
+
+        public int Compare(AuthoritativeActorRuntime left, AuthoritativeActorRuntime right)
+        {
+            float leftX = left.Position.X - ObserverX;
+            float leftZ = left.Position.Z - ObserverZ;
+            float rightX = right.Position.X - ObserverX;
+            float rightZ = right.Position.Z - ObserverZ;
+            int distanceOrder = ((leftX * leftX) + (leftZ * leftZ)).CompareTo(
+                (rightX * rightX) + (rightZ * rightZ));
+            return distanceOrder != 0
+                ? distanceOrder
+                : left.Handle.actorId.CompareTo(right.Handle.actorId);
+        }
+    }
+
     private sealed class PopulationPresentationState
     {
         public ServerPopulationPresentationEntity Entity { get; }
@@ -68,6 +89,8 @@ internal sealed partial class GameServerHost
     private readonly List<long> _populationActorIdScratch = new List<long>(128);
     private readonly List<AuthoritativeActorRuntime> _populationActorScratch =
         new List<AuthoritativeActorRuntime>(128);
+    private readonly PopulationActorDistanceComparer _populationActorDistanceComparer =
+        new PopulationActorDistanceComparer();
 
     // Reuse the existing PopulationAuthority cooperative work units for first
     // visibility after hibernation. No new tick, manager, message or network path.
@@ -329,6 +352,12 @@ internal sealed partial class GameServerHost
             }
         }
 
+        // A full client Population presentation set cannot admit another ambient actor.
+        // Actor-side reconciliation still admits a newly engaged actor and can replace
+        // the farthest ambient actor, so skip this repeated nearby-actor query here.
+        if (visible.Count >= MaxPopulationActorsPerObserver)
+            return;
+
         CharacterLocationState location = observer.Entity.Runtime.Location;
         _runtime.Actors.QueryRadius(
             location.MapId,
@@ -337,12 +366,30 @@ internal sealed partial class GameServerHost
             Math.Max(1f, _options.AoiRange),
             _populationActorScratch);
 
-        float enterRangeSquared = Math.Max(1f, _options.AoiRange) * Math.Max(1f, _options.AoiRange);
+        int populationCandidateCount = 0;
         for (int i = 0; i < _populationActorScratch.Count; ++i)
         {
             AuthoritativeActorRuntime actor = _populationActorScratch[i];
-            if (actor == null || actor.Handle.kind != AuthoritativeActorKind.Population ||
-                !_populationPresentations.TryGetValue(actor.Handle.actorId, out PopulationPresentationState state) ||
+            if (actor?.Handle.kind == AuthoritativeActorKind.Population)
+                _populationActorScratch[populationCandidateCount++] = actor;
+        }
+        if (populationCandidateCount < _populationActorScratch.Count)
+            _populationActorScratch.RemoveRange(
+                populationCandidateCount,
+                _populationActorScratch.Count - populationCandidateCount);
+
+        _populationActorDistanceComparer.ObserverX = observer.Entity.X;
+        _populationActorDistanceComparer.ObserverZ = observer.Entity.Z;
+        _populationActorScratch.Sort(_populationActorDistanceComparer);
+
+        float enterRangeSquared = Math.Max(1f, _options.AoiRange) * Math.Max(1f, _options.AoiRange);
+        for (int i = 0; i < _populationActorScratch.Count; ++i)
+        {
+            if (visible.Count >= MaxPopulationActorsPerObserver)
+                break;
+
+            AuthoritativeActorRuntime actor = _populationActorScratch[i];
+            if (!_populationPresentations.TryGetValue(actor.Handle.actorId, out PopulationPresentationState state) ||
                 !CanPresentPopulation(state) ||
                 PopulationDistanceSquared(observer, actor) > enterRangeSquared)
             {
@@ -421,6 +468,23 @@ internal sealed partial class GameServerHost
             visible = new HashSet<long>();
             _populationVisibleByObserver.Add(observer, visible);
         }
+        if (visible.Contains(actorId))
+            return;
+
+        if (visible.Count >= MaxPopulationActorsPerObserver)
+        {
+            if (!CanAdmitPriorityPopulation(state) ||
+                !TryRemoveFarthestAmbientPopulation(observer, visible))
+            {
+                return;
+            }
+
+            if (!_populationVisibleByObserver.TryGetValue(observer, out visible))
+            {
+                visible = new HashSet<long>();
+                _populationVisibleByObserver.Add(observer, visible);
+            }
+        }
         if (!visible.Add(actorId))
             return;
 
@@ -429,6 +493,48 @@ internal sealed partial class GameServerHost
 
         double interval = PopulationSnapshotInterval(observer, state.Entity.Population.Actor);
         state.NextSnapshotAt[observer] = _scheduler.ServerTime + interval;
+    }
+
+    private bool CanAdmitPriorityPopulation(PopulationPresentationState state)
+    {
+        PopulationActorRuntime population = state?.Entity?.Population;
+        return population != null &&
+               (population.AiState == PopulationAiState.Fighting ||
+                population.AiState == PopulationAiState.Fleeing ||
+                population.AiState == PopulationAiState.Recovering ||
+                state.PublicInteractionFlags != PopulationPublicInteractionFlags.None);
+    }
+
+    private bool TryRemoveFarthestAmbientPopulation(
+        ClientSession observer,
+        HashSet<long> visible)
+    {
+        long farthestActorId = 0L;
+        float farthestDistanceSquared = -1f;
+        foreach (long actorId in visible)
+        {
+            if (!_populationPresentations.TryGetValue(actorId, out PopulationPresentationState candidate) ||
+                CanAdmitPriorityPopulation(candidate))
+            {
+                continue;
+            }
+
+            float distanceSquared = PopulationDistanceSquared(observer, candidate.Entity.Population.Actor);
+            if (distanceSquared <= farthestDistanceSquared)
+                continue;
+
+            farthestDistanceSquared = distanceSquared;
+            farthestActorId = actorId;
+        }
+
+        if (farthestActorId == 0L ||
+            !_populationPresentations.TryGetValue(farthestActorId, out PopulationPresentationState farthest))
+        {
+            return false;
+        }
+
+        RemovePopulationVisibility(observer, farthest, sendDestroy: true);
+        return true;
     }
 
     private void RemovePopulationVisibility(

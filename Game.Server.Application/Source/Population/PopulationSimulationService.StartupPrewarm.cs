@@ -62,8 +62,8 @@ namespace Game.Server.Application.Population
         /// Runs exactly one initial portal-actor release work unit. Return false once all
         /// initial portal actors have been processed. The caller controls startup pacing.
         /// Startup preparation deliberately bypasses player-proximity and runtime release
-        /// cadence, but retains live collision/density safety, original portal ownership,
-        /// and the canonical ActivatePortalSpawn method.
+        /// cadence and original portal ownership, and uses the canonical ActivatePortalSpawn
+        /// method. Authored ambient civilian placement uses its baked spawn-slot validation.
         /// </summary>
         public bool PrewarmNextStartupPortal(out long actorId)
         {
