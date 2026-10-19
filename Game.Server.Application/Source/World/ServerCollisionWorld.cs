@@ -41,6 +41,8 @@ namespace Game.Server.Application.World
     /// </summary>
     public sealed partial class ServerCollisionWorld
     {
+        private const float SafeMovementCellSize = 4f;
+
         private readonly struct CellKey : IEquatable<CellKey>
         {
             public readonly int X;
@@ -60,9 +62,11 @@ namespace Game.Server.Application.World
         private readonly ServerMapSnapshot _map;
         private readonly ServerCollisionTriangle[] _movementTriangles;
         private readonly ServerCollisionTriangle[] _triangles;
+        private readonly ServerCollisionTriangle[] _safeMovementTriangles;
         private readonly float _cellSize;
         private readonly Dictionary<CellKey, List<int>> _movementTriangleGrid = new Dictionary<CellKey, List<int>>();
         private readonly Dictionary<CellKey, List<int>> _triangleGrid = new Dictionary<CellKey, List<int>>();
+        private readonly Dictionary<CellKey, List<int>> _safeMovementTriangleGrid = new Dictionary<CellKey, List<int>>();
         private readonly Dictionary<long, DynamicBlockerState> _dynamicBlockers = new Dictionary<long, DynamicBlockerState>();
         private readonly Dictionary<CellKey, List<long>> _dynamicBlockerGrid = new Dictionary<CellKey, List<long>>();
         private readonly HashSet<int> _movementQueryScratch = new HashSet<int>();
@@ -115,12 +119,17 @@ namespace Game.Server.Application.World
             _cellSize = IsFinite(cellSize) && cellSize >= 1f ? cellSize : 16f;
             _movementTriangles = map.movementTriangles ?? Array.Empty<ServerCollisionTriangle>();
             _triangles = map.collisionTriangles ?? Array.Empty<ServerCollisionTriangle>();
+            _safeMovementTriangles = map.safeMovementTriangles ?? Array.Empty<ServerCollisionTriangle>();
             if (_movementTriangles.Length == 0)
                 throw new InvalidOperationException(
                     $"Server map '{map.mapId}' has no baked movement surface. Re-bake it with ServerMap format {ServerMapFormat.Version}.");
             ComputeWorldBounds();
             BuildMovementTriangleGrid();
             BuildTriangleGrid();
+            if (_safeMovementTriangles.Length != 0 &&
+                IsFinite(map.safeMovementRadius) && map.safeMovementRadius > 0f &&
+                IsFinite(map.safeMovementHeight) && map.safeMovementHeight >= map.safeMovementRadius * 2f)
+                IndexTriangles(_safeMovementTriangles, _safeMovementTriangleGrid, SafeMovementCellSize);
 
             ServerDynamicBlocker[] blockers = map.dynamicBlockers ?? Array.Empty<ServerDynamicBlocker>();
             for (int i = 0; i < blockers.Length; ++i)
@@ -579,6 +588,17 @@ namespace Game.Server.Application.World
             if (length <= 0.000001f)
                 return startFeet;
 
+            // The bake's eroded walk surface is a server-trusted certificate that the
+            // player capsule clears immutable map geometry. When the whole move stays
+            // inside one certified triangle, preserve support/step rules with one ground
+            // query and keep live doors/dynamic blockers authoritative, while avoiding
+            // the repeated static capsule queries in each substep. Any uncertainty takes
+            // the original full collision path below.
+            if (grounded && TryResolveCertifiedSafeMove(
+                    startFeet, deltaX, deltaZ, capsule, stepHeight,
+                    groundSnapDistance, maximumSlopeDegrees, out WorldPosition safeMove))
+                return safeMove;
+
             float maxSubstep = Math.Max(0.05f, capsule.Radius * 0.5f);
             int steps = Math.Clamp((int)Math.Ceiling(length / maxSubstep), 1, 16);
             float sx = deltaX / steps;
@@ -628,6 +648,173 @@ namespace Game.Server.Application.World
             }
 
             return current;
+        }
+
+        private bool TryResolveCertifiedSafeMove(
+            WorldPosition startFeet,
+            float deltaX,
+            float deltaZ,
+            ServerCapsule capsule,
+            float stepHeight,
+            float groundSnapDistance,
+            float maximumSlopeDegrees,
+            out WorldPosition resolved)
+        {
+            resolved = startFeet;
+            if (_safeMovementTriangleGrid.Count == 0 ||
+                capsule.Radius > _map.safeMovementRadius + 0.0001f ||
+                capsule.Height > _map.safeMovementHeight + 0.0001f)
+                return false;
+
+            float targetX = startFeet.X + deltaX;
+            float targetZ = startFeet.Z + deltaZ;
+            float minX = Math.Min(startFeet.X, targetX);
+            float maxX = Math.Max(startFeet.X, targetX);
+            float minZ = Math.Min(startFeet.Z, targetZ);
+            float maxZ = Math.Max(startFeet.Z, targetZ);
+
+            // Dynamic blockers are mutable after bake. If any blocker occupies a grid
+            // cell touched by the swept capsule, use the full path, which checks its
+            // exact current enabled state and shape at every substep.
+            QueryDynamicBlockers(
+                minX - capsule.Radius, minZ - capsule.Radius,
+                maxX + capsule.Radius, maxZ + capsule.Radius);
+            if (_dynamicBlockerQueryScratch.Count != 0)
+                return false;
+
+            QuerySafeMovementTriangles(minX, minZ, maxX, maxZ);
+            float minimumNormalY = MathF.Cos(
+                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            float coveredUntil = 0f;
+            float coveredHeight = startFeet.Y;
+            float targetY = startFeet.Y;
+            const float coverageEpsilon = 0.0001f;
+            while (coveredUntil < 1f - coverageEpsilon)
+            {
+                float bestEnd = coveredUntil;
+                float bestHeight = coveredHeight;
+                float bestTargetY = targetY;
+                foreach (int index in _safeMovementQueryScratch)
+                {
+                    ServerCollisionTriangle triangle = _safeMovementTriangles[index];
+                    if (triangle.normalY < minimumNormalY ||
+                        !TryClipSegmentToTriangle(
+                            startFeet.X, startFeet.Z, targetX, targetZ,
+                            triangle, out float enter, out float exit) ||
+                        enter > coveredUntil + coverageEpsilon ||
+                        exit <= bestEnd + coverageEpsilon)
+                        continue;
+
+                    float coveredX = startFeet.X + deltaX * coveredUntil;
+                    float coveredZ = startFeet.Z + deltaZ * coveredUntil;
+                    float exitX = startFeet.X + deltaX * exit;
+                    float exitZ = startFeet.Z + deltaZ * exit;
+                    if (!TryTriangleHeightAtXZ(triangle, coveredX, coveredZ, out float startY) ||
+                        !TryTriangleHeightAtXZ(triangle, exitX, exitZ, out float endY))
+                        continue;
+
+                    // The NavMesh is voxelized. Reject mismatched floors and height jumps
+                    // at triangle joins so stairs, curbs, stacked floors, and unsupported
+                    // edges retain the existing collision solver.
+                    float expectedStartY = coveredUntil <= coverageEpsilon ? startFeet.Y : coveredHeight;
+                    if (Math.Abs(startY - expectedStartY) > 0.15f)
+                        continue;
+
+                    bestEnd = exit;
+                    bestHeight = endY;
+                    bestTargetY = endY;
+                }
+
+                if (bestEnd <= coveredUntil + coverageEpsilon)
+                    return false;
+
+                coveredUntil = bestEnd;
+                coveredHeight = bestHeight;
+                targetY = bestTargetY;
+            }
+
+            if (targetY > startFeet.Y + stepHeight + 0.05f ||
+                targetY < startFeet.Y - groundSnapDistance - 0.05f ||
+                !TryFindGround(
+                    new WorldPosition(targetX, targetY, targetZ),
+                    capsule.Radius,
+                    Math.Max(0.05f, stepHeight + 0.05f),
+                    Math.Max(0.05f, groundSnapDistance),
+                    maximumSlopeDegrees,
+                    out ServerGroundHit support) ||
+                Math.Abs(support.Position.Y - targetY) > 0.20f ||
+                support.Position.Y > startFeet.Y + stepHeight + 0.05f ||
+                support.Position.Y < startFeet.Y - groundSnapDistance - 0.05f)
+                return false;
+
+            resolved = new WorldPosition(targetX, support.Position.Y, targetZ);
+            return true;
+        }
+
+        private static bool TryClipSegmentToTriangle(
+            float startX, float startZ, float endX, float endZ,
+            ServerCollisionTriangle triangle, out float enter, out float exit)
+        {
+            enter = 0f;
+            exit = 1f;
+            float orientation = (triangle.bx - triangle.ax) * (triangle.cz - triangle.az) -
+                                (triangle.bz - triangle.az) * (triangle.cx - triangle.ax);
+            if (Math.Abs(orientation) <= 0.0000001f)
+                return false;
+
+            float sign = orientation > 0f ? 1f : -1f;
+            float dx = endX - startX;
+            float dz = endZ - startZ;
+            const float epsilon = 0.000001f;
+            return ClipTriangleEdge(
+                       triangle.ax, triangle.az, triangle.bx, triangle.bz,
+                       startX, startZ, dx, dz, sign, epsilon, ref enter, ref exit) &&
+                   ClipTriangleEdge(
+                       triangle.bx, triangle.bz, triangle.cx, triangle.cz,
+                       startX, startZ, dx, dz, sign, epsilon, ref enter, ref exit) &&
+                   ClipTriangleEdge(
+                       triangle.cx, triangle.cz, triangle.ax, triangle.az,
+                       startX, startZ, dx, dz, sign, epsilon, ref enter, ref exit) &&
+                   exit >= 0f && enter <= 1f;
+        }
+
+        private static bool ClipTriangleEdge(
+            float ax, float az, float bx, float bz,
+            float startX, float startZ, float dx, float dz,
+            float sign, float epsilon, ref float enter, ref float exit)
+        {
+            float edgeX = bx - ax;
+            float edgeZ = bz - az;
+            float atStart = sign * (edgeX * (startZ - az) - edgeZ * (startX - ax));
+            float along = sign * (edgeX * dz - edgeZ * dx);
+            if (Math.Abs(along) <= 0.0000001f)
+                return atStart >= -epsilon;
+
+            float crossing = (-epsilon - atStart) / along;
+            if (along > 0f)
+                enter = Math.Max(enter, crossing);
+            else
+                exit = Math.Min(exit, crossing);
+            return enter <= exit + epsilon;
+        }
+
+        private readonly HashSet<int> _safeMovementQueryScratch = new HashSet<int>();
+
+        private void QuerySafeMovementTriangles(float minX, float minZ, float maxX, float maxZ)
+        {
+            _safeMovementQueryScratch.Clear();
+            int minCellX = ToCell(minX, SafeMovementCellSize);
+            int maxCellX = ToCell(maxX, SafeMovementCellSize);
+            int minCellZ = ToCell(minZ, SafeMovementCellSize);
+            int maxCellZ = ToCell(maxZ, SafeMovementCellSize);
+            for (int z = minCellZ; z <= maxCellZ; ++z)
+            for (int x = minCellX; x <= maxCellX; ++x)
+            {
+                if (!_safeMovementTriangleGrid.TryGetValue(new CellKey(x, z), out List<int> list))
+                    continue;
+                for (int i = 0; i < list.Count; ++i)
+                    _safeMovementQueryScratch.Add(list[i]);
+            }
         }
 
         private bool TryResolveHorizontalCandidate(
@@ -928,8 +1115,10 @@ namespace Game.Server.Application.World
 
         private void IndexTriangles(
             ServerCollisionTriangle[] source,
-            Dictionary<CellKey, List<int>> grid)
+            Dictionary<CellKey, List<int>> grid,
+            float cellSize = 0f)
         {
+            float indexCellSize = cellSize > 0f ? cellSize : _cellSize;
             for (int i = 0; i < source.Length; ++i)
             {
                 ServerCollisionTriangle t = source[i];
@@ -937,10 +1126,10 @@ namespace Game.Server.Application.World
                 float maxX = Math.Max(t.ax, Math.Max(t.bx, t.cx));
                 float minZ = Math.Min(t.az, Math.Min(t.bz, t.cz));
                 float maxZ = Math.Max(t.az, Math.Max(t.bz, t.cz));
-                int minCellX = ToCell(minX);
-                int maxCellX = ToCell(maxX);
-                int minCellZ = ToCell(minZ);
-                int maxCellZ = ToCell(maxZ);
+                int minCellX = ToCell(minX, indexCellSize);
+                int maxCellX = ToCell(maxX, indexCellSize);
+                int minCellZ = ToCell(minZ, indexCellSize);
+                int maxCellZ = ToCell(maxZ, indexCellSize);
                 for (int z = minCellZ; z <= maxCellZ; ++z)
                 for (int x = minCellX; x <= maxCellX; ++x)
                 {
@@ -1037,6 +1226,7 @@ namespace Game.Server.Application.World
         }
 
         private int ToCell(float value) => (int)MathF.Floor(value / _cellSize);
+        private static int ToCell(float value, float cellSize) => (int)MathF.Floor(value / cellSize);
 
         // Return the triangle's height at the closest XZ location to the capsule
         // center. On an inclined mesh, the remote high vertex is irrelevant to the

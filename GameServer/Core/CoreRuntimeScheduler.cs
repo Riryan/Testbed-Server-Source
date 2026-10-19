@@ -71,6 +71,11 @@ namespace LiteNetLibManager
         public bool logStartupGraceOverruns = true;
 
 #if UNITY_5_3_OR_NEWER
+        [Tooltip("Only log invocation overruns for this system. Set empty to silence all overrun warnings. Measurements, work deferral, strikes, and quarantine remain active.")]
+#endif
+        public string invocationOverrunLogSystemName = "PlayerEntityAuthorityBatch";
+
+#if UNITY_5_3_OR_NEWER
         [Header("Overrun Protection")]
         [Tooltip("A single scheduled system/work-unit at or above this duration receives an overrun strike unless the registration overrides the value.")]
         [Min(0.1f)]
@@ -1132,7 +1137,8 @@ namespace LiteNetLibManager
             {
                 _startupGraceOverruns++;
 
-                if (_settings.logStartupGraceOverruns && _serverTime >= entry.NextWarningTime)
+                if (ShouldLogInvocationOverrun(entry) && _settings.logStartupGraceOverruns &&
+                    _serverTime >= entry.NextWarningTime)
                 {
                     string diagnosticContext = GetBudgetedWorkDiagnosticContext(entry, invocation, workUnitIndex);
                     CoreRuntimeSchedulerLog.Info(
@@ -1152,7 +1158,7 @@ namespace LiteNetLibManager
             // existing exception strikes here.
             if (!failed && entry.WorkSystem != null)
             {
-                if (_serverTime >= entry.NextWarningTime)
+                if (ShouldLogInvocationOverrun(entry) && _serverTime >= entry.NextWarningTime)
                 {
                     string diagnosticContext = GetBudgetedWorkDiagnosticContext(entry, invocation, workUnitIndex);
                     CoreRuntimeSchedulerLog.Warning(
@@ -1166,7 +1172,8 @@ namespace LiteNetLibManager
 
             entry.OverrunStrikes++;
 
-            if (entry.OverrunStrikes > 1 && _serverTime >= entry.NextWarningTime)
+            if (ShouldLogInvocationOverrun(entry) && entry.OverrunStrikes > 1 &&
+                _serverTime >= entry.NextWarningTime)
             {
                 CoreRuntimeSchedulerLog.Warning(
                     $"[CoreRuntimeScheduler] System '{entry.Name}' in channel '{channel.Config.name}' took {elapsedMilliseconds:F3} ms " +
@@ -1210,6 +1217,11 @@ namespace LiteNetLibManager
                 ? $"invocation={invocationDetail} "
                 : $"invocation={invocationDetail}, {detail} ";
         }
+
+        private bool ShouldLogInvocationOverrun(Entry entry) =>
+            entry != null &&
+            !string.IsNullOrWhiteSpace(_settings.invocationOverrunLogSystemName) &&
+            string.Equals(entry.Name, _settings.invocationOverrunLogSystemName, StringComparison.Ordinal);
 
         private void HandleSystemException(Entry entry, Exception ex)
         {

@@ -108,6 +108,12 @@ namespace Game.Shared.World
         [DataMember(Name = "sharedWorld")] public ServerSharedWorldInfo sharedWorld;
         [DataMember(Name = "movementTriangles")] public ServerCollisionTriangle[] movementTriangles = Array.Empty<ServerCollisionTriangle>();
         [DataMember(Name = "collisionTriangles")] public ServerCollisionTriangle[] collisionTriangles = Array.Empty<ServerCollisionTriangle>();
+        // Conservative, agent-radius-eroded walk surface emitted by the client bake.
+        // The server only uses a triangle to bypass repeated static collision substeps
+        // when the full attempted move remains inside that single certified triangle.
+        [DataMember(Name = "safeMovementTriangles")] public ServerCollisionTriangle[] safeMovementTriangles = Array.Empty<ServerCollisionTriangle>();
+        [DataMember(Name = "safeMovementRadius")] public float safeMovementRadius;
+        [DataMember(Name = "safeMovementHeight")] public float safeMovementHeight;
         [DataMember(Name = "dynamicBlockers")] public ServerDynamicBlocker[] dynamicBlockers = Array.Empty<ServerDynamicBlocker>();
         [DataMember(Name = "traversalLinks")] public ServerTraversalLink[] traversalLinks = Array.Empty<ServerTraversalLink>();
         [DataMember(Name = "spawnAnchors")] public ServerSpawnAnchor[] spawnAnchors = Array.Empty<ServerSpawnAnchor>();

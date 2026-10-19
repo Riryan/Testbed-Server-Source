@@ -86,6 +86,13 @@ internal static class Program
 
     private static async Task Main(string[] args)
     {
+        if (Array.IndexOf(args, "--movement-safe-fast-path") >= 0)
+        {
+            RunSync("certified flat movement remains within authored support", CertifiedFlatMove);
+            RunSync("movement leaving a certified region returns to static collision", CertifiedMoveKeepsStaticCollision);
+            RunSync("dynamic blockers still force authoritative collision", CertifiedMoveKeepsDynamicBlockers);
+            return;
+        }
         if (Array.IndexOf(args, "--population-route-v4") >= 0)
         {
             RunSync("validated slow travel never invokes stuck recovery", RouteSlowTravel);
@@ -1068,7 +1075,6 @@ internal static class Program
                 },
             }
             : Array.Empty<ServerPopulationPortal>();
-
         return new ServerMapSnapshot
         {
             formatVersion = ServerMapFormat.Version,
@@ -1135,6 +1141,123 @@ internal static class Program
                 flags = flags,
             },
         };
+    }
+
+    private static ServerMapSnapshot CertifiedMovementMap(ServerDynamicBlocker[] blockers = null)
+    {
+        const float extent = 10f;
+        ServerSurfaceFlags flags = ServerSurfaceFlags.Walkable | ServerSurfaceFlags.Ground;
+        ServerCollisionTriangle[] ground =
+        {
+            new ServerCollisionTriangle
+            {
+                surfaceId = 1,
+                ax = -extent, ay = 0f, az = -extent,
+                bx = -extent, by = 0f, bz = extent,
+                cx = extent, cy = 0f, cz = extent,
+                normalY = 1f,
+                flags = flags,
+            },
+            new ServerCollisionTriangle
+            {
+                surfaceId = 1,
+                ax = -extent, ay = 0f, az = -extent,
+                bx = extent, by = 0f, bz = extent,
+                cx = extent, cy = 0f, cz = -extent,
+                normalY = 1f,
+                flags = flags,
+            },
+        };
+        return new ServerMapSnapshot
+        {
+            mapId = "certified_movement_test",
+            movementTriangles = ground,
+            collisionTriangles = ground,
+            safeMovementTriangles = ground,
+            safeMovementRadius = 0.35f,
+            safeMovementHeight = 1.8f,
+            dynamicBlockers = blockers ?? Array.Empty<ServerDynamicBlocker>(),
+        };
+    }
+
+    private static void CertifiedFlatMove()
+    {
+        var world = new ServerCollisionWorld(CertifiedMovementMap());
+        WorldPosition moved = world.ResolveHorizontalMove(
+            new WorldPosition(0f, 0f, 0f), 0.5f, 0f,
+            new ServerCapsule(0.35f, 1.8f), 0.4f, 0.5f, 50f,
+            grounded: true, allowWallSlide: false, out bool blocked);
+        Require(!blocked, "clear certified movement should remain unblocked");
+        Require(Math.Abs(moved.X - 0.5f) < 0.001f && Math.Abs(moved.Y) < 0.001f,
+            "clear certified movement should preserve the requested horizontal step and ground height");
+    }
+
+    private static void CertifiedMoveKeepsDynamicBlockers()
+    {
+        var blocker = new ServerDynamicBlocker
+        {
+            stableId = 9001,
+            pose = new ServerPose(0.8f, 1f, 0f),
+            sizeX = 0.3f,
+            sizeY = 2f,
+            sizeZ = 1f,
+            enabledByDefault = true,
+        };
+        var world = new ServerCollisionWorld(CertifiedMovementMap(new[] { blocker }));
+        WorldPosition moved = world.ResolveHorizontalMove(
+            new WorldPosition(0f, 0f, 0f), 1.2f, 0f,
+            new ServerCapsule(0.35f, 1.8f), 0.4f, 0.5f, 50f,
+            grounded: true, allowWallSlide: false, out bool blocked);
+        Require(blocked, "movement through an enabled dynamic blocker must still be rejected");
+        Require(moved.X < 0.8f, "the authoritative result must stop before the blocker");
+    }
+
+    private static void CertifiedMoveKeepsStaticCollision()
+    {
+        ServerMapSnapshot map = CertifiedMovementMap();
+        map.safeMovementTriangles = new[]
+        {
+            new ServerCollisionTriangle
+            {
+                ax = -1f, ay = 0f, az = -1f,
+                bx = -1f, by = 0f, bz = 1f,
+                cx = 0.35f, cy = 0f, cz = 1f,
+                normalY = 1f,
+            },
+            new ServerCollisionTriangle
+            {
+                ax = -1f, ay = 0f, az = -1f,
+                bx = 0.35f, by = 0f, bz = 1f,
+                cx = 0.35f, cy = 0f, cz = -1f,
+                normalY = 1f,
+            },
+        };
+
+        ServerCollisionTriangle[] ground = map.collisionTriangles;
+        var wallA = new ServerCollisionTriangle
+        {
+            ax = 0.6f, ay = 0f, az = -2f,
+            bx = 0.6f, by = 2f, bz = -2f,
+            cx = 0.6f, cy = 2f, cz = 2f,
+        };
+        var wallB = new ServerCollisionTriangle
+        {
+            ax = 0.6f, ay = 0f, az = -2f,
+            bx = 0.6f, by = 2f, bz = 2f,
+            cx = 0.6f, cy = 0f, cz = 2f,
+        };
+        map.collisionTriangles = new[]
+        {
+            ground[0], ground[1], wallA, wallB,
+        };
+
+        var world = new ServerCollisionWorld(map);
+        WorldPosition moved = world.ResolveHorizontalMove(
+            new WorldPosition(0f, 0f, 0f), 1.2f, 0f,
+            new ServerCapsule(0.35f, 1.8f), 0.4f, 0.5f, 50f,
+            grounded: true, allowWallSlide: false, out bool blocked);
+        Require(blocked, "movement outside the certified region must retain static obstacle enforcement");
+        Require(moved.X < 0.6f, "the authoritative result must stop before the static wall");
     }
 
     private static (PlayerItemService Service, PlayerRuntime Runtime, FakeRepository Repository) CreateHarness(CommitBehavior behavior)
