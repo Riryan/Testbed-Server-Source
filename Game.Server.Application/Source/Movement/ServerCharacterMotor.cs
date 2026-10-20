@@ -20,7 +20,8 @@ namespace Game.Server.Application.Movement
             Jump = jump;
         }
 
-        private static float ClampUnit(float value) => float.IsNaN(value) ? 0f : Math.Clamp(value, -1f, 1f);
+        private static float ClampUnit(float value) =>
+            float.IsNaN(value) ? 0f : Math.Clamp(value, -1f, 1f);
     }
 
     public sealed class CharacterMotorSettings
@@ -54,17 +55,15 @@ namespace Game.Server.Application.Movement
     }
 
     /// <summary>
-    /// Common server-authoritative kinematic character motor. It consumes intent from a
-    /// Player or AI and owns XYZ. Animator/root motion never enters this API.
+    /// Server-authoritative kinematic motor. Grounded horizontal movement uses the
+    /// SAME GroundedMove.cs as Unity client prediction. Jump/fall/landing retains
+    /// the existing motor paths. Animator/root motion has no authority here.
     /// </summary>
     public sealed class ServerCharacterMotor
     {
         private readonly CharacterMotorSettings _settings;
         private readonly ServerCapsule _capsule;
 
-        // One rejected position/direction per motor. A held input into an immutable
-        // baked wall is NOT a reason to repeat the same collision query at 20 Hz.
-        // World identity and all proposed movement dimensions are part of the key.
         private ServerCollisionWorld _rejectedWorld;
         private WorldPosition _rejectedAt;
         private float _rejectedDeltaX;
@@ -85,20 +84,26 @@ namespace Game.Server.Application.Movement
 
         public CharacterMotorSettings Settings => _settings;
 
-        public void Tick(CharacterMotorState state, CharacterMovementIntent intent, float fixedDelta, ServerCollisionWorld collisionWorld)
+        public void Tick(CharacterMotorState state, CharacterMovementIntent intent,
+            float fixedDelta, ServerCollisionWorld collisionWorld)
         {
-            Tick(state, intent, fixedDelta, collisionWorld, allowWallSlide: false, out _);
+            TickInternal(state, intent, fixedDelta, collisionWorld, false, out _, true);
         }
 
-        // Kept for API compatibility with existing callers. No wall slide is allowed.
-        // A blocked baked movement is rejected rather than resolved along X or Z.
-        public void Tick(
-            CharacterMotorState state,
-            CharacterMovementIntent intent,
-            float fixedDelta,
-            ServerCollisionWorld collisionWorld,
-            bool allowWallSlide,
-            out bool blocked)
+        // Population and other explicit six-argument callers keep the validated
+        // existing movement resolver. PlayerEntity uses the four-argument overload
+        // and ONLY that path uses canonical shared horizontal movement.
+        public void Tick(CharacterMotorState state, CharacterMovementIntent intent,
+            float fixedDelta, ServerCollisionWorld collisionWorld,
+            bool allowWallSlide, out bool blocked)
+        {
+            TickInternal(state, intent, fixedDelta, collisionWorld,
+                allowWallSlide, out blocked, false);
+        }
+
+        private void TickInternal(CharacterMotorState state, CharacterMovementIntent intent,
+            float fixedDelta, ServerCollisionWorld collisionWorld,
+            bool allowWallSlide, out bool blocked, bool sharedGrounded)
         {
             long tickStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             long stageStartedAt = tickStartedAt;
@@ -107,14 +112,18 @@ namespace Game.Server.Application.Movement
             LastTickPostCollisionMs = 0d;
             LastTickOtherMs = 0d;
             blocked = false;
-            if (state == null || fixedDelta <= 0f || float.IsNaN(fixedDelta) || float.IsInfinity(fixedDelta))
+            if (state == null || fixedDelta <= 0f ||
+                float.IsNaN(fixedDelta) || float.IsInfinity(fixedDelta))
             {
                 LastTickOtherMs = ElapsedMillisecondsSince(tickStartedAt);
                 return;
             }
 
-            if (state.Mode == ActorMovementMode.Dead || state.Mode == ActorMovementMode.InteractionLocked ||
-                state.Mode == ActorMovementMode.Vaulting || state.Mode == ActorMovementMode.Ladder || state.Mode == ActorMovementMode.Mounted)
+            if (state.Mode == ActorMovementMode.Dead ||
+                state.Mode == ActorMovementMode.InteractionLocked ||
+                state.Mode == ActorMovementMode.Vaulting ||
+                state.Mode == ActorMovementMode.Ladder ||
+                state.Mode == ActorMovementMode.Mounted)
             {
                 LastTickOtherMs = ElapsedMillisecondsSince(tickStartedAt);
                 return;
@@ -128,9 +137,7 @@ namespace Game.Server.Application.Movement
                 float inv = 1f / MathF.Sqrt(magnitudeSq);
                 x *= inv;
                 z *= inv;
-                magnitudeSq = 1f;
             }
-
             float speed = intent.Sprint ? _settings.SprintSpeed : _settings.WalkSpeed;
             float dx = x * speed * fixedDelta;
             float dz = z * speed * fixedDelta;
@@ -138,83 +145,74 @@ namespace Game.Server.Application.Movement
 
             if (collisionWorld == null)
             {
-                state.Position = new WorldPosition(state.Position.X + dx, state.Position.Y, state.Position.Z + dz);
+                state.Position = new WorldPosition(state.Position.X + dx,
+                    state.Position.Y, state.Position.Z + dz);
                 state.LastSafePosition = state.Position;
                 state.Grounded = true;
                 state.Mode = ActorMovementMode.Grounded;
                 state.VerticalVelocity = 0f;
-                LastTickPostCollisionMs = ElapsedMillisecondsSince(tickStartedAt) - LastTickPreparationMs;
+                LastTickPostCollisionMs =
+                    ElapsedMillisecondsSince(tickStartedAt) - LastTickPreparationMs;
                 return;
             }
 
             stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             WorldPosition previousPosition = state.Position;
             WorldPosition moved = state.Position;
+            bool groundedHorizontal = state.Grounded && !intent.Jump;
 
-            // Cached denial is still authoritative: it is bound to the same baked
-            // world, unchanged feet, unchanged input displacement and grounded pose.
-            // An input change or an accepted move immediately invalidates it.
-            if (state.Grounded && !intent.Jump &&
-                _hasRejectedGroundedMove &&
+            // Static wall press: cached only for an identical world, position and
+            // displacement. New direction, jump, world or pose means revalidate.
+            if (groundedHorizontal && _hasRejectedGroundedMove &&
                 ReferenceEquals(collisionWorld, _rejectedWorld) &&
                 state.Position == _rejectedAt &&
                 dx == _rejectedDeltaX && dz == _rejectedDeltaZ)
             {
                 blocked = true;
                 LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
-                LastTickOtherMs = Math.Max(0d,
-                    ElapsedMillisecondsSince(tickStartedAt) -
+                LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
                     LastTickPreparationMs - LastTickHorizontalCollisionMs);
                 return;
             }
-
             _hasRejectedGroundedMove = false;
-            bool fastHandled = state.Grounded && !intent.Jump &&
-                collisionWorld.TryResolveCertifiedGroundedNoSlide(
-                    state.Position,
-                    dx,
-                    dz,
-                    _capsule,
-                    _settings.StepHeight,
-                    _settings.GroundSnapDistance,
-                    _settings.MaximumSlopeDegrees,
-                    out moved,
-                    out blocked);
 
-            if (!fastHandled && state.Grounded && !intent.Jump &&
-                collisionWorld.HasCertifiedGroundedMovement)
+            if (groundedHorizontal && sharedGrounded)
             {
-                // The map HAS a validated DotRecast movement surface. An
-                // uncertified grounded movement must stop, not trigger up to 16
-                // authored-collider substeps and more X/Z work. This also blocks
-                // forged client inputs cheaply; exceptional transitions are
-                // handled separately when explicitly implemented and tested.
+                // Player-only: exact source is compiled in client and server.
+                moved = GroundedMove.Resolve(collisionWorld, state.Position,
+                    dx, dz, _capsule, _settings.StepHeight,
+                    _settings.GroundSnapDistance, _settings.MaximumSlopeDegrees,
+                    out blocked);
+            }
+            else if (groundedHorizontal && !sharedGrounded &&
+                collisionWorld.TryResolveCertifiedGroundedNoSlide(
+                    state.Position, dx, dz, _capsule,
+                    _settings.StepHeight, _settings.GroundSnapDistance,
+                    _settings.MaximumSlopeDegrees, out moved, out blocked))
+            {
+                // Existing Population certified movement result.
+            }
+            else if (groundedHorizontal && !sharedGrounded &&
+                     collisionWorld.HasCertifiedGroundedMovement)
+            {
+                // Existing Population fail-closed policy on certified maps.
                 moved = state.Position;
                 blocked = true;
-                fastHandled = true;
             }
-            if (!fastHandled)
+            else
             {
+                // Existing jump, airborne and Population fallback policy.
                 moved = collisionWorld.ResolveHorizontalMove(
-                    state.Position,
-                    dx,
-                    dz,
-                    _capsule,
-                    _settings.StepHeight,
-                    _settings.GroundSnapDistance,
-                    _settings.MaximumSlopeDegrees,
-                    state.Grounded,
-                    allowWallSlide: false,
-                    out blocked);
+                    state.Position, dx, dz, _capsule,
+                    _settings.StepHeight, _settings.GroundSnapDistance,
+                    _settings.MaximumSlopeDegrees, state.Grounded,
+                    allowWallSlide: false, out blocked);
             }
             LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
 
-            // The baked NavMesh has already given a definitive no-movement answer.
-            // A stationary grounded actor needs NO repeated support or capsule checks.
-            if (fastHandled && blocked && moved == previousPosition)
+            if (groundedHorizontal && blocked && moved == previousPosition)
             {
-                if (state.Grounded && !intent.Jump &&
-                    (Math.Abs(dx) > 0.000001f || Math.Abs(dz) > 0.000001f))
+                if (Math.Abs(dx) > 0.000001f || Math.Abs(dz) > 0.000001f)
                 {
                     _hasRejectedGroundedMove = true;
                     _rejectedWorld = collisionWorld;
@@ -222,8 +220,7 @@ namespace Game.Server.Application.Movement
                     _rejectedDeltaX = dx;
                     _rejectedDeltaZ = dz;
                 }
-                LastTickOtherMs = Math.Max(0d,
-                    ElapsedMillisecondsSince(tickStartedAt) -
+                LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
                     LastTickPreparationMs - LastTickHorizontalCollisionMs);
                 return;
             }
@@ -239,19 +236,13 @@ namespace Game.Server.Application.Movement
             }
 
             if (state.Grounded && !intent.Jump &&
-                collisionWorld.TryFindGround(
-                    moved,
-                    _capsule.Radius,
-                    _settings.StepHeight,
-                    _settings.GroundSnapDistance,
-                    _settings.MaximumSlopeDegrees,
-                    out ServerGroundHit ground))
+                collisionWorld.TryFindGround(moved, _capsule.Radius,
+                    _settings.StepHeight, _settings.GroundSnapDistance,
+                    _settings.MaximumSlopeDegrees, out ServerGroundHit ground))
             {
-                // Retain the existing grounding and stair behavior for accepted moves.
                 groundedPoseValidated = true;
                 if (CanSettleGroundHeight(collisionWorld, moved, ground.Position.Y))
                     moved = new WorldPosition(moved.X, ground.Position.Y, moved.Z);
-
                 state.GroundSurfaceId = ground.SurfaceId;
                 state.VerticalVelocity = 0f;
                 state.Grounded = true;
@@ -262,18 +253,16 @@ namespace Game.Server.Application.Movement
                 state.Grounded = false;
                 if (state.Mode != ActorMovementMode.Jumping || state.VerticalVelocity <= 0f)
                     state.Mode = ActorMovementMode.Falling;
-                state.VerticalVelocity = Math.Max(-_settings.MaximumFallSpeed, state.VerticalVelocity - _settings.Gravity * fixedDelta);
+                state.VerticalVelocity = Math.Max(-_settings.MaximumFallSpeed,
+                    state.VerticalVelocity - _settings.Gravity * fixedDelta);
                 float targetY = moved.Y + state.VerticalVelocity * fixedDelta;
                 WorldPosition vertical = new WorldPosition(moved.X, targetY, moved.Z);
 
                 if (state.VerticalVelocity <= 0f &&
-                    collisionWorld.TryFindGround(
-                        moved,
-                        _capsule.Radius,
-                        0.05f,
-                        Math.Max(_settings.GroundSnapDistance, moved.Y - targetY + 0.05f),
-                        _settings.MaximumSlopeDegrees,
-                        out ServerGroundHit fallingGround) &&
+                    collisionWorld.TryFindGround(moved, _capsule.Radius,
+                        0.05f, Math.Max(_settings.GroundSnapDistance,
+                            moved.Y - targetY + 0.05f),
+                        _settings.MaximumSlopeDegrees, out ServerGroundHit fallingGround) &&
                     fallingGround.Position.Y >= targetY - 0.01f)
                 {
                     vertical = new WorldPosition(moved.X, fallingGround.Position.Y, moved.Z);
@@ -283,14 +272,11 @@ namespace Game.Server.Application.Movement
                     state.GroundSurfaceId = fallingGround.SurfaceId;
                 }
                 else if (state.VerticalVelocity <= 0f &&
-                         collisionWorld.TryFindSolidGround(
-                             moved,
-                             _capsule.Radius,
-                             0.05f,
-                             Math.Max(_settings.GroundSnapDistance, moved.Y - targetY + 0.05f),
-                             89f,
-                             out ServerGroundHit solidGround) &&
-                         solidGround.Position.Y >= targetY - 0.01f)
+                    collisionWorld.TryFindSolidGround(moved, _capsule.Radius,
+                        0.05f, Math.Max(_settings.GroundSnapDistance,
+                            moved.Y - targetY + 0.05f), 89f,
+                        out ServerGroundHit solidGround) &&
+                    solidGround.Position.Y >= targetY - 0.01f)
                 {
                     vertical = new WorldPosition(moved.X, solidGround.Position.Y, moved.Z);
                     state.Grounded = true;
@@ -334,13 +320,12 @@ namespace Game.Server.Application.Movement
             (System.Diagnostics.Stopwatch.GetTimestamp() - startedAt) *
             (1000d / System.Diagnostics.Stopwatch.Frequency);
 
-        private bool CanSettleGroundHeight(
-            ServerCollisionWorld world, WorldPosition current, float supportY)
+        private bool CanSettleGroundHeight(ServerCollisionWorld world,
+            WorldPosition current, float supportY)
         {
             float deltaY = supportY - current.Y;
             if (Math.Abs(deltaY) < 0.001f)
                 return true;
-
             float increment = Math.Max(0.05f, _capsule.Radius * 0.5f);
             int samples = Math.Clamp((int)Math.Ceiling(Math.Abs(deltaY) / increment), 1, 12);
             for (int i = 1; i <= samples; ++i)
