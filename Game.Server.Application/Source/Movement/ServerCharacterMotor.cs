@@ -62,6 +62,15 @@ namespace Game.Server.Application.Movement
         private readonly CharacterMotorSettings _settings;
         private readonly ServerCapsule _capsule;
 
+        // One rejected position/direction per motor. A held input into an immutable
+        // baked wall is NOT a reason to repeat the same collision query at 20 Hz.
+        // World identity and all proposed movement dimensions are part of the key.
+        private ServerCollisionWorld _rejectedWorld;
+        private WorldPosition _rejectedAt;
+        private float _rejectedDeltaX;
+        private float _rejectedDeltaZ;
+        private bool _hasRejectedGroundedMove;
+
         public double LastTickPreparationMs { get; private set; }
         public double LastTickHorizontalCollisionMs { get; private set; }
         public double LastTickPostCollisionMs { get; private set; }
@@ -78,11 +87,11 @@ namespace Game.Server.Application.Movement
 
         public void Tick(CharacterMotorState state, CharacterMovementIntent intent, float fixedDelta, ServerCollisionWorld collisionWorld)
         {
-            Tick(state, intent, fixedDelta, collisionWorld, allowWallSlide: true, out _);
+            Tick(state, intent, fixedDelta, collisionWorld, allowWallSlide: false, out _);
         }
 
-        // Population may forbid side-sliding and needs an explicit blocked result.
-        // Existing four-argument motor callers retain normal player-style sliding.
+        // Kept for API compatibility with existing callers. No wall slide is allowed.
+        // A blocked baked movement is rejected rather than resolved along X or Z.
         public void Tick(
             CharacterMotorState state,
             CharacterMovementIntent intent,
@@ -140,18 +149,84 @@ namespace Game.Server.Application.Movement
 
             stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             WorldPosition previousPosition = state.Position;
-            WorldPosition moved = collisionWorld.ResolveHorizontalMove(
-                state.Position,
-                dx,
-                dz,
-                _capsule,
-                _settings.StepHeight,
-                _settings.GroundSnapDistance,
-                _settings.MaximumSlopeDegrees,
-                state.Grounded,
-                allowWallSlide,
-                out blocked);
+            WorldPosition moved = state.Position;
+
+            // Cached denial is still authoritative: it is bound to the same baked
+            // world, unchanged feet, unchanged input displacement and grounded pose.
+            // An input change or an accepted move immediately invalidates it.
+            if (state.Grounded && !intent.Jump &&
+                _hasRejectedGroundedMove &&
+                ReferenceEquals(collisionWorld, _rejectedWorld) &&
+                state.Position == _rejectedAt &&
+                dx == _rejectedDeltaX && dz == _rejectedDeltaZ)
+            {
+                blocked = true;
+                LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
+                LastTickOtherMs = Math.Max(0d,
+                    ElapsedMillisecondsSince(tickStartedAt) -
+                    LastTickPreparationMs - LastTickHorizontalCollisionMs);
+                return;
+            }
+
+            _hasRejectedGroundedMove = false;
+            bool fastHandled = state.Grounded && !intent.Jump &&
+                collisionWorld.TryResolveCertifiedGroundedNoSlide(
+                    state.Position,
+                    dx,
+                    dz,
+                    _capsule,
+                    _settings.StepHeight,
+                    _settings.GroundSnapDistance,
+                    _settings.MaximumSlopeDegrees,
+                    out moved,
+                    out blocked);
+
+            if (!fastHandled && state.Grounded && !intent.Jump &&
+                collisionWorld.HasCertifiedGroundedMovement)
+            {
+                // The map HAS a validated DotRecast movement surface. An
+                // uncertified grounded movement must stop, not trigger up to 16
+                // authored-collider substeps and more X/Z work. This also blocks
+                // forged client inputs cheaply; exceptional transitions are
+                // handled separately when explicitly implemented and tested.
+                moved = state.Position;
+                blocked = true;
+                fastHandled = true;
+            }
+            if (!fastHandled)
+            {
+                moved = collisionWorld.ResolveHorizontalMove(
+                    state.Position,
+                    dx,
+                    dz,
+                    _capsule,
+                    _settings.StepHeight,
+                    _settings.GroundSnapDistance,
+                    _settings.MaximumSlopeDegrees,
+                    state.Grounded,
+                    allowWallSlide: false,
+                    out blocked);
+            }
             LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
+
+            // The baked NavMesh has already given a definitive no-movement answer.
+            // A stationary grounded actor needs NO repeated support or capsule checks.
+            if (fastHandled && blocked && moved == previousPosition)
+            {
+                if (state.Grounded && !intent.Jump &&
+                    (Math.Abs(dx) > 0.000001f || Math.Abs(dz) > 0.000001f))
+                {
+                    _hasRejectedGroundedMove = true;
+                    _rejectedWorld = collisionWorld;
+                    _rejectedAt = state.Position;
+                    _rejectedDeltaX = dx;
+                    _rejectedDeltaZ = dz;
+                }
+                LastTickOtherMs = Math.Max(0d,
+                    ElapsedMillisecondsSince(tickStartedAt) -
+                    LastTickPreparationMs - LastTickHorizontalCollisionMs);
+                return;
+            }
 
             stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             bool canJump = state.Grounded && state.Mode == ActorMovementMode.Grounded;
@@ -172,15 +247,8 @@ namespace Game.Server.Application.Movement
                     _settings.MaximumSlopeDegrees,
                     out ServerGroundHit ground))
             {
-                // ResolveHorizontalMove validates each accepted grounded pose against
-                // the live dynamic blockers and standing capsule clearance. The support
-                // query below confirms the final walk surface, so a second full collision
-                // scan at the same pose is redundant for this branch.
+                // Retain the existing grounding and stair behavior for accepted moves.
                 groundedPoseValidated = true;
-                // Keep the elevated feet through a small stair/curb edge when the
-                // downward settle would intersect the outgoing riser. Once the full
-                // capsule can descend, the same query lands it on real baked ground.
-                // This also preserves the short pre-step lift needed on ascent.
                 if (CanSettleGroundHeight(collisionWorld, moved, ground.Position.Y))
                     moved = new WorldPosition(moved.X, ground.Position.Y, moved.Z);
 
@@ -224,8 +292,6 @@ namespace Game.Server.Application.Movement
                              out ServerGroundHit solidGround) &&
                          solidGround.Position.Y >= targetY - 0.01f)
                 {
-                    // Solid collision must still stop a fall even when this surface was
-                    // intentionally excluded from normal walkability.
                     vertical = new WorldPosition(moved.X, solidGround.Position.Y, moved.Z);
                     state.Grounded = true;
                     state.Mode = ActorMovementMode.Grounded;
@@ -238,7 +304,6 @@ namespace Game.Server.Application.Movement
                 }
                 else
                 {
-                    // Collision during vertical movement: keep the last clear position.
                     state.VerticalVelocity = 0f;
                 }
 
@@ -251,17 +316,12 @@ namespace Game.Server.Application.Movement
             {
                 if (groundedPoseValidated)
                 {
-                    // A stationary or fully blocked actor remains at its previous safe
-                    // position. Only advance the recovery point after a changed pose was
-                    // accepted by the grounded resolver above.
                     if ((Math.Abs(dx) > 0.000001f || Math.Abs(dz) > 0.000001f) &&
                         moved != previousPosition)
                         state.LastSafePosition = state.Position;
                 }
                 else if (collisionWorld.IsCapsuleClear(state.Position, _capsule))
                 {
-                    // Falling/landing paths have not gone through grounded horizontal
-                    // clearance and retain the full physical validation.
                     state.LastSafePosition = state.Position;
                 }
             }
@@ -281,9 +341,6 @@ namespace Game.Server.Application.Movement
             if (Math.Abs(deltaY) < 0.001f)
                 return true;
 
-            // Test the vertical path, not just the destination. This is at most a
-            // handful of local spatial queries for an actual step transition and
-            // never adds network traffic or separate motor state.
             float increment = Math.Max(0.05f, _capsule.Radius * 0.5f);
             int samples = Math.Clamp((int)Math.Ceiling(Math.Abs(deltaY) / increment), 1, 12);
             for (int i = 1; i <= samples; ++i)
