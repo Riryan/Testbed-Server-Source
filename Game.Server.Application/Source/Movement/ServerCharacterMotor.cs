@@ -70,6 +70,18 @@ namespace Game.Server.Application.Movement
         private float _rejectedDeltaZ;
         private bool _hasRejectedGroundedMove;
 
+        // Validated idle pose: strictly bound to this motor state, world and feet.
+        // Corrective teleports, map changes, jumps and any movement invalidate it.
+        private CharacterMotorState _validatedState;
+        private ServerCollisionWorld _validatedWorld;
+        private WorldPosition _validatedAt;
+        private bool _hasValidatedIdlePose;
+
+        // Diagnostic-only, per-player rate limit. Never affects movement or admission.
+        private long _lastSlowMovementLogTimestamp;
+        private const double SlowMovementLogThresholdMs = 1.0;
+        private const double SlowMovementLogIntervalMs = 1000.0;
+
         public double LastTickPreparationMs { get; private set; }
         public double LastTickHorizontalCollisionMs { get; private set; }
         public double LastTickPostCollisionMs { get; private set; }
@@ -125,6 +137,8 @@ namespace Game.Server.Application.Movement
                 state.Mode == ActorMovementMode.Ladder ||
                 state.Mode == ActorMovementMode.Mounted)
             {
+                _hasValidatedIdlePose = false;
+                _hasRejectedGroundedMove = false;
                 LastTickOtherMs = ElapsedMillisecondsSince(tickStartedAt);
                 return;
             }
@@ -145,6 +159,8 @@ namespace Game.Server.Application.Movement
 
             if (collisionWorld == null)
             {
+                _hasValidatedIdlePose = false;
+                _hasRejectedGroundedMove = false;
                 state.Position = new WorldPosition(state.Position.X + dx,
                     state.Position.Y, state.Position.Z + dz);
                 state.LastSafePosition = state.Position;
@@ -160,6 +176,23 @@ namespace Game.Server.Application.Movement
             WorldPosition previousPosition = state.Position;
             WorldPosition moved = state.Position;
             bool groundedHorizontal = state.Grounded && !intent.Jump;
+            bool idleInput = Math.Abs(dx) <= 0.000001f && Math.Abs(dz) <= 0.000001f;
+            if (sharedGrounded && groundedHorizontal && idleInput &&
+                state.Mode == ActorMovementMode.Grounded &&
+                _hasValidatedIdlePose &&
+                ReferenceEquals(state, _validatedState) &&
+                ReferenceEquals(collisionWorld, _validatedWorld) &&
+                state.Position == _validatedAt &&
+                GroundedMove.CanReuseStationaryGround(collisionWorld, state.Position, _capsule))
+            {
+                // The previous accepted tick already validated this exact pose.
+                // No new intent, no changed position, no changed map: zero geometry work.
+                LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
+                LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
+                    LastTickPreparationMs - LastTickHorizontalCollisionMs);
+                return;
+            }
+            _hasValidatedIdlePose = false;
 
             // Static wall press: cached only for an identical world, position and
             // displacement. New direction, jump, world or pose means revalidate.
@@ -176,13 +209,18 @@ namespace Game.Server.Application.Movement
             }
             _hasRejectedGroundedMove = false;
 
+            GroundedMoveTiming groundedTiming = default;
+            ServerGroundHit sharedGround = default;
+            bool sharedGroundValidated = false;
             if (groundedHorizontal && sharedGrounded)
             {
-                // Player-only: exact source is compiled in client and server.
+                // Canonical client/server grounded movement. The final support hit
+                // comes back with the accepted pose: don't query it a second time.
                 moved = GroundedMove.Resolve(collisionWorld, state.Position,
                     dx, dz, _capsule, _settings.StepHeight,
                     _settings.GroundSnapDistance, _settings.MaximumSlopeDegrees,
-                    out blocked);
+                    out blocked, out sharedGround, out sharedGroundValidated,
+                    out groundedTiming);
             }
             else if (groundedHorizontal && !sharedGrounded &&
                 collisionWorld.TryResolveCertifiedGroundedNoSlide(
@@ -209,6 +247,9 @@ namespace Game.Server.Application.Movement
                     allowWallSlide: false, out blocked);
             }
             LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
+            if (groundedHorizontal && sharedGrounded)
+                LogSlowGroundedMove(collisionWorld, previousPosition, dx, dz,
+                    blocked, in groundedTiming);
 
             if (groundedHorizontal && blocked && moved == previousPosition)
             {
@@ -235,10 +276,26 @@ namespace Game.Server.Application.Movement
                 state.VerticalVelocity = _settings.JumpSpeed;
             }
 
-            if (state.Grounded && !intent.Jump &&
-                collisionWorld.TryFindGround(moved, _capsule.Radius,
-                    _settings.StepHeight, _settings.GroundSnapDistance,
-                    _settings.MaximumSlopeDegrees, out ServerGroundHit ground))
+            ServerGroundHit ground = default;
+            bool foundGround = false;
+            if (state.Grounded && !intent.Jump)
+            {
+                if (sharedGrounded && sharedGroundValidated)
+                {
+                    ground = sharedGround;
+                    foundGround = true;
+                }
+                else
+                {
+                    // Exception path only: newly spawned idle actor, unresolved
+                    // stair/tread height or non-player motor. Never repeat the
+                    // successful shared GroundedMove endpoint support query.
+                    foundGround = collisionWorld.TryFindGround(moved, _capsule.Radius,
+                        _settings.StepHeight, _settings.GroundSnapDistance,
+                        _settings.MaximumSlopeDegrees, out ground);
+                }
+            }
+            if (foundGround)
             {
                 groundedPoseValidated = true;
                 if (CanSettleGroundHeight(collisionWorld, moved, ground.Position.Y))
@@ -298,6 +355,15 @@ namespace Game.Server.Application.Movement
             }
 
             state.Position = moved;
+            _hasValidatedIdlePose = sharedGrounded && state.Grounded &&
+                state.Mode == ActorMovementMode.Grounded && groundedPoseValidated &&
+                GroundedMove.CanReuseStationaryGround(collisionWorld, state.Position, _capsule);
+            if (_hasValidatedIdlePose)
+            {
+                _validatedState = state;
+                _validatedWorld = collisionWorld;
+                _validatedAt = state.Position;
+            }
             if (state.Grounded)
             {
                 if (groundedPoseValidated)
@@ -314,6 +380,43 @@ namespace Game.Server.Application.Movement
             LastTickPostCollisionMs = ElapsedMillisecondsSince(stageStartedAt);
             LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
                 LastTickPreparationMs - LastTickHorizontalCollisionMs - LastTickPostCollisionMs);
+        }
+
+        private void LogSlowGroundedMove(ServerCollisionWorld world,
+            WorldPosition start, float dx, float dz, bool blocked,
+            in GroundedMoveTiming timing)
+        {
+            // This is a temporary, bounded diagnostic *log*, not a packet type or
+            // another scheduler. Only log anomalous work to correlate with the
+            // existing PlayerEntityAuthorityBatch scheduler warnings. Avoid
+            // logging while the collision stage is timed.
+            if (LastTickHorizontalCollisionMs < SlowMovementLogThresholdMs)
+                return;
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_lastSlowMovementLogTimestamp != 0 &&
+                (now - _lastSlowMovementLogTimestamp) *
+                (1000.0 / System.Diagnostics.Stopwatch.Frequency) < SlowMovementLogIntervalMs)
+                return;
+            _lastSlowMovementLogTimestamp = now;
+
+            double unclassified = Math.Max(0.0,
+                LastTickHorizontalCollisionMs - timing.TimedQueryMilliseconds);
+            Console.WriteLine(
+                "[GroundedMoveStages] " +
+                $"map={world.MapId} total={LastTickHorizontalCollisionMs:F3}ms " +
+                $"steps={timing.CompletedSteps}/{timing.RequestedSteps} flatCertified={timing.CertifiedFlatSteps} " +
+                $"failedAt={timing.FailedStep} blocked={blocked} reason={timing.Rejection ?? "none"} " +
+                $"support={timing.SupportMilliseconds:F3}ms/{timing.SupportCalls} " +
+                $"misses={timing.SupportMisses} max={timing.MaxSupportMilliseconds:F3}ms " +
+                $"ahead={timing.AheadMilliseconds:F3}ms/{timing.AheadCalls} " +
+                $"misses={timing.AheadMisses} max={timing.MaxAheadMilliseconds:F3}ms " +
+                $"capsule={timing.CapsuleMilliseconds:F3}ms/{timing.CapsuleCalls} " +
+                $"rejects={timing.CapsuleRejects} max={timing.MaxCapsuleMilliseconds:F3}ms " +
+                $"rise={timing.RiseCapsuleMilliseconds:F3}ms/{timing.RiseCapsuleCalls} " +
+                $"rejects={timing.RiseCapsuleRejects} max={timing.MaxRiseCapsuleMilliseconds:F3}ms " +
+                $"unclassified={unclassified:F3}ms " +
+                $"pos=({start.X:F2},{start.Y:F2},{start.Z:F2}) " +
+                $"delta=({dx:F3},{dz:F3})");
         }
 
         private static double ElapsedMillisecondsSince(long startedAt) =>
