@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using Game.Server.Application.Movement;
 using Game.Shared.World;
 
 namespace Game.Server.Application.World
@@ -57,10 +56,6 @@ namespace Game.Server.Application.World
                 snapshot.instanceId = instanceId;
                 _snapshots.Add(key, snapshot);
                 var world = new ServerCollisionWorld(snapshot, collisionCellSize);
-                // Immutable clearance summary, prepared ONCE while loading the map.
-                // Static proof agrees with the existing standing capsule exemption;
-                // anything uncertain continues through the original exact collision.
-                GroundedMove.RegisterWorld(world, snapshot.collisionTriangles, snapshot.dynamicBlockers);
                 _collisionWorlds.Add(key, world);
             }
         }
