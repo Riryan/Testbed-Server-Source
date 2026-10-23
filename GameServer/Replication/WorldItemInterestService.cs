@@ -12,6 +12,12 @@ namespace Game.GameServer.Replication;
 /// World items are spatially indexed because querying the complete world-item collection
 /// on every player movement would defeat the scalability boundary established by AOI.
 ///
+/// An observer's last full indexed scan now establishes a conservative displacement
+/// envelope: within it, no indexed item can cross the enter/exit thresholds. Ordinary
+/// movement inside that envelope updates the observer grid but performs no item scans.
+/// Item spatial mutations and map changes invalidate the envelope. No polling cadence,
+/// secondary index, or new wire message is required.
+///
 /// The revision exposed here is observer-local. A client intentionally does not receive
 /// world changes outside its AOI, so the backend/world revision cannot be used as a
 /// contiguous client delta sequence. Each visible enter/leave/change increments only the
@@ -202,6 +208,11 @@ internal sealed class WorldItemInterestService
         if (!_observers.TryGetValue(session, out ObserverState observer) || !IsEligible(session))
             return false;
 
+        // No live items or visible references: no partition query is needed on movement.
+        // The observer is reindexed when the first item is introduced.
+        if (_items.Count == 0 && observer.VisibleItems.Count == 0)
+            return false;
+
         var location = session.Entity.Runtime.Location;
         return !string.Equals(observer.MapId, location.MapId ?? string.Empty, StringComparison.Ordinal) ||
                !string.Equals(observer.InstanceId, location.InstanceId ?? string.Empty, StringComparison.Ordinal);
@@ -211,6 +222,12 @@ internal sealed class WorldItemInterestService
     {
         _changes.Clear();
         if (!_observers.TryGetValue(session, out ObserverState observer) || !IsEligible(session))
+            return _changes;
+
+        // Empty-world movement has no item visibility work. Avoid location locks,
+        // spatial hashing and observer-grid updates entirely until an item exists.
+        // A first item addition restores the observer-grid positions before querying.
+        if (_items.Count == 0 && observer.VisibleItems.Count == 0)
             return _changes;
 
         string oldMap = observer.MapId;
@@ -224,9 +241,8 @@ internal sealed class WorldItemInterestService
         if (partitionChanged && partitionSnapshot != null)
             Seed(partitionSnapshot);
 
-        // Empty world-item catalogs are common on sparse/test maps. Refreshing observer
-        // position is enough; do not walk the AOI cell neighborhood when no item can enter
-        // or exit visibility.
+        // An observer can temporarily retain an exit edge while the last item is
+        // removed. Clean it through the existing authoritative exit path.
         if (_items.Count == 0 && observer.VisibleItems.Count == 0)
             return _changes;
 
@@ -241,7 +257,14 @@ internal sealed class WorldItemInterestService
 
         if (change.Kind == WorldItemChangeKind.Added && change.Item != null)
         {
+            bool firstItem = _items.Count == 0;
             Upsert(change.Item);
+
+            // With no world items, ordinary movement does not touch this AOI index.
+            // Bring its existing observer positions up to date once, before the first
+            // item-add query. This also handles idle observers and map transfers.
+            if (firstItem)
+                RefreshDormantObservers();
 
             // Query only observer cells intersecting the item AOI. An item spawn/drop no
             // longer walks every connected player on the GameServer.
@@ -326,6 +349,13 @@ internal sealed class WorldItemInterestService
         else
         {
             Seed(authoritativeSnapshot);
+
+            // Snapshot requests are exceptional and must return the authoritative
+            // visible set, even if empty-world movement previously skipped updates.
+            RefreshObserver(observer);
+            MoveObserverGridIfNeeded(observer);
+            ReconcileVisibleExits(observer);
+            AddNearbyVisible(observer, emitChanges: false);
         }
 
         _itemScratch.Clear();
@@ -354,11 +384,29 @@ internal sealed class WorldItemInterestService
     {
         if (snapshot?.items == null)
             return;
+        bool firstItems = _items.Count == 0;
         for (int i = 0; i < snapshot.items.Length; ++i)
         {
             WorldItemView item = snapshot.items[i];
             if (item != null && item.itemInstanceId > 0)
                 Upsert(item);
+        }
+
+        // A partition snapshot can also be the first source of world items.
+        if (firstItems && _items.Count > 0)
+            RefreshDormantObservers();
+    }
+
+    private void RefreshDormantObservers()
+    {
+        // Only used on the transition from zero items to a nonempty item catalog.
+        // The original observer grid remains the single source of item observers.
+        foreach (ObserverState observer in _observers.Values)
+        {
+            if (!IsEligible(observer.Session))
+                continue;
+            RefreshObserver(observer);
+            MoveObserverGridIfNeeded(observer);
         }
     }
 

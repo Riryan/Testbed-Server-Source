@@ -4,40 +4,13 @@ using Game.Shared.World;
 namespace Game.Server.Application.World
 {
     /// <summary>
-    /// Player NavMesh movement helpers, reusing the EXISTING 4m certified-triangle
-    /// index and live dynamic-blocker index. No new map grid or wire state.
+    /// The existing agent-eroded baked NavMesh is used only to find the feet
+    /// height for server-integrated Player intent. This is NOT a physics motor
+    /// or a path solver: no static capsule checks, no segment sweeps, no Detour
+    /// searches, and no dynamic blocker lookup are performed here.
     /// </summary>
     public sealed partial class ServerCollisionWorld
     {
-        public bool HasBakedDynamicBlockerCandidatesForMove(
-            WorldPosition start, float dx, float dz, float radius)
-        {
-            if (!float.IsFinite(start.X) || !float.IsFinite(start.Z) ||
-                !float.IsFinite(dx) || !float.IsFinite(dz) ||
-                !float.IsFinite(radius) || radius <= 0f)
-                return true;
-
-            float endX = start.X + dx;
-            float endZ = start.Z + dz;
-            QueryDynamicBlockers(
-                Math.Min(start.X, endX) - radius,
-                Math.Min(start.Z, endZ) - radius,
-                Math.Max(start.X, endX) + radius,
-                Math.Max(start.Z, endZ) + radius);
-            return _dynamicBlockerQueryScratch.Count != 0;
-        }
-
-        /// <summary>
-        /// Fast Player-only path for consecutive moves within the same trusted,
-        /// agent-eroded Recast triangle. Both endpoints inside a convex triangle
-        /// imply the entire connecting segment stays inside that certified surface.
-        /// The destination is grounded exactly once against the existing physical
-        /// support mesh, preserving the old height and step/snap constraints.
-        /// On a triangle transition, use the existing whole-segment resolver.
-        /// Caller must have excluded nearby dynamic-blocker candidates; the existing
-        /// resolver independently checks dynamic blockers on the fallback path.
-        /// A triangle index is only valid for the same ServerCollisionWorld instance.
-        /// </summary>
         public bool TryResolvePlayerCertifiedGrounded(
             WorldPosition startFeet,
             float deltaX,
@@ -51,102 +24,162 @@ namespace Game.Server.Application.World
             out bool blocked)
         {
             resolved = startFeet;
-            blocked = false;
+            blocked = true;
 
-            if (cachedTriangleIndex >= 0 &&
-                cachedTriangleIndex < _safeMovementTriangles.Length &&
-                _safeMovementTriangleGrid.Count != 0 &&
-                capsule.Radius <= _map.safeMovementRadius + 0.0001f &&
-                capsule.Height <= _map.safeMovementHeight + 0.0001f &&
-                float.IsFinite(startFeet.X) &&
-                float.IsFinite(startFeet.Y) &&
-                float.IsFinite(startFeet.Z) &&
-                float.IsFinite(deltaX) && float.IsFinite(deltaZ) &&
-                TryResolveInsideCertifiedTriangle(
-                    _safeMovementTriangles[cachedTriangleIndex],
-                    startFeet, deltaX, deltaZ, capsule,
-                    stepHeight, groundSnapDistance,
-                    maximumSlopeDegrees, out resolved))
-            {
-                return true;
-            }
-
-            // The cached triangle did not completely contain the proposed move.
-            // No speculative acceptance: invoke the existing certified resolver,
-            // with its full path coverage and established rejection semantics.
-            cachedTriangleIndex = -1;
-            bool handled = TryResolveCertifiedGroundedNoSlide(
-                startFeet, deltaX, deltaZ, capsule,
-                stepHeight, groundSnapDistance, maximumSlopeDegrees,
-                out resolved, out blocked);
-
-            if (!handled || blocked || resolved == startFeet)
-                return handled;
-
-            // The existing segment solver already populated this SAME scratch set.
-            // Recover one containing triangle without another grid query. If the
-            // endpoint falls on a seam, the regular resolver remains the fallback.
-            float normalFloor = MathF.Cos(
-                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
-            foreach (int index in _safeMovementQueryScratch)
-            {
-                ServerCollisionTriangle triangle = _safeMovementTriangles[index];
-                if (triangle.normalY < normalFloor ||
-                    !TryTriangleHeightAtXZ(triangle, resolved.X, resolved.Z, out float y) ||
-                    Math.Abs(y - resolved.Y) > 0.15f)
-                    continue;
-                cachedTriangleIndex = index;
-                break;
-            }
-            return handled;
-        }
-
-        private bool TryResolveInsideCertifiedTriangle(
-            ServerCollisionTriangle triangle,
-            WorldPosition startFeet,
-            float deltaX,
-            float deltaZ,
-            ServerCapsule capsule,
-            float stepHeight,
-            float groundSnapDistance,
-            float maximumSlopeDegrees,
-            out WorldPosition resolved)
-        {
-            resolved = startFeet;
-            float minNormalY = MathF.Cos(
-                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
-            if (triangle.normalY < minNormalY ||
-                !TryTriangleHeightAtXZ(triangle, startFeet.X, startFeet.Z, out float startY) ||
-                Math.Abs(startY - startFeet.Y) > 0.15f)
+            if (_safeMovementTriangleGrid.Count == 0 ||
+                capsule.Radius > _map.safeMovementRadius + 0.0001f ||
+                capsule.Height > _map.safeMovementHeight + 0.0001f)
                 return false;
+
+            if (!float.IsFinite(startFeet.X) || !float.IsFinite(startFeet.Y) ||
+                !float.IsFinite(startFeet.Z) || !float.IsFinite(deltaX) ||
+                !float.IsFinite(deltaZ))
+                return true;
 
             float targetX = startFeet.X + deltaX;
             float targetZ = startFeet.Z + deltaZ;
-            // The existing clipper is the exact certified segment contract. The
-            // barycentric height routine deliberately tolerates slight edge error,
-            // so require full segment coverage before fast-path acceptance.
-            if (!float.IsFinite(targetX) || !float.IsFinite(targetZ) ||
-                !TryClipSegmentToTriangle(startFeet.X, startFeet.Z,
-                    targetX, targetZ, triangle, out float enter, out float exit) ||
-                enter > 0.0001f || exit < 0.9999f ||
-                !TryTriangleHeightAtXZ(triangle, targetX, targetZ, out float targetY) ||
-                targetY > startFeet.Y + stepHeight + 0.05f ||
-                targetY < startFeet.Y - groundSnapDistance - 0.05f)
-                return false;
+            if (!float.IsFinite(targetX) || !float.IsFinite(targetZ))
+                return true;
 
-            if (!TryFindGround(
-                    new WorldPosition(targetX, targetY, targetZ),
-                    capsule.Radius,
-                    Math.Max(0.05f, stepHeight + 0.05f),
-                    Math.Max(0.05f, groundSnapDistance),
-                    maximumSlopeDegrees, out ServerGroundHit support) ||
-                Math.Abs(support.Position.Y - targetY) > 0.20f ||
-                support.Position.Y > startFeet.Y + stepHeight + 0.05f ||
-                support.Position.Y < startFeet.Y - groundSnapDistance - 0.05f)
-                return false;
+            float minimumNormalY = MathF.Cos(
+                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            float maximumRise = stepHeight + 0.05f;
+            float maximumDrop = groundSnapDistance + 0.05f;
 
-            resolved = new WorldPosition(targetX, support.Position.Y, targetZ);
+            // Normal flat-ground movement: one previously identified triangle,
+            // two inexpensive barycentric heights, and no collection search.
+            // A convex triangle also contains the entire segment when both
+            // endpoints lie inside it; an independent segment sweep is redundant.
+            bool hasCachedStart = false;
+            float cachedStartY = 0f;
+            if (cachedTriangleIndex >= 0 &&
+                cachedTriangleIndex < _safeMovementTriangles.Length)
+            {
+                ServerCollisionTriangle cached = _safeMovementTriangles[cachedTriangleIndex];
+                if (cached.normalY >= minimumNormalY &&
+                    TryTriangleHeightAtXZ(cached, startFeet.X, startFeet.Z,
+                        out cachedStartY) &&
+                    Math.Abs(cachedStartY - startFeet.Y) <= 0.40f)
+                {
+                    hasCachedStart = true;
+                    if (TryTriangleHeightAtXZ(cached, targetX, targetZ,
+                            out float targetNavY))
+                    {
+                        // Preserve the offset between voxelized NavMesh height
+                        // and physical feet height already established at entry.
+                        float targetFeetY = startFeet.Y + targetNavY - cachedStartY;
+                        float rise = targetFeetY - startFeet.Y;
+                        if (rise <= maximumRise && rise >= -maximumDrop)
+                        {
+                            resolved = new WorldPosition(targetX, targetFeetY, targetZ);
+                            blocked = false;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Triangle transition: inspect only the already-indexed triangles
+            // under the proposed endpoint. No whole-path search or physics query.
+            QuerySafeMovementTriangles(targetX, targetZ, targetX, targetZ);
+            int bestIndex = -1;
+            float bestFeetY = startFeet.Y;
+            float bestError = float.MaxValue;
+            foreach (int index in _safeMovementQueryScratch)
+            {
+                ServerCollisionTriangle triangle = _safeMovementTriangles[index];
+                if (triangle.normalY < minimumNormalY ||
+                    !TryTriangleHeightAtXZ(triangle, targetX, targetZ,
+                        out float targetNavY))
+                    continue;
+
+                float feetY = targetNavY;
+                if (hasCachedStart)
+                {
+                    feetY = startFeet.Y + targetNavY - cachedStartY;
+                }
+                else if (TryTriangleHeightAtXZ(triangle,
+                             startFeet.X, startFeet.Z, out float startNavY) &&
+                         Math.Abs(startNavY - startFeet.Y) <= 0.40f)
+                {
+                    feetY = startFeet.Y + targetNavY - startNavY;
+                }
+
+                float rise = feetY - startFeet.Y;
+                if (rise > maximumRise || rise < -maximumDrop)
+                    continue;
+
+                // When multiple floors overlap in X/Z, stay near the current
+                // authoritative feet rather than teleporting to a distant floor.
+                float error = Math.Abs(targetNavY - startFeet.Y);
+                if (error >= bestError)
+                    continue;
+                bestError = error;
+                bestIndex = index;
+                bestFeetY = feetY;
+            }
+
+            if (bestIndex < 0)
+            {
+                cachedTriangleIndex = -1;
+                return true;
+            }
+
+            cachedTriangleIndex = bestIndex;
+            resolved = new WorldPosition(targetX, bestFeetY, targetZ);
+            blocked = false;
             return true;
         }
+
+        /// <summary>
+        /// Sample the already-indexed baked walk surface only when descending
+        /// through a possible landing. There is no physics sweep, capsule/triangle
+        /// collision or repeated ground probe. The accepted floor is the highest
+        /// walkable surface crossed by this vertical step at the new X/Z location.
+        /// </summary>
+        public bool TryFindPlayerBakedLandingSupport(
+            float previousFeetY,
+            WorldPosition nextFeet,
+            ServerCapsule capsule,
+            float maximumSlopeDegrees,
+            out float groundY)
+        {
+            groundY = 0f;
+            if (_safeMovementTriangleGrid.Count == 0 ||
+                capsule.Radius > _map.safeMovementRadius + 0.0001f ||
+                capsule.Height > _map.safeMovementHeight + 0.0001f ||
+                !float.IsFinite(previousFeetY) ||
+                !float.IsFinite(nextFeet.X) || !float.IsFinite(nextFeet.Y) ||
+                !float.IsFinite(nextFeet.Z) || nextFeet.Y > previousFeetY)
+                return false;
+
+            // Small tolerance accommodates baked NavMesh vs physical feet offset
+            // without accepting floors that the falling trajectory has not reached.
+            float upper = previousFeetY + 0.03f;
+            float lower = nextFeet.Y - 0.15f;
+            float minimumNormalY = MathF.Cos(
+                Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            QuerySafeMovementTriangles(nextFeet.X, nextFeet.Z,
+                nextFeet.X, nextFeet.Z);
+
+            bool found = false;
+            float highest = float.NegativeInfinity;
+            foreach (int index in _safeMovementQueryScratch)
+            {
+                ServerCollisionTriangle triangle = _safeMovementTriangles[index];
+                if (triangle.normalY < minimumNormalY ||
+                    !TryTriangleHeightAtXZ(triangle, nextFeet.X,
+                        nextFeet.Z, out float y) ||
+                    y > upper || y < lower || y <= highest)
+                    continue;
+                highest = y;
+                found = true;
+            }
+
+            if (found)
+                groundY = highest;
+            return found;
+        }
+
     }
 }
