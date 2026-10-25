@@ -57,6 +57,8 @@ internal sealed partial class GameServerHost
             new Queue<OutboundPacket>(32),
         };
 
+        // Tokens may be negative after a bounded oversized reliable message. Refill repays
+        // that debt before this connection can spend its regular budget again.
         public double Tokens;
         public long LastRefillTimestamp;
         public int PendingBytes;
@@ -83,12 +85,20 @@ internal sealed partial class GameServerHost
     private readonly long[] _outboundFamilyBytes = new long[(int)OutboundFamily.Count];
     private readonly long[] _outboundFamilyPackets = new long[(int)OutboundFamily.Count];
     private int _outboundFlushCursor;
+    // Bytes borrowed against future global frames when one oversized reliable message
+    // exceeded the current frame's available byte budget. No independent queue is added.
+    private long _outboundGlobalByteDebt;
+    private long _outboundOversizedReliableSends;
     private long _outboundBudgetDeferrals;
     private long _outboundDroppedUnreliable;
     private long _outboundQueueLimitDisconnects;
     private int _outboundMaxPendingBytes;
     private int _outboundMaxPendingPackets;
     private long _outboundMaxQueueAgeMilliseconds;
+
+    private static bool CanFragmentOutbound(DeliveryMethod deliveryMethod) =>
+        deliveryMethod == DeliveryMethod.ReliableOrdered ||
+        deliveryMethod == DeliveryMethod.ReliableUnordered;
 
     private void QueueOutbound(
         ClientSession session,
@@ -109,6 +119,23 @@ internal sealed partial class GameServerHost
         }
 
         int length = writer.Length;
+        // LiteNetLib only fragments ReliableOrdered / ReliableUnordered messages. Other
+        // delivery modes cannot safely bypass the hard framing/burst limits, and an
+        // unreliable message above its transport MTU would throw at Peer.Send anyway.
+        // Discard unschedulable non-fragmentable traffic instead of blocking its lane.
+        int maxConnectionBurst = _options.OutboundBurstBytesPerConnection +
+            (priority == OutboundPriority.Critical ? _options.OutboundCriticalReserveBytes : 0);
+        int maxFrameBytes = Math.Max(1024, _options.OutboundBytesPerFrame);
+        if (!CanFragmentOutbound(deliveryMethod) &&
+            (length > maxConnectionBurst ||
+             length > maxFrameBytes ||
+             length > session.Peer.GetMaxSinglePacketSize(deliveryMethod)))
+        {
+            state.DroppedUnreliableWindow++;
+            _outboundDroppedUnreliable++;
+            return;
+        }
+
         long projectedBytes = (long)state.PendingBytes + length;
         if (projectedBytes > _options.OutboundMaxQueuedBytesPerConnection)
         {
@@ -162,16 +189,29 @@ internal sealed partial class GameServerHost
 
     private void FlushOutboundQueues()
     {
+        int maxFrameBytes = Math.Max(1024, _options.OutboundBytesPerFrame);
+
+        // Pay for earlier frame overshoot even when the application has no pending packets.
+        // This prevents successive oversized sends across different connections from
+        // evading the global throughput budget. Debt is repaid one frame at a time.
+        if (_outboundGlobalByteDebt >= maxFrameBytes)
+        {
+            _outboundGlobalByteDebt -= maxFrameBytes;
+            return;
+        }
+
+        int globalBytesRemaining = maxFrameBytes - (int)_outboundGlobalByteDebt;
+        _outboundGlobalByteDebt = 0;
         int count = _outboundActive.Count;
         if (count == 0)
             return;
 
-        int globalBytesRemaining = Math.Max(1024, _options.OutboundBytesPerFrame);
         int globalPacketsRemaining = Math.Max(1, _options.OutboundPacketsPerFrame);
         int start = _outboundFlushCursor;
         if (start < 0 || start >= count)
             start = 0;
 
+        bool oversizedReliableSentThisFrame = false;
         int visited = 0;
         while (visited < count && globalBytesRemaining > 0 && globalPacketsRemaining > 0)
         {
@@ -195,7 +235,29 @@ internal sealed partial class GameServerHost
             {
                 bool critical = packet.Priority == OutboundPriority.Critical;
                 double permitted = state.Tokens + (critical ? _options.OutboundCriticalReserveBytes : 0d);
-                if (packet.Length > permitted || packet.Length > globalBytesRemaining)
+                int maxConnectionBurst = _options.OutboundBurstBytesPerConnection +
+                    (critical ? _options.OutboundCriticalReserveBytes : 0);
+
+                // Normal messages still require sufficient per-connection tokens and
+                // available frame bytes. Only a reliable message that can NEVER fit a
+                // full bucket/frame can take the exceptional path. Letting it pass to
+                // LiteNetLib preserves the original message: the transport fragments and
+                // reassembles it without any new gameplay wire protocol.
+                bool oversizedReliable = CanFragmentOutbound(packet.Delivery) &&
+                    (packet.Length > maxConnectionBurst || packet.Length > maxFrameBytes);
+                if (oversizedReliable)
+                {
+                    // At most one exceptional message per global flush. Require a
+                    // replenished connection bucket before borrowing above its capacity,
+                    // minimizing the debt that may temporarily defer later traffic.
+                    if (oversizedReliableSentThisFrame ||
+                        state.Tokens < _options.OutboundBurstBytesPerConnection)
+                    {
+                        deferred = true;
+                        break;
+                    }
+                }
+                else if (packet.Length > permitted || packet.Length > globalBytesRemaining)
                 {
                     deferred = true;
                     break;
@@ -227,7 +289,23 @@ internal sealed partial class GameServerHost
 
                 connectionPackets++;
                 globalPacketsRemaining--;
-                globalBytesRemaining -= packet.Length;
+                if (oversizedReliable)
+                {
+                    oversizedReliableSentThisFrame = true;
+                    _outboundOversizedReliableSends++;
+                }
+
+                // Large packets borrow only the bytes they actually exceeded this frame.
+                // The next flush(es) must repay that global debt before more sends run.
+                if (packet.Length > globalBytesRemaining)
+                {
+                    _outboundGlobalByteDebt += (long)packet.Length - globalBytesRemaining;
+                    globalBytesRemaining = 0;
+                }
+                else
+                {
+                    globalBytesRemaining -= packet.Length;
+                }
             }
 
             if (deferred && state.HasPending)
@@ -363,6 +441,7 @@ internal sealed partial class GameServerHost
         _outboundStates.Clear();
         _outboundActive.Clear();
         _outboundFlushCursor = 0;
+        _outboundGlobalByteDebt = 0;
     }
 
     private static void ReleaseOutboundState(OutboundConnectionState state)
@@ -465,7 +544,8 @@ internal sealed partial class GameServerHost
         }
 
         activity = totalPackets > 0 || _outboundBudgetDeferrals > 0 ||
-                   _outboundDroppedUnreliable > 0 || _outboundQueueLimitDisconnects > 0;
+                   _outboundDroppedUnreliable > 0 || _outboundQueueLimitDisconnects > 0 ||
+                   _outboundOversizedReliableSends > 0;
         string summary = string.Empty;
         if (activity || forceSummary)
         {
@@ -474,6 +554,8 @@ internal sealed partial class GameServerHost
                 $"maxConn={maxConnectionPackets}/{maxConnectionBytes}B, " +
                 $"deferredFrames={_outboundBudgetDeferrals} (maxConn={maxConnectionDeferrals}), " +
                 $"unreliableDropped={_outboundDroppedUnreliable} (maxConn={maxConnectionDrops}), " +
+                $"oversizedReliable={_outboundOversizedReliableSends}, " +
+                $"globalByteDebt={_outboundGlobalByteDebt}B, " +
                 $"queueLimitDisconnects={_outboundQueueLimitDisconnects}, " +
                 $"queueMax={_outboundMaxPendingPackets}pkt/{_outboundMaxPendingBytes}B/{_outboundMaxQueueAgeMilliseconds}ms, " +
                 $"families=" + FormatOutboundFamilies();
@@ -481,6 +563,7 @@ internal sealed partial class GameServerHost
 
         Array.Clear(_outboundFamilyBytes, 0, _outboundFamilyBytes.Length);
         Array.Clear(_outboundFamilyPackets, 0, _outboundFamilyPackets.Length);
+        _outboundOversizedReliableSends = 0;
         _outboundBudgetDeferrals = 0;
         _outboundDroppedUnreliable = 0;
         _outboundQueueLimitDisconnects = 0;

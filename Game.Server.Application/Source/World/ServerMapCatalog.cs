@@ -56,6 +56,10 @@ namespace Game.Server.Application.World
                 snapshot.instanceId = instanceId;
                 _snapshots.Add(key, snapshot);
                 var world = new ServerCollisionWorld(snapshot, collisionCellSize);
+                // Prepare the immutable direct-neighbour and precomputed-height
+                // fast path BEFORE publishing the world/admitting any Players.
+                // This work is startup-only, never a Player simulation cost.
+                world.PreparePlayerNavigationFastPath();
                 _collisionWorlds.Add(key, world);
             }
         }
