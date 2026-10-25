@@ -1,4 +1,3 @@
-using Game.Server.Application.Movement;
 using Game.Server.Application.World;
 using Game.Server.Domain.Characters;
 using Game.Server.Domain.Players;
@@ -24,13 +23,13 @@ internal enum ServerPlayerSnapshotReason : byte
 }
 
 /// <summary>
-/// Pure-.NET authoritative movement shell for one connected Player runtime.
-/// The transport adapter serializes this state using the existing PlayerEntity wire contract.
+/// Pure-.NET authoritative position validator for one connected Player runtime.
+/// The client resolves ordinary movement; this class validates accepted positions and
+/// the transport adapter serializes them through the existing PlayerEntity wire contract.
 /// Alive/dead state is derived from the canonical Health resource, never duplicated here.
 /// </summary>
 internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
 {
-    private const float InputPrecision = 1f / 127f;
     private const float PositionPrecision = 0.01f;
     private const long CommandTimeoutMilliseconds = 650;
     private const int MaxAcceptedCommandsPerSecond = 60;
@@ -40,8 +39,14 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     private const byte CombatReadyInputFlag = 0x02; // PlayerCombatInputFlags.AimHeld
 
     private readonly ServerMapCatalog _maps;
-    private readonly ServerCharacterMotor _motor;
-    private CharacterMotorState _motorState;
+    private float _walkSpeed;
+    private float _sprintSpeed;
+    private float _gravity;
+    private float _jumpSpeed;
+    private bool _grounded = true;
+    private bool _correctionPending;
+    private long _lastAcceptedPositionAtMs;
+    private long _jumpValidationUntilMs;
 
     private bool _hasCommand;
     private uint _lastAcceptedSequence;
@@ -51,10 +56,6 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     private byte _commandFlags;
     private byte _combatInput;
     private bool _combatReady;
-    // Jump is edge-triggered on the server. A held client flag must not turn into
-    // automatic bunny-hopping whenever the motor becomes grounded again.
-    private bool _jumpHeld;
-    private bool _jumpRequested;
     private long _lastCommandTimestampMs;
     private long _rateWindowStartMs;
     private int _rateWindowAccepted;
@@ -90,7 +91,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     public float YawDegrees { get; private set; }
     public uint AppearanceSequence { get; private set; } = 1;
     public float SnapshotSpeed { get; private set; }
-    public float SnapshotVerticalSpeed => _motorState.VerticalVelocity;
+    public float SnapshotVerticalSpeed { get; private set; }
     public byte SnapshotFlags { get; private set; } = 0x01; // Grounded
     public byte SnapshotMoveState { get; private set; }
     public bool IsCombatReady => !IsDead && _combatReady;
@@ -110,14 +111,14 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         // GameplayContentValidation has already validated the active revision. Clamp again
         // at this final authority boundary so malformed runtime injection cannot produce
         // non-finite or inverted movement tuning.
-        float moveSpeed = SanitizePositive(movement.moveSpeed, _motor.Settings.WalkSpeed, 30f);
-        float sprintSpeed = SanitizePositive(movement.sprintSpeed, _motor.Settings.SprintSpeed, 50f);
+        float moveSpeed = SanitizePositive(movement.moveSpeed, _walkSpeed, 30f);
+        float sprintSpeed = SanitizePositive(movement.sprintSpeed, _sprintSpeed, 50f);
         sprintSpeed = Math.Max(moveSpeed, sprintSpeed);
 
-        _motor.Settings.WalkSpeed = moveSpeed;
-        _motor.Settings.SprintSpeed = sprintSpeed;
-        _motor.Settings.Gravity = SanitizeNonNegative(movement.gravity, _motor.Settings.Gravity, 100f);
-        _motor.Settings.JumpSpeed = SanitizeNonNegative(movement.jumpSpeed, _motor.Settings.JumpSpeed, 50f);
+        _walkSpeed = moveSpeed;
+        _sprintSpeed = sprintSpeed;
+        _gravity = SanitizeNonNegative(movement.gravity, _gravity, 100f);
+        _jumpSpeed = SanitizeNonNegative(movement.jumpSpeed, _jumpSpeed, 50f);
         _forceSnapshot = true;
     }
 
@@ -143,25 +144,18 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         ConnectionId = connectionId;
         _maps = maps;
         MovementRulesDefinition movementRules = movement ?? new MovementRulesDefinition();
-        _motor = new ServerCharacterMotor(new CharacterMotorSettings
-        {
-            WalkSpeed = movementRules.moveSpeed,
-            SprintSpeed = movementRules.sprintSpeed,
-            Gravity = movementRules.gravity,
-            JumpSpeed = movementRules.jumpSpeed,
-            Radius = 0.35f,
-            Height = 1.8f,
-            StepHeight = 0.4f,
-            GroundSnapDistance = 0.5f,
-            MaximumSlopeDegrees = 50f,
-        });
+        _walkSpeed = SanitizePositive(movementRules.moveSpeed, PlayerMovementDefaults.WalkSpeed, 30f);
+        _sprintSpeed = Math.Max(_walkSpeed,
+            SanitizePositive(movementRules.sprintSpeed, PlayerMovementDefaults.SprintSpeed, 50f));
+        _gravity = SanitizeNonNegative(movementRules.gravity, PlayerMovementDefaults.Gravity, 100f);
+        _jumpSpeed = SanitizeNonNegative(movementRules.jumpSpeed, PlayerMovementDefaults.JumpSpeed, 50f);
 
         CharacterLocationState location = runtime.Location;
         X = location.Position.X;
         Y = location.Position.Y;
         Z = location.Position.Z;
         YawDegrees = NormalizeYaw(location.YawDegrees);
-        _motorState = new CharacterMotorState(location.Position);
+        _lastAcceptedPositionAtMs = Environment.TickCount64;
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
         _lastSnapshotZ = Z;
@@ -179,15 +173,13 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         byte yaw,
         byte flags,
         byte combatFlags,
+        int positionX,
+        int positionY,
+        int positionZ,
         long nowMilliseconds,
         out bool simulationChanged)
     {
         simulationChanged = false;
-        if (IsDead)
-        {
-            ClearMovementIntent();
-            return false;
-        }
         if (!IsNewer(sequence, _lastAcceptedSequence))
             return false;
 
@@ -202,33 +194,62 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _rateWindowAccepted++;
         _lastAcceptedSequence = sequence;
 
-        // The wire type can technically represent -128, while the canonical client
-        // quantizer emits -127..127. Clamp to the canonical input domain and discard all
-        // client-authored presentation/state flags except the movement intent bits the
-        // authoritative motor consumes (Sprint + Jump). Grounded/running/death remain derived.
+        // The server accepts the client's resolved location, then independently validates
+        // its envelope and baked-map legality. Input remains only for public presentation
+        // intent and sprint/jump plausibility; it never drives a server Player motor.
         sbyte nextInputX = (sbyte)Math.Clamp((int)inputX, -127, 127);
         sbyte nextInputZ = (sbyte)Math.Clamp((int)inputZ, -127, 127);
         byte intentFlags = (byte)(flags & (SprintIntentFlag | JumpIntentFlag));
         bool jumpHeld = (intentFlags & JumpIntentFlag) != 0;
         bool combatReady = (combatFlags & CombatReadyInputFlag) != 0;
-        bool wasFresh = _hasCommand &&
-                        nowMilliseconds - _lastCommandTimestampMs <= CommandTimeoutMilliseconds;
+        bool wasFresh = _hasCommand && nowMilliseconds - _lastCommandTimestampMs <= CommandTimeoutMilliseconds;
+        bool inputChanged = !wasFresh || nextInputX != _inputX || nextInputZ != _inputZ ||
+                            yaw != _commandYaw || intentFlags != _commandFlags || combatReady != _combatReady;
 
-        simulationChanged =
-            !wasFresh ||
-            nextInputX != _inputX ||
-            nextInputZ != _inputZ ||
-            yaw != _commandYaw ||
-            intentFlags != _commandFlags ||
-            combatReady != _combatReady ||
-            (jumpHeld && !_jumpHeld);
+        WorldPosition reported = new WorldPosition(
+            positionX * PositionPrecision,
+            positionY * PositionPrecision,
+            positionZ * PositionPrecision);
+        WorldPosition previous = new WorldPosition(X, Y, Z);
+        float dx = reported.X - X;
+        float dz = reported.Z - Z;
+        float dy = reported.Y - Y;
+        float horizontalDistance = MathF.Sqrt(dx * dx + dz * dz);
+        float elapsed = Math.Clamp((nowMilliseconds - _lastAcceptedPositionAtMs) / 1000f, 0.02f, 1.25f);
+        float selectedSpeed = (intentFlags & SprintIntentFlag) != 0 ? _sprintSpeed : _walkSpeed;
+        float distanceMultiplier = (intentFlags & SprintIntentFlag) != 0
+            ? PlayerMovementDefaults.SprintDistanceMultiplier
+            : PlayerMovementDefaults.WalkDistanceMultiplier;
+        float horizontalLimit = selectedSpeed * distanceMultiplier * elapsed + 0.65f;
+        float verticalLimit = Math.Max(_jumpSpeed, 2f) * elapsed +
+                              0.5f * _gravity * elapsed * elapsed + 0.65f;
+        bool positionChanged = horizontalDistance > 0.015f || Math.Abs(dy) > 0.015f;
+        bool movementLocked = false;
+        if (positionChanged)
+        {
+            CharacterStatusEffectsState statusState = Runtime.CaptureStatusEffects();
+            movementLocked = statusState.HasControl(ControlEffectType.Stun) ||
+                              statusState.HasControl(ControlEffectType.Root);
+        }
+        bool plausible = !IsDead && !movementLocked &&
+                         horizontalDistance <= horizontalLimit && Math.Abs(dy) <= verticalLimit;
+        bool jumpInitiated = jumpHeld && dy > 0.015f && _grounded;
+        bool jumpValidationActive = jumpHeld || jumpInitiated ||
+                                    nowMilliseconds <= _jumpValidationUntilMs;
+        bool grounded = _grounded;
+        if (plausible && positionChanged)
+        {
+            ServerCollisionWorld collision = null;
+            _maps?.TryGetCollisionWorld(Runtime.Location.MapId, Runtime.Location.InstanceId, out collision);
+            bool falling = reported.Y < previous.Y - 0.03f;
+            plausible = collision != null && collision.ValidateReportedPlayerMove(
+                previous, reported, jumpValidationActive, falling, 50f, out grounded);
+        }
 
+        simulationChanged = inputChanged || positionChanged || _correctionPending;
         _inputX = nextInputX;
         _inputZ = nextInputZ;
         _commandYaw = yaw;
-        if (jumpHeld && !_jumpHeld)
-            _jumpRequested = true;
-        _jumpHeld = jumpHeld;
         _commandFlags = intentFlags;
 
         // Combat hold/aim state shares the existing one-byte movement field and does not
@@ -237,10 +258,58 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         // canonical input domain.
         PlayerCombatInputFlags combatState = PlayerCombatInputEncoding.DecodeFlags(combatFlags);
         float aimPitch = PlayerCombatInputEncoding.DecodeAimPitchDegrees(combatFlags);
-        _combatInput = PlayerCombatInputEncoding.Encode(combatState, aimPitch);
-        _combatReady = combatReady;
+        _combatInput = IsDead ? (byte)0 : PlayerCombatInputEncoding.Encode(combatState, aimPitch);
+        _combatReady = !IsDead && combatReady;
         _lastCommandTimestampMs = nowMilliseconds;
         _hasCommand = true;
+
+        if (positionChanged && plausible)
+        {
+            X = reported.X;
+            Y = reported.Y;
+            Z = reported.Z;
+            YawDegrees = DequantizeYaw(yaw);
+            _grounded = grounded;
+            CharacterLocationState priorLocation = Runtime.Location;
+            Runtime.UpdateLocation(new CharacterLocationState(
+                priorLocation.MapId,
+                priorLocation.InstanceId,
+                reported,
+                YawDegrees));
+            SnapshotVerticalSpeed = elapsed > 0.0001f ? dy / elapsed : 0f;
+            SnapshotSpeed = Math.Min(selectedSpeed, horizontalDistance / (elapsed * distanceMultiplier));
+            SnapshotFlags = (byte)((grounded ? 0x01 : 0) |
+                ((intentFlags & SprintIntentFlag) != 0 ? 0x02 | 0x80 : 0) |
+                (!grounded ? 0x08 : 0) |
+                (_combatReady ? 0x20 : 0));
+            SnapshotMoveState = grounded ? (byte)(SnapshotSpeed > 0.01f ? 1 : 0) : (byte)2;
+            _lastAcceptedPositionAtMs = nowMilliseconds;
+            if (jumpInitiated)
+                _jumpValidationUntilMs = nowMilliseconds + 1200;
+            if (grounded && dy <= 0.03f)
+                _jumpValidationUntilMs = 0;
+        }
+        else if (positionChanged)
+        {
+            _correctionPending = true;
+            SnapshotFlags |= 0x10; // Teleport: existing owner and observer snap path.
+            simulationChanged = true;
+        }
+        else if (inputChanged)
+        {
+            YawDegrees = DequantizeYaw(yaw);
+            if (nextInputX == 0 && nextInputZ == 0)
+            {
+                SnapshotSpeed = 0f;
+                SnapshotFlags &= unchecked((byte)~0x82); // Running and sprinting presentation.
+                SnapshotMoveState = _grounded ? (byte)0 : (byte)2;
+            }
+            if (_combatReady)
+                SnapshotFlags |= 0x20;
+            else
+                SnapshotFlags &= unchecked((byte)~0x20);
+        }
+
         return true;
     }
 
@@ -267,30 +336,18 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
     }
 
     /// <summary>
-    /// True while this entity needs fixed-cadence movement simulation without another
-    /// external wake event. Grounded stationary players return false. Fresh movement,
-    /// jump/airborne motion, and one final stale-input stop transition remain continuous.
+    /// Ordinary Player movement is reported by the client and never schedules a server motor.
     /// </summary>
     public bool RequiresContinuousSimulation(long nowMilliseconds)
     {
-        if (!_motorState.Grounded || _jumpRequested)
-            return true;
-
-        if (!_hasCommand)
-            return false;
-
-        long age = Math.Max(0L, nowMilliseconds - _lastCommandTimestampMs);
-        if (age <= CommandTimeoutMilliseconds)
-            return _inputX != 0 || _inputZ != 0;
-
-        // If the last replicated state was moving, run one timeout tick so authority
-        // publishes the transition back to idle before this entity goes dormant.
-        return SnapshotSpeed > 0.01f || _lastSnapshotMoveState == 1;
+        // Client-resolved movement arrives through MovementCommand. Input leases never
+        // schedule continuous server Player motor work.
+        return false;
     }
 
     /// <summary>
-    /// Executes one fixed authoritative simulation step. Returns true when a snapshot
-    /// should be emitted because authoritative presentation state changed or heartbeat is due.
+    /// Evaluates event-driven Player presentation and snapshot state. It does not integrate
+    /// or resolve ordinary Player movement.
     /// </summary>
     public bool Tick(float fixedDelta, double nowSeconds, long nowMilliseconds, out float moveSpeed, out byte flags, out byte moveState, out ServerPlayerSnapshotReason reason)
     {
@@ -301,96 +358,45 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         LastTickHorizontalCollisionMs = 0d;
         LastTickPostCollisionMs = 0d;
         LastTickMotorOtherMs = 0d;
-        bool dead = IsDead;
-        if (dead)
-            ClearMovementIntent();
+        LastTickStatusReadMs = 0d;
+        LastTickInputMs = 0d;
+        LastTickMotorMs = 0d;
+        LastTickLocationUpdateMs = 0d;
 
+        bool dead = IsDead;
         CharacterStatusEffectsState statusState = Runtime.CaptureStatusEffects();
         bool stunned = statusState.HasControl(ControlEffectType.Stun);
-        bool rooted = stunned || statusState.HasControl(ControlEffectType.Root);
+        bool rooted = statusState.HasControl(ControlEffectType.Root);
         LastTickStatusReadMs = ElapsedMillisecondsSince(stageStartedAt);
-
         stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-        bool timedOut = dead || !_hasCommand || nowMilliseconds - _lastCommandTimestampMs > CommandTimeoutMilliseconds;
-        float x = timedOut || rooted ? 0f : _inputX * InputPrecision;
-        float z = timedOut || rooted ? 0f : _inputZ * InputPrecision;
-        float magnitudeSq = x * x + z * z;
-        if (magnitudeSq > 1f)
+
+        if (dead)
         {
-            float inv = 1f / MathF.Sqrt(magnitudeSq);
-            x *= inv;
-            z *= inv;
-            magnitudeSq = 1f;
+            ClearMovementIntent();
+            _grounded = true;
+            SnapshotVerticalSpeed = 0f;
+            SnapshotSpeed = 0f;
+        }
+        else if (stunned || rooted)
+        {
+            SnapshotSpeed = 0f;
+            SnapshotFlags &= 0x7D; // Clear running/sprinting while control is locked.
         }
 
-        bool sprint = !timedOut && !rooted && (_commandFlags & SprintIntentFlag) != 0;
-        bool jump = !timedOut && !rooted && _jumpRequested;
-        // Consume the edge exactly once regardless of whether the motor can execute it
-        // (for example, an airborne jump request). A new jump requires release + press.
-        _jumpRequested = false;
-
-        float speed = sprint
-            ? _motor.Settings.SprintSpeed
-            : _motor.Settings.WalkSpeed;
-        float magnitude = magnitudeSq <= 0f ? 0f : MathF.Sqrt(magnitudeSq);
-        moveSpeed = dead ? 0f : magnitude * speed;
-
-        if (!timedOut && !stunned)
-            YawDegrees = DequantizeYaw(_commandYaw);
+        moveSpeed = dead ? 0f : SnapshotSpeed;
+        flags = _correctionPending
+            ? SnapshotFlags
+            : (byte)(SnapshotFlags & 0xEF); // Teleport is a one-snapshot correction pulse.
+        if (dead)
+            flags = 0x01;
+        moveState = dead ? (byte)6 : !_grounded ? (byte)2 : moveSpeed > 0.01f ? (byte)1 : (byte)0;
+        SnapshotFlags = flags;
+        SnapshotMoveState = moveState;
         LastTickInputMs = ElapsedMillisecondsSince(stageStartedAt);
 
         stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (dead)
-        {
-            _motorState.Mode = Game.Shared.Actors.ActorMovementMode.Dead;
-            _motorState.Grounded = true;
-            _motorState.VerticalVelocity = 0f;
-        }
-        else
-        {
-            if (_motorState.Mode == Game.Shared.Actors.ActorMovementMode.Dead)
-                _motorState.Mode = Game.Shared.Actors.ActorMovementMode.Grounded;
-
-            ServerCollisionWorld collision = null;
-            long collisionLookupStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-            _maps?.TryGetCollisionWorld(Runtime.Location.MapId, Runtime.Location.InstanceId, out collision);
-            LastTickCollisionWorldLookupMs = ElapsedMillisecondsSince(collisionLookupStartedAt);
-            _motor.Tick(
-                _motorState,
-                new CharacterMovementIntent(x, z, sprint, jump),
-                fixedDelta,
-                collision);
-            LastTickMotorPreparationMs = _motor.LastTickPreparationMs;
-            LastTickHorizontalCollisionMs = _motor.LastTickHorizontalCollisionMs;
-            LastTickPostCollisionMs = _motor.LastTickPostCollisionMs;
-            LastTickMotorOtherMs = _motor.LastTickOtherMs;
-            X = _motorState.Position.X;
-            Y = _motorState.Position.Y;
-            Z = _motorState.Position.Z;
-        }
-        LastTickMotorMs = ElapsedMillisecondsSince(stageStartedAt);
-
-        stageStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-        flags = 0;
-        if (_motorState.Grounded || dead)
-            flags |= 0x01; // Grounded
-        if (!dead && sprint && magnitudeSq > 0.0001f)
-            flags |= 0x02 | 0x80; // Sprinting | Running
-        if (!dead && !_motorState.Grounded)
-            flags |= 0x08; // Jumping/Airborne presentation bit
-        if (!dead && _combatReady)
-            flags |= 0x20; // CombatReady presentation bit; zero additional snapshot bytes
-        moveState = dead ? (byte)6 : !_motorState.Grounded ? (byte)2 : moveSpeed > 0.01f ? (byte)1 : (byte)0;
-        SnapshotSpeed = moveSpeed;
-        SnapshotFlags = flags;
-        SnapshotMoveState = moveState;
-
-        bool moved =
-            DistanceSquared(X, Y, Z, _lastSnapshotX, _lastSnapshotY, _lastSnapshotZ) >=
-            PositionPrecision * PositionPrecision;
-        // Dirty rotation must match the actual wire representation. If quantization still
-        // produces the same byte, the client cannot observe a rotation change and there is
-        // no reason to wake replication for it.
+        bool moved = DistanceSquared(X, Y, Z, _lastSnapshotX, _lastSnapshotY, _lastSnapshotZ) >=
+                     PositionPrecision * PositionPrecision;
         byte wireYaw = QuantizeYaw(YawDegrees);
         bool rotated = wireYaw != _lastSnapshotWireYaw;
         bool flagsChanged = flags != _lastSnapshotFlags;
@@ -399,9 +405,9 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         bool heartbeat = nowSeconds >= _nextHeartbeatAt;
 
         reason = ServerPlayerSnapshotReason.None;
-        if (_forceSnapshot)
+        if (_forceSnapshot || _correctionPending)
             reason |= ServerPlayerSnapshotReason.Forced;
-        if (moved)
+        if (moved || _correctionPending)
             reason |= ServerPlayerSnapshotReason.Position;
         if (rotated)
             reason |= ServerPlayerSnapshotReason.Rotation;
@@ -415,9 +421,8 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         if (reason == ServerPlayerSnapshotReason.None)
         {
             LastTickSnapshotDecisionMs = ElapsedMillisecondsSince(stageStartedAt);
-            LastTickLocationUpdateMs = 0d;
             LastTickUnattributedMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
-                LastTickStatusReadMs - LastTickInputMs - LastTickMotorMs - LastTickSnapshotDecisionMs);
+                LastTickStatusReadMs - LastTickInputMs - LastTickSnapshotDecisionMs);
             return false;
         }
 
@@ -440,9 +445,9 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
             new WorldPosition(X, Y, Z),
             YawDegrees));
         LastTickLocationUpdateMs = ElapsedMillisecondsSince(stageStartedAt);
+        _correctionPending = false;
         LastTickUnattributedMs = Math.Max(0d, ElapsedMillisecondsSince(tickStartedAt) -
-            LastTickStatusReadMs - LastTickInputMs - LastTickMotorMs -
-            LastTickSnapshotDecisionMs - LastTickLocationUpdateMs);
+            LastTickStatusReadMs - LastTickInputMs - LastTickSnapshotDecisionMs - LastTickLocationUpdateMs);
         return true;
     }
 
@@ -457,7 +462,9 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         Y = location.Position.Y;
         Z = location.Position.Z;
         YawDegrees = NormalizeYaw(location.YawDegrees);
-        _motorState = new CharacterMotorState(location.Position);
+        _grounded = true;
+        SnapshotVerticalSpeed = 0f;
+        _lastAcceptedPositionAtMs = Environment.TickCount64;
         ClearMovementIntent();
         _lastSnapshotX = X;
         _lastSnapshotY = Y;
@@ -524,8 +531,7 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         _inputZ = 0;
         _combatInput = 0;
         _commandFlags = 0;
-        _jumpHeld = false;
-        _jumpRequested = false;
+        _jumpValidationUntilMs = 0;
     }
 
     private static bool IsNewer(uint candidate, uint reference) =>
@@ -577,3 +583,4 @@ internal sealed class ServerPlayerEntity : IPlayerEntityPresentationSource
         return x * x + y * y + z * z;
     }
 }
+

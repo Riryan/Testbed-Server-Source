@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Game.Server.Application.Movement;
 using Game.Shared.World;
 
 namespace Game.Server.Application.World
@@ -60,6 +61,12 @@ namespace Game.Server.Application.World
                 // fast path BEFORE publishing the world/admitting any Players.
                 // This work is startup-only, never a Player simulation cost.
                 world.PreparePlayerNavigationFastPath();
+                // Prepare the SAME shared-world clearance index that the Unity
+                // client builds in SharedMovementQueries. Runtime grounded Player
+                // movement uses GroundedMove.Resolve, not the separate V6
+                // NavMesh-triangle acceptance route. This is startup-only work.
+                GroundedMove.RegisterWorld(world,
+                    snapshot.collisionTriangles, snapshot.dynamicBlockers);
                 _collisionWorlds.Add(key, world);
             }
         }

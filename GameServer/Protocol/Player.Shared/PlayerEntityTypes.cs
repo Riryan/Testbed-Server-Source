@@ -4,7 +4,7 @@ namespace Player.Shared
 {
     public static class PlayerEntityProtocol
     {
-        public const ushort Version = 15;
+        public const ushort Version = 16;
         public const ushort DefaultTickRate = 20;
     }
 
@@ -12,6 +12,8 @@ namespace Player.Shared
     {
         public const float WalkSpeed = 3.0f;
         public const float SprintSpeed = 5.95f;
+        public const float WalkDistanceMultiplier = 1.10f;
+        public const float SprintDistanceMultiplier = 1.68f;
         public const float Gravity = 24f;
         public const float JumpSpeed = 7f;
     }
@@ -61,3 +63,4 @@ namespace Player.Shared
         Running = 1 << 7,
     }
 }
+

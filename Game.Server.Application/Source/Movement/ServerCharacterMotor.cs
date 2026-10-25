@@ -55,34 +55,18 @@ namespace Game.Server.Application.Movement
     }
 
     /// <summary>
-    /// Authoritative, inexpensive Player intent integration over the immutable
-    /// baked agent-sized surface. Reuse per-Player cached NavMesh location;
-    /// Population's separate motor branch is preserved unchanged.
+    /// Player input is integrated authoritatively against the same baked-world
+    /// GroundedMove contract already used by the Unity client's local predictor.
+    /// No separate NavMesh certificate acceptance logic runs for grounded Players.
+    /// Population and airborne movement retain their existing branches.
     /// </summary>
     public sealed class ServerCharacterMotor
     {
         private readonly CharacterMotorSettings _settings;
         private readonly ServerCapsule _capsule;
-        private CharacterMotorState _groundHintOwner;
-        private ServerCollisionWorld _groundHintWorld;
-        private WorldPosition _groundHintPosition;
-        private int _groundHintTriangle = -1;
-
-        // A Player pressing into an immutable NavMesh boundary can send the same
-        // authoritative move attempt for many consecutive ticks. A rejection
-        // cannot become valid without an input/position/world change, so reuse
-        // that result instead of querying the same cell repeatedly. This cache
-        // is per motor/player, never global across actors or maps.
-        private bool _hasRejectedGroundedMove;
-        private WorldPosition _rejectedStart;
-        private float _rejectedDx;
-        private float _rejectedDz;
-
-        // Only ground movement's previously-expensive grid fallback is blocked.
-        // Landing still uses its already-existing indexed support lookup.
+        // Kept as a read-only compatibility diagnostic. Grounded Players now use
+        // GroundedMove.Resolve rather than the legacy PlayerNavMesh V6 fallback.
         public PlayerNavFallbackReason LastTickNavFallbackReason { get; private set; }
-        private long _nextNavFallbackWarningAtMs;
-        private int _suppressedNavFallbackWarnings;
 
         public double LastTickPreparationMs { get; private set; }
         public double LastTickHorizontalCollisionMs { get; private set; }
@@ -180,8 +164,14 @@ namespace Game.Server.Application.Movement
             bool grounded = state.Grounded && state.Mode == ActorMovementMode.Grounded;
             bool hasHorizontalInput = Math.Abs(dx) + Math.Abs(dz) > 0.000001f;
 
-            // Ordinary Player ground movement: no physical ground query,
-            // dynamic-blocker lookup, capsule scan, or second acceptance solver.
+            // Both the local client and the authoritative server now use the SAME
+            // GroundedMove.Resolve implementation, the same authored support
+            // triangles and static collision, and the same 0.35m/1.80m capsule.
+            //
+            // Reuse the world-level index prepared once in ServerMapCatalog.
+            // No separate V6 NavMesh surface certificate, neighbour walk, or
+            // blocked-step cache is consulted. Mutable blocker state remains
+            // observable through the canonical ServerCollisionWorld.
             if (player && grounded && !intent.Jump)
             {
                 if (!hasHorizontalInput)
@@ -192,68 +182,23 @@ namespace Game.Server.Application.Movement
                 }
 
                 stageStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                if (!ReferenceEquals(_groundHintOwner, state) ||
-                    !ReferenceEquals(_groundHintWorld, collisionWorld) ||
-                    state.Position != _groundHintPosition)
-                {
-                    // One-time binding on initial world entry, respawn, or warp.
-                    // Never use a new endpoint grid search to resolve movement.
-                    _groundHintTriangle = -1;
-                    _hasRejectedGroundedMove = false;
-                    _groundHintOwner = state;
-                    _groundHintWorld = collisionWorld;
-                    _groundHintPosition = state.Position;
-                    collisionWorld.TryBindPlayerNavStart(state.Position,
-                        _capsule, _settings.MaximumSlopeDegrees,
-                        out _groundHintTriangle);
-                }
-
-                // An identical failed step against the same immutable baked
-                // geometry cannot succeed until something changes. A Player
-                // changing heading, sprint speed, position, world, or state will
-                // bypass this check and receive normal authoritative validation.
-                if (_hasRejectedGroundedMove &&
-                    state.Position == _rejectedStart &&
-                    dx == _rejectedDx && dz == _rejectedDz)
-                {
-                    blocked = true;
-                    LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStart);
-                    LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStart) -
-                        LastTickPreparationMs - LastTickHorizontalCollisionMs);
-                    return;
-                }
-
-                bool handled = collisionWorld.TryResolvePlayerCertifiedGrounded(
-                    state.Position, dx, dz, _capsule,
+                WorldPosition next = GroundedMove.Resolve(
+                    collisionWorld, state.Position, dx, dz, _capsule,
                     _settings.StepHeight, _settings.GroundSnapDistance,
-                    _settings.MaximumSlopeDegrees, ref _groundHintTriangle,
-                    out WorldPosition next, out blocked,
-                    out PlayerNavFallbackReason fallbackReason);
+                    _settings.MaximumSlopeDegrees, out blocked);
                 LastTickHorizontalCollisionMs = ElapsedMillisecondsSince(stageStart);
-                LastTickNavFallbackReason = fallbackReason;
-                if (fallbackReason != PlayerNavFallbackReason.None)
-                    LogBypassedNavFallback(collisionWorld, state.Position,
-                        dx, dz, fallbackReason);
-                if (!handled || blocked)
+                if (blocked)
                 {
-                    blocked = true;
-                    _groundHintPosition = state.Position;
-                    _rejectedStart = state.Position;
-                    _rejectedDx = dx;
-                    _rejectedDz = dz;
-                    _hasRejectedGroundedMove = true;
                     LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStart) -
                         LastTickPreparationMs - LastTickHorizontalCollisionMs);
                     return;
                 }
 
-                _hasRejectedGroundedMove = false;
                 state.Position = next;
                 state.LastSafePosition = next;
                 state.VerticalVelocity = 0f;
                 state.Grounded = true;
                 state.Mode = ActorMovementMode.Grounded;
-                _groundHintPosition = next;
                 LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStart) -
                     LastTickPreparationMs - LastTickHorizontalCollisionMs);
                 return;
@@ -263,8 +208,6 @@ namespace Game.Server.Application.Movement
             // capsule movement simulation. Consult baked surface on descent only.
             if (player)
             {
-                _groundHintTriangle = -1;
-                _hasRejectedGroundedMove = false;
                 stageStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 WorldPosition before = state.Position;
                 bool launching = grounded && intent.Jump;
@@ -291,20 +234,15 @@ namespace Game.Server.Application.Movement
                     collisionWorld.TryFindPlayerBakedLandingSupport(
                         before.Y, next, _capsule,
                         _settings.MaximumSlopeDegrees,
-                        out float landingY, out int landingTriangle))
+                        out float landingY, out _))
                 {
                     next = new WorldPosition(next.X, landingY, next.Z);
                     state.Grounded = true;
                     state.Mode = ActorMovementMode.Grounded;
                     state.VerticalVelocity = 0f;
                     state.LastSafePosition = next;
-                    // Landing already identified the support triangle; preserve it.
-                    // Do not force a second grid bind on the next grounded tick.
-                    _groundHintTriangle = landingTriangle;
-                    _groundHintOwner = state;
-                    _groundHintWorld = collisionWorld;
-                    _groundHintPosition = next;
-                    _hasRejectedGroundedMove = false;
+                    // The grounded solver reuses the shared baked-world index;
+                    // landing requires no legacy PlayerNavMesh cache binding.
                 }
                 state.Position = next;
                 LastTickPostCollisionMs = ElapsedMillisecondsSince(stageStart);
@@ -315,7 +253,6 @@ namespace Game.Server.Application.Movement
             }
 
             // Existing Population motor, deliberately unchanged.
-            _groundHintTriangle = -1;
             stageStart = System.Diagnostics.Stopwatch.GetTimestamp();
             WorldPosition previousPosition = state.Position;
             WorldPosition moved;
@@ -439,35 +376,6 @@ namespace Game.Server.Application.Movement
             LastTickPostCollisionMs = ElapsedMillisecondsSince(stageStart);
             LastTickOtherMs = Math.Max(0d, ElapsedMillisecondsSince(tickStart) -
                 LastTickPreparationMs - LastTickHorizontalCollisionMs - LastTickPostCollisionMs);
-        }
-
-        private void LogBypassedNavFallback(
-            ServerCollisionWorld world, WorldPosition start,
-            float dx, float dz, PlayerNavFallbackReason reason)
-        {
-            long now = Environment.TickCount64;
-            if (now < _nextNavFallbackWarningAtMs)
-            {
-                if (_suppressedNavFallbackWarnings < int.MaxValue)
-                    ++_suppressedNavFallbackWarnings;
-                return;
-            }
-
-            float targetX = start.X + dx;
-            float targetZ = start.Z + dz;
-            int candidateCount = world.CountPlayerNavCellCandidates(targetX, targetZ);
-            string warning =
-                $"[PlayerNavMesh] Grounded baked transition unavailable (movement blocked, no grid fallback): " +
-                $"map={world.MapId} instance={world.InstanceId} reason={reason} " +
-                $"start=({start.X:0.###},{start.Y:0.###},{start.Z:0.###}) " +
-                $"target=({targetX:0.###},{targetZ:0.###}) " +
-                $"cachedTriangle={_groundHintTriangle} " +
-                $"targetCellCandidates={candidateCount} " +
-                $"suppressedSinceLastWarning={_suppressedNavFallbackWarnings}";
-            System.Threading.ThreadPool.QueueUserWorkItem(static value =>
-                Console.Error.WriteLine((string)value), warning);
-            _nextNavFallbackWarningAtMs = now + 10000L;
-            _suppressedNavFallbackWarnings = 0;
         }
 
         private static double ElapsedMillisecondsSince(long startedAt) =>

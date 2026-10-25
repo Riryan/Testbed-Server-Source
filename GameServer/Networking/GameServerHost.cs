@@ -895,6 +895,9 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
         byte yaw = reader.GetByte();
         byte flags = reader.GetByte();
         byte combatFlags = reader.GetByte();
+        int positionX = reader.GetPackedInt();
+        int positionY = reader.GetPackedInt();
+        int positionZ = reader.GetPackedInt();
         long nowMilliseconds = Environment.TickCount64;
 
         bool accepted = session.Entity.TryAcceptMovement(
@@ -904,6 +907,9 @@ internal sealed partial class GameServerHost : INetEventListener, IDisposable
             yaw,
             flags,
             combatFlags,
+            positionX,
+            positionY,
+            positionZ,
             nowMilliseconds,
             out bool simulationChanged);
         if (accepted && simulationChanged)
@@ -1504,3 +1510,4 @@ internal static class TaskExtensions
             TaskScheduler.Default);
     }
 }
+

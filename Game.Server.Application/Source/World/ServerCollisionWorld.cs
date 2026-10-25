@@ -259,6 +259,86 @@ namespace Game.Server.Application.World
         }
 
         /// <summary>
+        /// Performs bounded validation of a client-resolved Player position using the
+        /// map's existing baked movement and collision grids. This does not move the
+        /// actor, search a NavMesh, or run capsule/physics simulation.
+        /// </summary>
+        public bool ValidateReportedPlayerMove(
+            WorldPosition from,
+            WorldPosition to,
+            bool jumping,
+            bool falling,
+            float maximumSlopeDegrees,
+            out bool grounded)
+        {
+            grounded = false;
+            if (!IsFinite(from.X) || !IsFinite(from.Y) || !IsFinite(from.Z) ||
+                !IsFinite(to.X) || !IsFinite(to.Y) || !IsFinite(to.Z) ||
+                IsOutsideRecoveryBounds(to, 1f, 4f, 30f))
+                return false;
+
+            float dx = to.X - from.X;
+            float dz = to.Z - from.Z;
+            float horizontalDistanceSquared = dx * dx + dz * dz;
+            float dy = to.Y - from.Y;
+            if (horizontalDistanceSquared <= 0.0004f && Math.Abs(dy) <= 0.015f)
+            {
+                grounded = TryFindGroundAtPoint(to.X, to.Z, to.Y,
+                    0.35f, 0.35f, MathF.Cos(maximumSlopeDegrees * (MathF.PI / 180f)),
+                    requireWalkable: true, out _, out _);
+                return true;
+            }
+
+            // Static steep triangles are wall/obstacle faces. The already prepared
+            // collision grid limits this query to cells touched by the short, speed-
+            // validated movement segment.
+            float minX = Math.Min(from.X, to.X) - 0.02f;
+            float maxX = Math.Max(from.X, to.X) + 0.02f;
+            float minZ = Math.Min(from.Z, to.Z) - 0.02f;
+            float maxZ = Math.Max(from.Z, to.Z) + 0.02f;
+            QueryTriangles(minX, minZ, maxX, maxZ);
+            float minNormalY = MathF.Cos(Math.Clamp(maximumSlopeDegrees, 0f, 89.9f) * (MathF.PI / 180f));
+            foreach (int index in _queryScratch)
+            {
+                ServerCollisionTriangle triangle = _triangles[index];
+                if (triangle.normalY >= minNormalY)
+                {
+                    if (falling && SegmentIntersectsTriangle(
+                            from.X, from.Y + 0.05f, from.Z,
+                            to.X, to.Y + 0.05f, to.Z,
+                            triangle))
+                        return false;
+                    continue;
+                }
+
+                for (int heightIndex = 0; heightIndex < 3; ++heightIndex)
+                {
+                    float bodyOffset = heightIndex == 0 ? 0.25f : heightIndex == 1 ? 0.9f : 1.55f;
+                    if (SegmentIntersectsTriangle(
+                            from.X, from.Y + bodyOffset, from.Z,
+                            to.X, to.Y + bodyOffset, to.Z,
+                            triangle))
+                        return false;
+                }
+            }
+
+            grounded = TryFindGroundAtPoint(to.X, to.Z, to.Y,
+                0.55f, 0.55f, minNormalY,
+                requireWalkable: true, out _, out _);
+            if (grounded)
+                return true;
+
+            // A reported jump must remain close to a baked walkable support surface.
+            // A descending fall may leave a ledge, but remains bounded by map bounds
+            // and the caller's vertical speed envelope.
+            if (jumping && TryFindGroundAtPoint(to.X, to.Z, to.Y,
+                    0.10f, 1.60f, minNormalY,
+                    requireWalkable: true, out _, out _))
+                return true;
+            return falling;
+        }
+
+        /// <summary>
         /// Rare last-resort recovery search when a map has no valid authored player spawn.
         /// Normal spawning should use ServerSpawn anchors.
         /// </summary>
@@ -1455,3 +1535,4 @@ namespace Game.Server.Application.World
         private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
     }
 }
+
