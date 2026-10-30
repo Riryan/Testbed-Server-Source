@@ -42,6 +42,11 @@ namespace Game.Server.Application.World
     public sealed partial class ServerCollisionWorld
     {
         private const float SafeMovementCellSize = 4f;
+        // Reported positions are samples of the client's already collision-resolved
+        // path. The straight chord between two samples can cut across a wall corner
+        // even when the actual path slid around it. Only treat a triangle hit as a
+        // wall crossing when travel is substantially directed into its face.
+        private const float MinimumWallCrossingNormalFraction = 0.75f;
 
         private readonly struct CellKey : IEquatable<CellKey>
         {
@@ -280,6 +285,7 @@ namespace Game.Server.Application.World
             float dx = to.X - from.X;
             float dz = to.Z - from.Z;
             float horizontalDistanceSquared = dx * dx + dz * dz;
+            float horizontalDistance = MathF.Sqrt(horizontalDistanceSquared);
             float dy = to.Y - from.Y;
             if (horizontalDistanceSquared <= 0.0004f && Math.Abs(dy) <= 0.015f)
             {
@@ -318,7 +324,19 @@ namespace Game.Server.Application.World
                             from.X, from.Y + bodyOffset, from.Z,
                             to.X, to.Y + bodyOffset, to.Z,
                             triangle))
-                        return false;
+                    {
+                        float normalLength = MathF.Sqrt(
+                            triangle.normalX * triangle.normalX +
+                            triangle.normalZ * triangle.normalZ);
+                        if (normalLength > 0.0001f && horizontalDistance > 0.0001f)
+                        {
+                            float crossingFraction = Math.Abs(
+                                (dx * triangle.normalX + dz * triangle.normalZ) /
+                                (horizontalDistance * normalLength));
+                            if (crossingFraction >= MinimumWallCrossingNormalFraction)
+                                return false;
+                        }
+                    }
                 }
             }
 

@@ -473,9 +473,35 @@ namespace Game.Server.Application.Movement
                         snapDown, slope, out WorldPosition next, out ServerGroundHit ground,
                         out bool exactHeight, ref timing, measure))
                 {
+                    // A diagonal request can touch a baked object even though one
+                    // component remains clear. Resolve that blocked substep along the
+                    // requested axes using the same support and clearance checks. This
+                    // runs only after a blocked step; open-ground movement keeps its
+                    // existing single-path cost.
+                    if (TryResolveBlockedAxes(world, current, dx, dz, capsule,
+                            stepHeight, snapDown, slope, out WorldPosition partial,
+                            out ServerGroundHit partialGround, out bool partialSettled,
+                            ref timing, measure))
+                    {
+                        blocked = true;
+                        current = partial;
+                        finalSupport = partialGround;
+                        settledSupport = partialSettled;
+                        if (measure)
+                        {
+                            timing.CompletedSteps++;
+                            timing.FailedStep = i + 1;
+                            timing.Rejection = "blocked-axis-resolved";
+                        }
+                        return current;
+                    }
+
                     blocked = true;
                     if (measure) timing.FailedStep = i + 1;
-                    return start;
+                    // Keep any earlier valid substeps from this request. Do not
+                    // rewind the whole frame to its original position because the
+                    // final substep reached an object or an uncertain baked seam.
+                    return current;
                 }
                 current = next;
                 finalSupport = ground;
@@ -483,6 +509,78 @@ namespace Game.Server.Application.Movement
                 if (measure) timing.CompletedSteps++;
             }
             return current;
+        }
+
+        private static bool TryResolveBlockedAxes(ServerCollisionWorld world,
+            WorldPosition start, float dx, float dz, ServerCapsule capsule,
+            float stepHeight, float snapDown, float slope,
+            out WorldPosition resolved, out ServerGroundHit finalSupport,
+            out bool settledSupport, ref GroundedMoveTiming timing, bool measure)
+        {
+            resolved = start;
+            finalSupport = default;
+            settledSupport = false;
+            const float axisEpsilon = 0.000001f;
+            bool xFirst = Math.Abs(dx) >= Math.Abs(dz);
+            float first = xFirst ? dx : dz;
+            float second = xFirst ? dz : dx;
+            if (Math.Abs(first) <= axisEpsilon)
+                return false;
+
+            if (TryStep(world, start,
+                    xFirst ? first : 0f,
+                    xFirst ? 0f : first,
+                    capsule, stepHeight, snapDown, slope,
+                    out WorldPosition firstPosition, out ServerGroundHit firstGround,
+                    out bool firstSettled, ref timing, measure))
+            {
+                resolved = firstPosition;
+                finalSupport = firstGround;
+                settledSupport = firstSettled;
+                if (Math.Abs(second) <= axisEpsilon)
+                    return true;
+
+                if (TryStep(world, firstPosition,
+                        xFirst ? 0f : second,
+                        xFirst ? second : 0f,
+                        capsule, stepHeight, snapDown, slope,
+                        out WorldPosition combined, out ServerGroundHit combinedGround,
+                        out bool combinedSettled, ref timing, measure))
+                {
+                    resolved = combined;
+                    finalSupport = combinedGround;
+                    settledSupport = combinedSettled;
+                }
+                return true;
+            }
+
+            // If the larger component is blocked, preserve the smaller clear axis
+            // instead of rejecting the whole client-resolved movement sample.
+            if (Math.Abs(second) <= axisEpsilon ||
+                !TryStep(world, start,
+                    xFirst ? 0f : second,
+                    xFirst ? second : 0f,
+                    capsule, stepHeight, snapDown, slope,
+                    out WorldPosition secondPosition, out ServerGroundHit secondGround,
+                    out bool secondSettled, ref timing, measure))
+                return false;
+
+            resolved = secondPosition;
+            finalSupport = secondGround;
+            settledSupport = secondSettled;
+            if (TryStep(world, secondPosition,
+                    xFirst ? first : 0f,
+                    xFirst ? 0f : first,
+                    capsule, stepHeight, snapDown, slope,
+                    out WorldPosition combinedFromSecond,
+                    out ServerGroundHit combinedGroundFromSecond,
+                    out bool combinedSettledFromSecond, ref timing, measure))
+            {
+                resolved = combinedFromSecond;
+                finalSupport = combinedGroundFromSecond;
+                settledSupport = combinedSettledFromSecond;
+            }
+            return true;
         }
 
         private static bool TryStep(ServerCollisionWorld world, WorldPosition start,
