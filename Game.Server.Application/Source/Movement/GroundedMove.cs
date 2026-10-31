@@ -639,6 +639,22 @@ namespace Game.Server.Application.Movement
                 settledSupport = true;
                 return true;
             }
+            // A player pressed against an authored mesh can begin a frame with
+            // a shallow capsule overlap. Rejecting every still-overlapping
+            // candidate traps the player even while pressing directly BACK.
+            // Permit only the ordinary short step when the existing collision
+            // world proves that every static overlap stays the same or shrinks,
+            // at least one actually shrinks, and no blocker/wall is crossed.
+            // This runs only after the normal standing test has failed.
+            if (world.CanRetreatFromShallowStandingOverlap(
+                    start, onGround, capsule, slope))
+            {
+                next = onGround;
+                finalSupport = ground;
+                settledSupport = true;
+                return true;
+            }
+
             if (y < start.Y - 0.01f &&
                 CheckStanding(world, target, capsule, slope, ref timing, measure, false))
             {
