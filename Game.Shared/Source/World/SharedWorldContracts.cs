@@ -67,6 +67,14 @@ namespace Game.Shared.World
         [DataMember(Name = "supportTriangles")] public ServerCollisionTriangle[] supportTriangles = Array.Empty<ServerCollisionTriangle>();
         [DataMember(Name = "surfaceEdges")] public ServerSurfaceEdge[] surfaceEdges = Array.Empty<ServerSurfaceEdge>();
 
+        // Canonical Player walk surface baked by the Unity Editor for the server map.
+        // The client copy must carry the SAME certified triangles and agent dimensions.
+        // These are data-only fields; the current movement solver is not changed by
+        // adding them to the shared-world contract.
+        [DataMember(Name = "safeMovementTriangles")] public ServerCollisionTriangle[] safeMovementTriangles = Array.Empty<ServerCollisionTriangle>();
+        [DataMember(Name = "safeMovementRadius")] public float safeMovementRadius;
+        [DataMember(Name = "safeMovementHeight")] public float safeMovementHeight;
+
         // Client-safe physical environment. Dynamic state is NOT authoritative here; live
         // blocker/interactable revisions are still supplied by server AOI/deltas.
         [DataMember(Name = "collisionTriangles")] public ServerCollisionTriangle[] collisionTriangles = Array.Empty<ServerCollisionTriangle>();
